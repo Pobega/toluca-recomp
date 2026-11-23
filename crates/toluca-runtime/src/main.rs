@@ -8,6 +8,7 @@ struct CliArgs {
     exe_path: PathBuf,
     aot_path: PathBuf,
     game_dir: Option<PathBuf>,
+    shader_cache: Option<PathBuf>,
     headless: bool,
     trace_imports: bool,
     trace_d3d8: bool,
@@ -35,11 +36,16 @@ fn main() -> ExitCode {
         .unwrap_or("sh2pc.exe")
         .to_owned();
 
+    let shader_cache_path = opts
+        .shader_cache
+        .or_else(|| (!opts.headless).then(|| game_root.join("toluca-progs.bin")));
+
     let config = Win32Config {
         game_root,
         headless: opts.headless,
         trace_imports: opts.trace_imports,
         trace_d3d8: opts.trace_d3d8,
+        shader_cache_path,
         command_line: exe_name.clone(),
         exe_name,
     };
@@ -116,6 +122,7 @@ fn main() -> ExitCode {
 fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut game_dir: Option<PathBuf> = None;
+    let mut shader_cache: Option<PathBuf> = None;
     let mut headless = false;
     let mut trace_imports = false;
     let mut trace_d3d8 = false;
@@ -131,6 +138,11 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
                 idx += 1;
                 let val = args.get(idx)?;
                 game_dir = Some(PathBuf::from(val));
+            }
+            "--shader-cache" => {
+                idx += 1;
+                let val = args.get(idx)?;
+                shader_cache = Some(PathBuf::from(val));
             }
             _ if arg.starts_with('-') => {
                 eprintln!("Unknown option: {arg}");
@@ -149,6 +161,7 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         exe_path: positional.remove(0),
         aot_path: positional.remove(0),
         game_dir,
+        shader_cache,
         headless,
         trace_imports,
         trace_d3d8,
@@ -159,6 +172,6 @@ fn print_usage(args: &[String]) {
     let bin = args.first().map(String::as_str).unwrap_or("toluca-runtime");
     eprintln!("Usage:");
     eprintln!(
-        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--headless] [--trace-imports] [--trace-d3d8]"
+        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--headless] [--trace-imports] [--trace-d3d8]"
     );
 }

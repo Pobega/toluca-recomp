@@ -1,8 +1,17 @@
 use std::any::Any;
 
+use crate::shader_asm::VertexDeclElement;
 use crate::state::DeviceState;
 use crate::texture::PreparedTextureUpload;
 use crate::types::D3dRect;
+
+#[derive(Default)]
+pub struct ActiveShaders<'a> {
+    pub vs_decl_tokens: Option<&'a [u32]>,
+    pub vs_parsed_decl: Option<&'a [VertexDeclElement]>,
+    pub vs_tokens: Option<&'a [u32]>,
+    pub ps_tokens: Option<&'a [u32]>,
+}
 
 pub trait RenderBackend {
     fn as_any(&self) -> &dyn Any;
@@ -14,12 +23,7 @@ pub trait RenderBackend {
     fn on_device_create(&mut self, width: u32, height: u32, format: u32, windowed: bool);
     fn on_device_reset(&mut self, width: u32, height: u32, format: u32, windowed: bool);
     fn on_clear(&mut self, flags: u32, color: u32, z: f32, stencil: u32, rects: &[D3dRect]);
-    fn on_texture_upload(
-        &mut self,
-        tex_handle: u32,
-        level: u32,
-        upload: &PreparedTextureUpload,
-    );
+    fn on_texture_upload(&mut self, tex_handle: u32, level: u32, upload: &PreparedTextureUpload);
     fn on_texture_destroy(&mut self, tex_handle: u32);
     fn on_vb_upload(&mut self, vb_handle: u32, data: &[u8], fvf: u32, usage: u32);
     fn on_vb_destroy(&mut self, vb_handle: u32);
@@ -28,19 +32,60 @@ pub trait RenderBackend {
     fn on_draw_primitive(
         &mut self,
         state: &DeviceState,
+        shaders: &ActiveShaders<'_>,
         prim_type: u32,
         start_vertex: u32,
         prim_count: u32,
     );
+    #[allow(clippy::too_many_arguments)]
     fn on_draw_indexed_primitive(
         &mut self,
         state: &DeviceState,
+        shaders: &ActiveShaders<'_>,
         prim_type: u32,
         min_vertex_index: u32,
         num_vertices: u32,
         start_index: u32,
         prim_count: u32,
     );
+    #[allow(clippy::too_many_arguments)]
+    fn on_draw_primitive_up(
+        &mut self,
+        state: &DeviceState,
+        shaders: &ActiveShaders<'_>,
+        prim_type: u32,
+        prim_count: u32,
+        vertex_data: &[u8],
+        stride: u32,
+    ) {
+        let _ = (vertex_data, stride);
+        self.on_draw_primitive(state, shaders, prim_type, 0, prim_count);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn on_draw_indexed_primitive_up(
+        &mut self,
+        state: &DeviceState,
+        shaders: &ActiveShaders<'_>,
+        prim_type: u32,
+        min_vertex_index: u32,
+        num_vertices: u32,
+        prim_count: u32,
+        index_data: &[u8],
+        index_format: u32,
+        vertex_data: &[u8],
+        stride: u32,
+    ) {
+        let _ = (index_data, index_format, vertex_data, stride);
+        self.on_draw_indexed_primitive(
+            state,
+            shaders,
+            prim_type,
+            min_vertex_index,
+            num_vertices,
+            0,
+            prim_count,
+        );
+    }
     fn on_present(&mut self);
 }
 
@@ -120,12 +165,7 @@ impl RenderBackend for NullBackend {
         self.clears += 1;
     }
 
-    fn on_texture_upload(
-        &mut self,
-        _tex_handle: u32,
-        _level: u32,
-        _upload: &PreparedTextureUpload,
-    ) {
+    fn on_texture_upload(&mut self, _tex_handle: u32, _level: u32, _upload: &PreparedTextureUpload) {
         self.texture_uploads += 1;
     }
 
@@ -152,6 +192,7 @@ impl RenderBackend for NullBackend {
     fn on_draw_primitive(
         &mut self,
         _state: &DeviceState,
+        _shaders: &ActiveShaders<'_>,
         _prim_type: u32,
         _start_vertex: u32,
         prim_count: u32,
@@ -163,6 +204,7 @@ impl RenderBackend for NullBackend {
     fn on_draw_indexed_primitive(
         &mut self,
         _state: &DeviceState,
+        _shaders: &ActiveShaders<'_>,
         _prim_type: u32,
         _min_vertex_index: u32,
         _num_vertices: u32,

@@ -428,6 +428,7 @@ fn executes_kernel32_and_msvcrt_shims_end_to_end() {
         headless: true,
         trace_imports: false,
         trace_d3d8: false,
+        shader_cache_path: None,
         command_line: "sh2pc.exe -test".to_owned(),
         exe_name: "sh2pc.exe".to_owned(),
     };

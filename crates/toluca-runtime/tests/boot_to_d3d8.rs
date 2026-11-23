@@ -422,6 +422,7 @@ fn milestone_gate_boots_synthetic_pe_through_window_pump_to_direct3d_create8() {
         headless: true,
         trace_imports: false,
         trace_d3d8: false,
+        shader_cache_path: None,
         command_line: "sh2pc.exe".to_owned(),
         exe_name: "sh2pc.exe".to_owned(),
     };

@@ -1,6 +1,6 @@
 use toluca_core::GuestAddr;
 use toluca_core::cpu::{ExitReason, GuestCpuState};
-use toluca_d3d8::{ComInterfaceId, D3d8Context, GuestMemory};
+use toluca_d3d8::{ComInterfaceId, D3d8Context, Gles3Backend, GuestMemory};
 
 use crate::arena::GuestArena;
 use crate::callconv::{peek_arg_u32, return_stdcall};
@@ -69,12 +69,53 @@ pub fn register_imports(registry: &mut ImportRegistry) {
     registry.register_name("d3d8.dll", "Direct3DCreate8", direct3d_create_8);
 }
 
+fn maybe_attach_gles3(ctx: &mut RuntimeContext<'_>, focus_hwnd: u32) {
+    if ctx.win32.config.headless || ctx.win32.d3d8.backend().as_any().is::<Gles3Backend>() {
+        return;
+    }
+
+    let sdl_win = ctx
+        .win32
+        .window_mgr
+        .windows
+        .get(&focus_hwnd)
+        .and_then(|w| w.sdl_window)
+        .or_else(|| {
+            ctx.win32
+                .window_mgr
+                .sdl
+                .as_ref()
+                .and_then(|sdl| sdl.primary_window())
+        });
+    let Some(win_ptr) = sdl_win else {
+        return;
+    };
+
+    let Some(sdl) = ctx.win32.window_mgr.sdl.as_mut() else {
+        return;
+    };
+    let Some((get_proc, present_target)) = (unsafe { sdl.create_gles3_context(win_ptr) }) else {
+        return;
+    };
+
+    let cache_path = ctx.win32.config.shader_cache_path.clone();
+    match Gles3Backend::new(Some(get_proc), present_target, cache_path) {
+        Ok(backend) => {
+            ctx.win32.d3d8.replace_backend(Box::new(backend));
+        }
+        Err(err) => {
+            eprintln!("[d3d8] GLES 3.0 backend init failed, falling back to NullBackend: {err}");
+        }
+    }
+}
+
 fn direct3d_create_8(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
     let sdk_version = peek_arg_u32(cpu, ctx.arena, 0)?;
     ctx.win32.d3d8_create_calls.push(sdk_version);
+    maybe_attach_gles3(ctx, 0);
 
     let mut mem = ArenaGuestMemory {
         arena: ctx.arena,
@@ -115,6 +156,11 @@ pub fn dispatch_com_call(
                 return;
             }
         }
+    }
+
+    if iface == ComInterfaceId::Direct3D8 && method_idx == 15 {
+        let focus_hwnd = args.get(3).copied().unwrap_or(0);
+        maybe_attach_gles3(ctx, focus_hwnd);
     }
 
     let result = {

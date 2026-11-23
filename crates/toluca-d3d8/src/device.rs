@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use toluca_core::GuestAddr;
 
-use crate::backend::{NullBackend, RenderBackend};
+use crate::backend::{ActiveShaders, NullBackend, RenderBackend};
 use crate::mem::{ComInterfaceId, ComObjectTable, GuestMemory};
 use crate::shader_asm::{VertexDeclElement, parse_vertex_declaration};
 use crate::state::{DeviceState, StateBlockData, StreamBinding};
@@ -14,13 +14,14 @@ use crate::types::{
     D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INDEX16,
     D3DFMT_INDEX32, D3DFMT_L8, D3DFMT_P8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UNKNOWN,
     D3DFMT_V8U8, D3DFMT_VERTEXDATA, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DLOCK_READONLY,
-    D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3D_OK, D3dAdapterIdentifier8, D3dCaps8,
-    D3dDeviceCreationParameters, D3dDisplayMode, D3dIndexBufferDesc, D3dLight8, D3dLockedRect,
-    D3dMaterial8, D3dPresentParameters, D3dRect, D3dSurfaceDesc, D3dVertexBufferDesc, D3dViewport8,
-    E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_OUTOFMEMORY, E_POINTER, HResult, S_FALSE,
-    dxt_block_bytes, format_bytes_per_pixel, read_matrix_4x4, surface_byte_size, surface_row_pitch,
-    write_matrix_4x4,
+    D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
+    D3DPT_TRIANGLESTRIP, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VERTEXBUFFER, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3D_OK,
+    D3dAdapterIdentifier8, D3dCaps8, D3dDeviceCreationParameters, D3dDisplayMode,
+    D3dIndexBufferDesc, D3dLight8, D3dLockedRect, D3dMaterial8, D3dPresentParameters, D3dRect,
+    D3dSurfaceDesc, D3dVertexBufferDesc, D3dViewport8, E_FAIL, E_INVALIDARG, E_NOINTERFACE,
+    E_OUTOFMEMORY, E_POINTER, HResult, S_FALSE, dxt_block_bytes, format_bytes_per_pixel,
+    read_matrix_4x4, surface_byte_size, surface_row_pitch, write_matrix_4x4,
 };
 
 pub const IDIRECT3D8_METHOD_COUNT: u32 = 16;
@@ -417,6 +418,14 @@ impl D3d8Context {
 
     pub fn backend_mut(&mut self) -> &mut dyn RenderBackend {
         self.backend.as_mut()
+    }
+
+    pub fn replace_backend(&mut self, backend: Box<dyn RenderBackend>) {
+        self.backend = backend;
+    }
+
+    pub fn has_devices(&self) -> bool {
+        !self.devices.is_empty()
     }
 
     pub fn vertex_shader(&self, device_handle: u32, vs_handle: u32) -> Option<&VertexShaderObj> {
@@ -1598,8 +1607,14 @@ impl D3d8Context {
                 let start_vertex = args[2];
                 let prim_count = args[3];
                 if let Some(dev) = self.devices.get(&handle) {
-                    self.backend
-                        .on_draw_primitive(&dev.state, prim_type, start_vertex, prim_count);
+                    let shaders = active_shaders_for_device(dev);
+                    self.backend.on_draw_primitive(
+                        &dev.state,
+                        &shaders,
+                        prim_type,
+                        start_vertex,
+                        prim_count,
+                    );
                 }
                 Ok(D3D_OK)
             }
@@ -1610,8 +1625,10 @@ impl D3d8Context {
                 let start_index = args[4];
                 let prim_count = args[5];
                 if let Some(dev) = self.devices.get(&handle) {
+                    let shaders = active_shaders_for_device(dev);
                     self.backend.on_draw_indexed_primitive(
                         &dev.state,
+                        &shaders,
                         prim_type,
                         min_vertex_idx,
                         num_vertices,
@@ -1629,10 +1646,24 @@ impl D3d8Context {
                 if p_data == 0 || stride == 0 {
                     return Ok(D3DERR_INVALIDCALL);
                 }
+                let vtx_count = vertex_count_for_primitives(prim_type, prim_count);
+                let byte_len = (vtx_count as usize).saturating_mul(stride as usize);
+                let vtx_data = if byte_len > 0 {
+                    mem.read_bytes(p_data, byte_len)?
+                } else {
+                    Vec::new()
+                };
                 if let Some(dev) = self.devices.get_mut(&handle) {
                     dev.state.set_stream_source(0, None);
-                    self.backend
-                        .on_draw_primitive(&dev.state, prim_type, 0, prim_count);
+                    let shaders = active_shaders_for_device(dev);
+                    self.backend.on_draw_primitive_up(
+                        &dev.state,
+                        &shaders,
+                        prim_type,
+                        prim_count,
+                        &vtx_data,
+                        stride,
+                    );
                 }
                 Ok(D3D_OK)
             }
@@ -1642,22 +1673,40 @@ impl D3d8Context {
                 let num_verts = args[3];
                 let prim_count = args[4];
                 let p_idx = args[5];
-                let _idx_fmt = args[6];
+                let idx_fmt = args[6];
                 let p_vtx = args[7];
                 let stride = args[8];
                 if p_idx == 0 || p_vtx == 0 || stride == 0 {
                     return Ok(D3DERR_INVALIDCALL);
                 }
+                let idx_count = vertex_count_for_primitives(prim_type, prim_count) as usize;
+                let idx_elem_size = if idx_fmt == D3DFMT_INDEX32 { 4 } else { 2 };
+                let idx_data = if idx_count > 0 {
+                    mem.read_bytes(p_idx, idx_count * idx_elem_size)?
+                } else {
+                    Vec::new()
+                };
+                let vtx_count = min_idx.saturating_add(num_verts) as usize;
+                let vtx_data = if vtx_count > 0 {
+                    mem.read_bytes(p_vtx, vtx_count.saturating_mul(stride as usize))?
+                } else {
+                    Vec::new()
+                };
                 if let Some(dev) = self.devices.get_mut(&handle) {
                     dev.state.set_stream_source(0, None);
                     dev.state.set_indices(None);
-                    self.backend.on_draw_indexed_primitive(
+                    let shaders = active_shaders_for_device(dev);
+                    self.backend.on_draw_indexed_primitive_up(
                         &dev.state,
+                        &shaders,
                         prim_type,
                         min_idx,
                         num_verts,
-                        0,
                         prim_count,
+                        &idx_data,
+                        idx_fmt,
+                        &vtx_data,
+                        stride,
                     );
                 }
                 Ok(D3D_OK)
@@ -3196,4 +3245,29 @@ fn read_vec4_array(
         out.push(v);
     }
     Ok(out)
+}
+
+fn active_shaders_for_device(dev: &DeviceObj) -> ActiveShaders<'_> {
+    let vs = dev.vertex_shaders.get(&dev.state.current_vertex_shader);
+    let ps = dev.pixel_shaders.get(&dev.state.current_pixel_shader);
+    ActiveShaders {
+        vs_decl_tokens: vs.map(|v| v.declaration.as_slice()),
+        vs_parsed_decl: vs.map(|v| v.parsed_decl.as_slice()),
+        vs_tokens: vs.and_then(|v| (!v.function.is_empty()).then_some(v.function.as_slice())),
+        ps_tokens: ps.map(|p| p.function.as_slice()),
+    }
+}
+
+pub fn vertex_count_for_primitives(prim_type: u32, prim_count: u32) -> u32 {
+    if prim_count == 0 {
+        return 0;
+    }
+    match prim_type {
+        D3DPT_POINTLIST => prim_count,
+        D3DPT_LINELIST => prim_count.saturating_mul(2),
+        D3DPT_LINESTRIP => prim_count.saturating_add(1),
+        D3DPT_TRIANGLELIST => prim_count.saturating_mul(3),
+        D3DPT_TRIANGLESTRIP | D3DPT_TRIANGLEFAN => prim_count.saturating_add(2),
+        _ => 0,
+    }
 }

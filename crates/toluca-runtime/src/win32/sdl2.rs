@@ -1,9 +1,19 @@
 use std::ffi::{CString, c_char, c_void};
 
+use toluca_d3d8::{GlGetProcAddrFn, PresentTarget};
+
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000;
 const SDL_WINDOW_OPENGL: u32 = 0x0000_0002;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
+
+const SDL_GL_DOUBLEBUFFER: i32 = 5;
+const SDL_GL_DEPTH_SIZE: i32 = 6;
+const SDL_GL_STENCIL_SIZE: i32 = 7;
+const SDL_GL_CONTEXT_MAJOR_VERSION: i32 = 17;
+const SDL_GL_CONTEXT_MINOR_VERSION: i32 = 18;
+const SDL_GL_CONTEXT_PROFILE_MASK: i32 = 21;
+const SDL_GL_CONTEXT_PROFILE_ES: i32 = 4;
 
 const SDL_EVENT_SIZE: usize = 56;
 const SDL_QUIT: u32 = 0x100;
@@ -100,6 +110,40 @@ type SdlShowWindowFn = unsafe extern "C" fn(window: *mut c_void);
 type SdlHideWindowFn = unsafe extern "C" fn(window: *mut c_void);
 type SdlShowCursorFn = unsafe extern "C" fn(toggle: i32) -> i32;
 type SdlPollEventFn = unsafe extern "C" fn(event: *mut SdlEventBuf) -> i32;
+type SdlGlSetAttributeFn = unsafe extern "C" fn(attr: i32, value: i32) -> i32;
+type SdlGlCreateContextFn = unsafe extern "C" fn(window: *mut c_void) -> *mut c_void;
+type SdlGlDeleteContextFn = unsafe extern "C" fn(context: *mut c_void);
+type SdlGlMakeCurrentFn = unsafe extern "C" fn(window: *mut c_void, context: *mut c_void) -> i32;
+type SdlGlSwapWindowFn = unsafe extern "C" fn(window: *mut c_void);
+type SdlGlGetDrawableSizeFn = unsafe extern "C" fn(window: *mut c_void, w: *mut i32, h: *mut i32);
+type SdlGlSetSwapIntervalFn = unsafe extern "C" fn(interval: i32) -> i32;
+
+struct SdlPresentTarget {
+    window: *mut c_void,
+    swap_window_fn: SdlGlSwapWindowFn,
+    drawable_size_fn: Option<SdlGlGetDrawableSizeFn>,
+}
+
+unsafe impl Send for SdlPresentTarget {}
+
+impl PresentTarget for SdlPresentTarget {
+    fn drawable_size(&self) -> (u32, u32) {
+        let mut w = 0i32;
+        let mut h = 0i32;
+        if let Some(f) = self.drawable_size_fn {
+            unsafe {
+                f(self.window, &mut w, &mut h);
+            }
+        }
+        (w.max(0) as u32, h.max(0) as u32)
+    }
+
+    fn swap_buffers(&mut self) {
+        unsafe {
+            (self.swap_window_fn)(self.window);
+        }
+    }
+}
 
 pub struct Sdl2WindowBackend {
     lib_handle: *mut c_void,
@@ -110,6 +154,15 @@ pub struct Sdl2WindowBackend {
     hide_window_fn: SdlHideWindowFn,
     show_cursor_fn: SdlShowCursorFn,
     poll_event_fn: SdlPollEventFn,
+    gl_set_attr_fn: Option<SdlGlSetAttributeFn>,
+    gl_create_context_fn: Option<SdlGlCreateContextFn>,
+    gl_delete_context_fn: Option<SdlGlDeleteContextFn>,
+    gl_make_current_fn: Option<SdlGlMakeCurrentFn>,
+    gl_swap_window_fn: Option<SdlGlSwapWindowFn>,
+    gl_get_proc_addr_fn: Option<GlGetProcAddrFn>,
+    gl_drawable_size_fn: Option<SdlGlGetDrawableSizeFn>,
+    gl_set_swap_interval_fn: Option<SdlGlSetSwapIntervalFn>,
+    gl_contexts: Vec<*mut c_void>,
     windows: Vec<*mut c_void>,
 }
 
@@ -158,6 +211,15 @@ impl Sdl2WindowBackend {
             return None;
         }
 
+        let gl_set_attr_fn = load_sym::<SdlGlSetAttributeFn>(lib_handle, c"SDL_GL_SetAttribute");
+        let gl_create_context_fn = load_sym::<SdlGlCreateContextFn>(lib_handle, c"SDL_GL_CreateContext");
+        let gl_delete_context_fn = load_sym::<SdlGlDeleteContextFn>(lib_handle, c"SDL_GL_DeleteContext");
+        let gl_make_current_fn = load_sym::<SdlGlMakeCurrentFn>(lib_handle, c"SDL_GL_MakeCurrent");
+        let gl_swap_window_fn = load_sym::<SdlGlSwapWindowFn>(lib_handle, c"SDL_GL_SwapWindow");
+        let gl_get_proc_addr_fn = load_sym::<GlGetProcAddrFn>(lib_handle, c"SDL_GL_GetProcAddress");
+        let gl_drawable_size_fn = load_sym::<SdlGlGetDrawableSizeFn>(lib_handle, c"SDL_GL_GetDrawableSize");
+        let gl_set_swap_interval_fn = load_sym::<SdlGlSetSwapIntervalFn>(lib_handle, c"SDL_GL_SetSwapInterval");
+
         Some(Self {
             lib_handle,
             quit_subsystem,
@@ -167,11 +229,78 @@ impl Sdl2WindowBackend {
             hide_window_fn,
             show_cursor_fn,
             poll_event_fn,
+            gl_set_attr_fn,
+            gl_create_context_fn,
+            gl_delete_context_fn,
+            gl_make_current_fn,
+            gl_swap_window_fn,
+            gl_get_proc_addr_fn,
+            gl_drawable_size_fn,
+            gl_set_swap_interval_fn,
+            gl_contexts: Vec::new(),
             windows: Vec::new(),
         })
     }
 
+    pub fn primary_window(&self) -> Option<*mut c_void> {
+        self.windows.first().copied()
+    }
+
+    fn configure_gles3_attributes(&self) {
+        if let Some(set_attr) = self.gl_set_attr_fn {
+            unsafe {
+                set_attr(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+                set_attr(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+                set_attr(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+                set_attr(SDL_GL_DOUBLEBUFFER, 1);
+                set_attr(SDL_GL_DEPTH_SIZE, 24);
+                set_attr(SDL_GL_STENCIL_SIZE, 8);
+            }
+        }
+    }
+
+    /// Creates and activates an OpenGL ES 3.0 context for `window`.
+    ///
+    /// # Safety
+    /// `window` must be a valid non-null SDL2 window pointer returned by `create_window`.
+    pub unsafe fn create_gles3_context(
+        &mut self,
+        window: *mut c_void,
+    ) -> Option<(GlGetProcAddrFn, Box<dyn PresentTarget>)> {
+        if window.is_null() {
+            return None;
+        }
+        let create_ctx = self.gl_create_context_fn?;
+        let make_current = self.gl_make_current_fn?;
+        let swap_window = self.gl_swap_window_fn?;
+        let get_proc = self.gl_get_proc_addr_fn?;
+
+        let ctx = unsafe { create_ctx(window) };
+        if ctx.is_null() {
+            return None;
+        }
+        if unsafe { make_current(window, ctx) } != 0 {
+            if let Some(del_ctx) = self.gl_delete_context_fn {
+                unsafe { del_ctx(ctx) };
+            }
+            return None;
+        }
+        if let Some(set_swap) = self.gl_set_swap_interval_fn {
+            unsafe {
+                set_swap(1);
+            }
+        }
+        self.gl_contexts.push(ctx);
+        let target: Box<dyn PresentTarget> = Box::new(SdlPresentTarget {
+            window,
+            swap_window_fn: swap_window,
+            drawable_size_fn: self.gl_drawable_size_fn,
+        });
+        Some((get_proc, target))
+    }
+
     pub fn create_window(&mut self, title: &str, width: i32, height: i32) -> Option<*mut c_void> {
+        self.configure_gles3_attributes();
         let c_title = CString::new(title).unwrap_or_else(|_| CString::new("toluca-runtime").unwrap());
         let ptr = unsafe {
             (self.create_window_fn)(
@@ -261,6 +390,13 @@ impl Sdl2WindowBackend {
 
 impl Drop for Sdl2WindowBackend {
     fn drop(&mut self) {
+        if let Some(del_ctx) = self.gl_delete_context_fn {
+            while let Some(ctx) = self.gl_contexts.pop() {
+                unsafe {
+                    del_ctx(ctx);
+                }
+            }
+        }
         while let Some(win) = self.windows.pop() {
             unsafe {
                 (self.destroy_window_fn)(win);

@@ -54,9 +54,9 @@
 
 ### Phase 0 — Workspace & ABI Contract (`toluca-core`)
 - [x] Initialize clean-room MIT Cargo workspace (`toluca-core`, `toluca-recomp`, `toluca-d3d8`, `toluca-runtime`).
-- [ ] Define `GuestCpuState` layout (`eax..edi`, `esp`, `eip`, lazy/materialized flags, x87 FP stack + control/status words, MMX/SSE registers, guest arena base pointer).
-- [ ] Define `toluca_code.bin` header, section directory, VA→offset dispatch table, and relocation entry formats with versioned magic + checksums.
-- [ ] Define the `HostBridge` function table ABI for calling native Win32/D3D8/libc shims and handling guest indirect calls (`call reg` / `call [mem]`).
+- [x] Define `GuestCpuState` layout (`eax..edi`, `esp`, `eip`, lazy/materialized flags, x87 FP stack + control/status words, MMX/SSE registers, guest arena base pointer).
+- [x] Define `toluca_code.bin` header, section directory, VA→offset dispatch table, and relocation entry formats with versioned magic + checksums.
+- [x] Define the `HostBridge` function table ABI for calling native Win32/D3D8/libc shims and handling guest indirect calls (`call reg` / `call [mem]`).
 
 ### Phase 1 — PE32 Loader & Function Discovery (`toluca-recomp` Front-End)
 - [ ] Parse PE32 headers, section tables, import address table (IAT), and entry point cleanly using `object` or a small dedicated parser.

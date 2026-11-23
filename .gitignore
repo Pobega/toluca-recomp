@@ -1,0 +1,14 @@
+/target
+Cargo.lock
+
+# Never commit copyrighted game binaries, assets, saves, or generated AOT caches
+/game/
+*.exe
+*.bik
+*.bin
+*.tex
+*.dat
+toluca_code.bin
+toluca-progs.bin
+toluca.log
+toluca-crash.log

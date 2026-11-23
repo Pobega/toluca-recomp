@@ -1,0 +1,8 @@
+[package]
+name = "toluca-d3d8"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+toluca-core = { path = "../toluca-core" }

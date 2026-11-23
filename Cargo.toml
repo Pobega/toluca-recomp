@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/toluca-core",
+    "crates/toluca-recomp",
+    "crates/toluca-d3d8",
+    "crates/toluca-runtime",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["toluca-portmaster contributors"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

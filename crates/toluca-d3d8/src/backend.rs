@@ -1,6 +1,7 @@
 use std::any::Any;
 
 use crate::state::DeviceState;
+use crate::texture::PreparedTextureUpload;
 use crate::types::D3dRect;
 
 pub trait RenderBackend {
@@ -17,10 +18,7 @@ pub trait RenderBackend {
         &mut self,
         tex_handle: u32,
         level: u32,
-        width: u32,
-        height: u32,
-        format: u32,
-        data: &[u8],
+        upload: &PreparedTextureUpload,
     );
     fn on_texture_destroy(&mut self, tex_handle: u32);
     fn on_vb_upload(&mut self, vb_handle: u32, data: &[u8], fvf: u32, usage: u32);
@@ -126,10 +124,7 @@ impl RenderBackend for NullBackend {
         &mut self,
         _tex_handle: u32,
         _level: u32,
-        _width: u32,
-        _height: u32,
-        _format: u32,
-        _data: &[u8],
+        _upload: &PreparedTextureUpload,
     ) {
         self.texture_uploads += 1;
     }

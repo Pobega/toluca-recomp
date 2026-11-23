@@ -5,6 +5,7 @@ use toluca_core::GuestAddr;
 use crate::backend::{NullBackend, RenderBackend};
 use crate::mem::{ComInterfaceId, ComObjectTable, GuestMemory};
 use crate::state::{DeviceState, StateBlockData, StreamBinding};
+use crate::texture::prepare_texture_upload;
 use crate::types::{
     D3DADAPTER_DEFAULT, D3DCLEAR_TARGET, D3DDEVTYPE_HAL, D3DDEVTYPE_REF, D3DERR_INVALIDCALL,
     D3DERR_NOTAVAILABLE, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8,
@@ -728,12 +729,7 @@ impl D3d8Context {
             return is_supported_backbuffer_format(check_fmt);
         }
         match rtype {
-            D3DRTYPE_TEXTURE | D3DRTYPE_SURFACE => {
-                if crate::types::is_dxt_format(check_fmt) {
-                    return self.backend.supports_s3tc();
-                }
-                is_supported_texture_format(check_fmt)
-            }
+            D3DRTYPE_TEXTURE | D3DRTYPE_SURFACE => is_supported_texture_format(check_fmt),
             D3DRTYPE_VERTEXBUFFER => check_fmt == D3DFMT_VERTEXDATA,
             D3DRTYPE_INDEXBUFFER => matches!(check_fmt, D3DFMT_INDEX16 | D3DFMT_INDEX32),
             _ => false,
@@ -1103,7 +1099,8 @@ impl D3d8Context {
                 mem, handle, args[1], args[2], args[3], 0, 2, 0, args[4],
             ),
             28 => self.device_copy_rects(mem, args),
-            29 | 30 => Ok(D3D_OK),
+            29 => self.device_update_texture(mem, args),
+            30 => Ok(D3D_OK),
             31 => self.device_set_render_target(mem, handle, args[1], args[2]),
             32 => {
                 let pp_rt = args[1];
@@ -2268,17 +2265,83 @@ impl D3d8Context {
         };
         let copy_len = src_data.len().min(dst.data.len());
         dst.data[..copy_len].copy_from_slice(&src_data[..copy_len]);
-        if let Some((tex_h, level)) = dst.parent_texture {
-            self.backend.on_texture_upload(
-                tex_h,
-                level,
-                dst.width,
-                dst.height,
-                dst.format,
-                &dst.data,
-            );
+        self.upload_surface_texture(dst_h);
+        Ok(D3D_OK)
+    }
+
+    fn device_update_texture(
+        &mut self,
+        mem: &dyn GuestMemory,
+        args: &[u32],
+    ) -> Result<HResult, String> {
+        let src_va = args[1];
+        let dst_va = args[2];
+        if src_va == 0 || dst_va == 0 {
+            return Ok(D3DERR_INVALIDCALL);
+        }
+        let (src_iface, src_h) = self.com_objects.read_object(mem, src_va)?;
+        let (dst_iface, dst_h) = self.com_objects.read_object(mem, dst_va)?;
+        if src_iface != ComInterfaceId::Direct3DTexture8
+            || dst_iface != ComInterfaceId::Direct3DTexture8
+        {
+            return Ok(D3DERR_INVALIDCALL);
+        }
+
+        let Some(src_mips) = self.textures.get(&src_h).map(|t| t.mip_surfaces.clone()) else {
+            return Ok(D3DERR_INVALIDCALL);
+        };
+        let Some(dst_mips) = self.textures.get(&dst_h).map(|t| t.mip_surfaces.clone()) else {
+            return Ok(D3DERR_INVALIDCALL);
+        };
+
+        let levels = src_mips.len().min(dst_mips.len());
+        for level in 0..levels {
+            let Some(src_data) = self.surfaces.get(&src_mips[level]).map(|s| s.data.clone()) else {
+                continue;
+            };
+            let dst_surf_h = dst_mips[level];
+            if let Some(dst_surf) = self.surfaces.get_mut(&dst_surf_h) {
+                let copy_len = src_data.len().min(dst_surf.data.len());
+                dst_surf.data[..copy_len].copy_from_slice(&src_data[..copy_len]);
+            }
+            self.upload_surface_texture(dst_surf_h);
         }
         Ok(D3D_OK)
+    }
+
+    fn upload_surface_texture(&mut self, surf_handle: u32) {
+        let Some(surf) = self.surfaces.get(&surf_handle) else {
+            return;
+        };
+        let Some((tex_h, level)) = surf.parent_texture else {
+            return;
+        };
+        let palette = if surf.format == D3DFMT_P8 {
+            self.devices.get(&surf.device_handle).and_then(|dev| {
+                let entries = dev.state.palette_entries.get(&dev.state.current_palette)?;
+                let mut arr = [[0u8; 4]; 256];
+                for (i, &entry) in entries.iter().take(256).enumerate() {
+                    arr[i] = entry;
+                }
+                Some(arr)
+            })
+        } else {
+            None
+        };
+
+        let pitch = surface_row_pitch(surf.format, surf.width);
+        if let Ok(prepared) = prepare_texture_upload(
+            surf.format,
+            surf.width,
+            surf.height,
+            pitch,
+            &surf.data,
+            palette.as_ref(),
+            self.backend.max_texture_size(),
+            self.backend.supports_s3tc(),
+        ) {
+            self.backend.on_texture_upload(tex_h, level, &prepared);
+        }
     }
 
     fn device_set_render_target(
@@ -2670,16 +2733,7 @@ impl D3d8Context {
                     mem.read_into(staging_va, &mut surf.data)?;
                 }
             }
-            if let Some((tex_handle, level)) = surf.parent_texture {
-                self.backend.on_texture_upload(
-                    tex_handle,
-                    level,
-                    surf.width,
-                    surf.height,
-                    surf.format,
-                    &surf.data,
-                );
-            }
+            self.upload_surface_texture(surf_handle);
         }
         Ok(D3D_OK)
     }

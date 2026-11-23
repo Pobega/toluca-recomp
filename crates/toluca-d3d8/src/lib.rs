@@ -2,6 +2,7 @@ pub mod backend;
 pub mod device;
 pub mod mem;
 pub mod state;
+pub mod texture;
 pub mod types;
 
 pub use backend::{NullBackend, RenderBackend};
@@ -11,3 +12,4 @@ pub use mem::{
     GuestMemory, decode_com_thunk, encode_com_thunk,
 };
 pub use state::{DeviceState, LightSlot, StateBlockData, StreamBinding};
+pub use texture::{DecodedRgba8, PreparedTextureUpload, prepare_texture_upload};

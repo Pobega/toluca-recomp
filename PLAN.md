@@ -59,10 +59,10 @@
 - [x] Define the `HostBridge` function table ABI for calling native Win32/D3D8/libc shims and handling guest indirect calls (`call reg` / `call [mem]`).
 
 ### Phase 1 — PE32 Loader & Function Discovery (`toluca-recomp` Front-End)
-- [ ] Parse PE32 headers, section tables, import address table (IAT), and entry point cleanly using `object` or a small dedicated parser.
-- [ ] Verify unprotected v1.0 `sh2pc.exe` and detect SafeDisc-encrypted `.text` sections with clear user diagnostics.
-- [ ] Implement `iced-x86` disassembly over `.text`: recursive descent from entry point, indirect jump-table pattern recognition, alignment/prologue heuristics, and data-section function-pointer scanning.
-- [ ] Emit a summary report (discovered functions, byte coverage, jump tables, imported Win32 DLL/symbol list) and validate against vanilla `sh2pc.exe`.
+- [x] Parse PE32 headers, section tables, import address table (IAT), and entry point cleanly using `object` or a small dedicated parser.
+- [x] Verify unprotected v1.0 `sh2pc.exe` and detect SafeDisc-encrypted `.text` sections with clear user diagnostics.
+- [x] Implement `iced-x86` disassembly over `.text`: recursive descent from entry point, indirect jump-table pattern recognition, alignment/prologue heuristics, and data-section function-pointer scanning.
+- [ ] Emit a summary report (discovered functions, byte coverage, jump tables, imported Win32 DLL/symbol list) and validate against vanilla `sh2pc.exe`. *(Summary report CLI implemented; awaiting real vanilla `sh2pc.exe` validation.)*
 
 ### Phase 2 — Streaming Cranelift Lifter & Verification (`toluca-recomp` Back-End)
 - [ ] Implement the x86-32 → Cranelift IR lifter in small, modular files (`integer.rs`, `flags.rs`, `control_flow.rs`, `fpu.rs`, `simd.rs`, `string_ops.rs`).

@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 toluca-core = { path = "../toluca-core" }
+iced-x86 = "1.21"

@@ -19,8 +19,13 @@ struct KnownProfile {
     sha1: [u8; 20],
 }
 
-// Known unprotected vanilla sh2pc.exe SHA-1 digests can be registered here.
-const KNOWN_PROFILES: &[KnownProfile] = &[];
+const KNOWN_PROFILES: &[KnownProfile] = &[KnownProfile {
+    name: "Vanilla NA v1.0 (unprotected)",
+    sha1: [
+        0x25, 0x76, 0x35, 0x58, 0x80, 0x13, 0xec, 0xec, 0x81, 0xde, 0xeb, 0xae, 0x90, 0xd0, 0x98,
+        0x10, 0xcb, 0x41, 0x39, 0x6b,
+    ],
+}];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BinaryVerdict {

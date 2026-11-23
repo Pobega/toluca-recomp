@@ -420,6 +420,7 @@ fn milestone_gate_boots_synthetic_pe_through_window_pump_to_direct3d_create8() {
     let config = Win32Config {
         game_root: tmp.root.clone(),
         headless: true,
+        trace_imports: false,
         command_line: "sh2pc.exe".to_owned(),
         exe_name: "sh2pc.exe".to_owned(),
     };

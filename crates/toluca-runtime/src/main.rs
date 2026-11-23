@@ -9,6 +9,7 @@ struct CliArgs {
     aot_path: PathBuf,
     game_dir: Option<PathBuf>,
     headless: bool,
+    trace_imports: bool,
 }
 
 fn main() -> ExitCode {
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
     let config = Win32Config {
         game_root,
         headless: opts.headless,
+        trace_imports: opts.trace_imports,
         command_line: exe_name.clone(),
         exe_name,
     };
@@ -113,12 +115,14 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut game_dir: Option<PathBuf> = None;
     let mut headless = false;
+    let mut trace_imports = false;
 
     let mut idx = 1usize;
     while idx < args.len() {
         let arg = args[idx].as_str();
         match arg {
             "--headless" => headless = true,
+            "--trace-imports" => trace_imports = true,
             "--game-dir" => {
                 idx += 1;
                 let val = args.get(idx)?;
@@ -142,11 +146,12 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         aot_path: positional.remove(0),
         game_dir,
         headless,
+        trace_imports,
     })
 }
 
 fn print_usage(args: &[String]) {
     let bin = args.first().map(String::as_str).unwrap_or("toluca-runtime");
     eprintln!("Usage:");
-    eprintln!("  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--headless]");
+    eprintln!("  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--headless] [--trace-imports]");
 }

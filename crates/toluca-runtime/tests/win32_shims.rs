@@ -426,6 +426,7 @@ fn executes_kernel32_and_msvcrt_shims_end_to_end() {
     let config = Win32Config {
         game_root: ws.dir.clone(),
         headless: true,
+        trace_imports: false,
         command_line: "sh2pc.exe -test".to_owned(),
         exe_name: "sh2pc.exe".to_owned(),
     };

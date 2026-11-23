@@ -8,7 +8,10 @@ use toluca_core::aot::ImportSymbol;
 use toluca_core::cpu::{ExitReason, GuestCpuState};
 
 use crate::callconv::{peek_arg_i32, peek_arg_u32, return_stdcall};
-use crate::heap::{MEM_DECOMMIT, MEM_RELEASE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+use crate::heap::{
+    MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+};
 use crate::runtime::{ImportRegistry, RuntimeContext, RuntimeError};
 use crate::win32::path::wildcard_match_ci;
 use crate::win32::{
@@ -155,15 +158,56 @@ pub fn register_imports(registry: &mut ImportRegistry) {
         ("IsProcessorFeaturePresent", is_processor_feature_present),
         ("OutputDebugStringA", output_debug_string_a),
         ("ExitProcess", exit_process),
+        ("lstrlenA", lstrlen_a),
+        ("lstrcpyA", lstrcpy_a),
+        ("lstrcatA", lstrcat_a),
+        ("lstrcmpiA", lstrcmpi_a),
+        ("CreateFileW", create_file_w),
+        ("GlobalMemoryStatus", global_memory_status),
+        ("CreateMutexA", create_mutex_a),
+        ("ReleaseMutex", release_mutex),
+        ("GetSystemTimeAsFileTime", get_system_time_as_file_time),
+        ("FileTimeToLocalFileTime", file_time_to_local_file_time),
+        ("FileTimeToSystemTime", file_time_to_system_time),
+        ("SystemTimeToFileTime", system_time_to_file_time),
+        ("GetThreadLocale", get_thread_locale),
+        ("GetLocaleInfoA", get_locale_info_a),
+        ("GetDriveTypeA", get_drive_type_a),
+        ("GetDiskFreeSpaceExA", get_disk_free_space_ex_a),
+        ("CreateFileMappingA", create_file_mapping_a),
+        ("MapViewOfFile", map_view_of_file),
+        ("UnmapViewOfFile", unmap_view_of_file),
+        ("FindResourceA", find_resource_null),
+        ("FindResourceW", find_resource_null),
+        ("LoadResource", load_resource),
+        ("LockResource", lock_resource),
+        ("SizeofResource", sizeof_resource),
+        ("SetFileAttributesA", set_file_attributes_a),
+        ("CopyFileA", copy_file_a),
+        ("RemoveDirectoryA", remove_directory_a),
+        ("GetOverlappedResult", get_overlapped_result),
+        ("CreateThread", create_thread),
+        ("ExitThread", exit_thread),
+        ("GetExitCodeThread", get_exit_code_thread),
+        ("SetThreadPriority", set_thread_priority),
+        ("GetThreadPriority", get_thread_priority),
+        ("SetThreadPriorityBoost", set_thread_priority_boost),
+        ("ResumeThread", resume_thread),
+        ("SuspendThread", suspend_thread),
+        ("PulseEvent", pulse_event),
     ];
 
     for &(name, handler) in entries {
         registry.register_name(k32, name, handler);
     }
 
+    registry.register_name("gdi32.dll", "DeleteObject", gdi_delete_object);
+
     registry.register_name("winmm.dll", "timeGetTime", time_get_time);
     registry.register_name("winmm.dll", "timeBeginPeriod", time_begin_period);
     registry.register_name("winmm.dll", "timeEndPeriod", time_end_period);
+    registry.register_name("winmm.dll", "timeSetEvent", time_set_event);
+    registry.register_name("winmm.dll", "timeKillEvent", time_kill_event);
 }
 
 fn create_file_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
@@ -1599,5 +1643,546 @@ fn exit_process(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result
     cpu.exit_reason = ExitReason::Halt as u32;
     cpu.exit_detail = code;
     return_stdcall(cpu, ctx.arena, 1, code)?;
+    Ok(())
+}
+
+fn lstrlen_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let len = if ptr == 0 {
+        0
+    } else {
+        ctx.arena.read_cstr(ptr, MAX_DEBUG_STR_LEN)?.len() as u32
+    };
+    return_stdcall(cpu, ctx.arena, 1, len)?;
+    Ok(())
+}
+
+fn lstrcpy_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let dst = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let src = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let text = ctx.arena.read_cstr(src, MAX_DEBUG_STR_LEN)?;
+    ctx.arena.write_cstr(dst, &text)?;
+    return_stdcall(cpu, ctx.arena, 2, dst)?;
+    Ok(())
+}
+
+fn lstrcat_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let dst = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let src = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let dst_len = ctx.arena.read_cstr(dst, MAX_DEBUG_STR_LEN)?.len() as u32;
+    let src_text = ctx.arena.read_cstr(src, MAX_DEBUG_STR_LEN)?;
+    ctx.arena.write_cstr(dst + dst_len, &src_text)?;
+    return_stdcall(cpu, ctx.arena, 2, dst)?;
+    Ok(())
+}
+
+fn lstrcmpi_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let a_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let b_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let a = ctx.arena.read_cstr(a_ptr, MAX_DEBUG_STR_LEN)?;
+    let b = ctx.arena.read_cstr(b_ptr, MAX_DEBUG_STR_LEN)?;
+    let ord = a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+    let val = match ord {
+        std::cmp::Ordering::Less => -1i32 as u32,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    return_stdcall(cpu, ctx.arena, 2, val)?;
+    Ok(())
+}
+
+fn create_file_w(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let name_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let desired_access = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let disposition = peek_arg_u32(cpu, ctx.arena, 4)?;
+
+    let mut units = Vec::new();
+    let mut off = 0u32;
+    while units.len() < MAX_PATH_LEN {
+        let u = ctx.arena.read_u16(name_ptr + off)?;
+        if u == 0 {
+            break;
+        }
+        units.push(u);
+        off += 2;
+    }
+    let win_path = String::from_utf16_lossy(&units);
+    let host_path = ctx.win32.resolve_path(&win_path);
+    let existed = host_path.exists();
+
+    let want_read = (desired_access & GENERIC_READ) != 0 || desired_access == 0;
+    let want_write = (desired_access & GENERIC_WRITE) != 0;
+
+    let mut opts = OpenOptions::new();
+    match disposition {
+        CREATE_NEW => {
+            opts.read(want_read).write(true).create_new(true);
+        }
+        CREATE_ALWAYS => {
+            opts.read(want_read).write(true).create(true).truncate(true);
+        }
+        OPEN_EXISTING => {
+            opts.read(want_read || !want_write).write(want_write);
+        }
+        OPEN_ALWAYS => {
+            opts.read(want_read || !want_write)
+                .write(want_write)
+                .create(true);
+        }
+        TRUNCATE_EXISTING => {
+            opts.read(want_read).write(true).truncate(true);
+        }
+        _ => {
+            *ctx.last_error = ERROR_INVALID_PARAMETER;
+            return_stdcall(cpu, ctx.arena, 7, INVALID_HANDLE_VALUE)?;
+            return Ok(());
+        }
+    }
+
+    match opts.open(&host_path) {
+        Ok(file) => {
+            *ctx.last_error = if existed && (disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS) {
+                ERROR_ALREADY_EXISTS
+            } else {
+                ERROR_SUCCESS
+            };
+            let handle = ctx.win32.alloc_handle(Win32Handle::File {
+                file,
+                path: host_path,
+            });
+            return_stdcall(cpu, ctx.arena, 7, handle)?;
+        }
+        Err(err) => {
+            *ctx.last_error = map_io_error(&err);
+            return_stdcall(cpu, ctx.arena, 7, INVALID_HANDLE_VALUE)?;
+        }
+    }
+    Ok(())
+}
+
+fn global_memory_status(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    const PHYS_512_MIB: u32 = 512 * 1024 * 1024;
+    const AVAIL_384_MIB: u32 = 384 * 1024 * 1024;
+    const PAGE_1_GIB: u32 = 1024 * 1024 * 1024;
+    const VIRT_2_GIB: u32 = 0x7FFF_0000;
+    ctx.arena.write_u32(ptr, 32)?;
+    ctx.arena.write_u32(ptr + 4, 25)?;
+    ctx.arena.write_u32(ptr + 8, PHYS_512_MIB)?;
+    ctx.arena.write_u32(ptr + 12, AVAIL_384_MIB)?;
+    ctx.arena.write_u32(ptr + 16, PAGE_1_GIB)?;
+    ctx.arena.write_u32(ptr + 20, PAGE_1_GIB)?;
+    ctx.arena.write_u32(ptr + 24, VIRT_2_GIB)?;
+    ctx.arena.write_u32(ptr + 28, VIRT_2_GIB)?;
+    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    Ok(())
+}
+
+fn create_mutex_a(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let handle = ctx.win32.alloc_handle(Win32Handle::Mutex);
+    *ctx.last_error = ERROR_SUCCESS;
+    return_stdcall(cpu, ctx.arena, 3, handle)?;
+    Ok(())
+}
+
+fn release_mutex(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 1)?;
+    Ok(())
+}
+
+const UNIX_EPOCH_TO_FILETIME_100NS: u64 = 116_444_736_000_000_000;
+
+fn get_system_time_as_file_time(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let ft = UNIX_EPOCH_TO_FILETIME_100NS + (nanos / 100);
+    ctx.arena.write_u32(ptr, ft as u32)?;
+    ctx.arena.write_u32(ptr + 4, (ft >> 32) as u32)?;
+    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    Ok(())
+}
+
+fn file_time_to_local_file_time(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let in_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let out_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let ft = ctx.arena.read_u64(in_ptr)?;
+    ctx.arena.write_u64(out_ptr, ft)?;
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    Ok(())
+}
+
+fn file_time_to_system_time(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let in_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let out_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let ft = ctx.arena.read_u64(in_ptr)?;
+    let unix_100ns = ft.saturating_sub(UNIX_EPOCH_TO_FILETIME_100NS);
+    let secs = (unix_100ns / 10_000_000) as libc::time_t;
+    let millis = ((unix_100ns % 10_000_000) / 10_000) as u16;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::gmtime_r(&secs, &mut tm);
+    }
+    ctx.arena.write_u16(out_ptr, (tm.tm_year + 1900) as u16)?;
+    ctx.arena.write_u16(out_ptr + 2, (tm.tm_mon + 1) as u16)?;
+    ctx.arena.write_u16(out_ptr + 4, tm.tm_wday as u16)?;
+    ctx.arena.write_u16(out_ptr + 6, tm.tm_mday as u16)?;
+    ctx.arena.write_u16(out_ptr + 8, tm.tm_hour as u16)?;
+    ctx.arena.write_u16(out_ptr + 10, tm.tm_min as u16)?;
+    ctx.arena.write_u16(out_ptr + 12, tm.tm_sec.min(59) as u16)?;
+    ctx.arena.write_u16(out_ptr + 14, millis)?;
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    Ok(())
+}
+
+fn system_time_to_file_time(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let out_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    ctx.arena.write_u64(out_ptr, UNIX_EPOCH_TO_FILETIME_100NS)?;
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    Ok(())
+}
+
+fn get_thread_locale(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 0, 0x0409)?;
+    Ok(())
+}
+
+fn get_locale_info_a(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let buf_ptr = peek_arg_u32(cpu, ctx.arena, 2)?;
+    let buf_len = peek_arg_i32(cpu, ctx.arena, 3)?;
+    let val = "1";
+    if buf_ptr == 0 || buf_len == 0 {
+        return_stdcall(cpu, ctx.arena, 4, (val.len() + 1) as u32)?;
+        return Ok(());
+    }
+    if (buf_len as usize) < val.len() + 1 {
+        *ctx.last_error = ERROR_INSUFFICIENT_BUFFER;
+        return_stdcall(cpu, ctx.arena, 4, 0)?;
+        return Ok(());
+    }
+    ctx.arena.write_cstr(buf_ptr, val)?;
+    return_stdcall(cpu, ctx.arena, 4, (val.len() + 1) as u32)?;
+    Ok(())
+}
+
+fn get_drive_type_a(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    const DRIVE_FIXED: u32 = 3;
+    return_stdcall(cpu, ctx.arena, 1, DRIVE_FIXED)?;
+    Ok(())
+}
+
+fn get_disk_free_space_ex_a(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let avail_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let total_ptr = peek_arg_u32(cpu, ctx.arena, 2)?;
+    let free_ptr = peek_arg_u32(cpu, ctx.arena, 3)?;
+    const TWO_GIB: u64 = 2u64 * 1024 * 1024 * 1024;
+    if avail_ptr != 0 {
+        ctx.arena.write_u64(avail_ptr, TWO_GIB)?;
+    }
+    if total_ptr != 0 {
+        ctx.arena.write_u64(total_ptr, TWO_GIB)?;
+    }
+    if free_ptr != 0 {
+        ctx.arena.write_u64(free_ptr, TWO_GIB)?;
+    }
+    return_stdcall(cpu, ctx.arena, 4, 1)?;
+    Ok(())
+}
+
+fn create_file_mapping_a(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let h_file = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let max_low = peek_arg_u32(cpu, ctx.arena, 4)? as usize;
+
+    let bytes = if h_file == INVALID_HANDLE_VALUE {
+        vec![0u8; max_low.max(4096)]
+    } else if let Some(Win32Handle::File { file, .. }) = ctx.win32.get_handle_mut(h_file) {
+        let saved = file.stream_position().unwrap_or(0);
+        let _ = file.seek(SeekFrom::Start(0));
+        let mut buf = Vec::new();
+        let _ = file.read_to_end(&mut buf);
+        let _ = file.seek(SeekFrom::Start(saved));
+        buf
+    } else {
+        *ctx.last_error = ERROR_INVALID_HANDLE;
+        return_stdcall(cpu, ctx.arena, 6, 0)?;
+        return Ok(());
+    };
+
+    let handle = ctx.win32.alloc_handle(Win32Handle::FileMapping { bytes });
+    *ctx.last_error = ERROR_SUCCESS;
+    return_stdcall(cpu, ctx.arena, 6, handle)?;
+    Ok(())
+}
+
+fn map_view_of_file(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let h_map = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let off_low = peek_arg_u32(cpu, ctx.arena, 3)? as usize;
+    let num_bytes = peek_arg_u32(cpu, ctx.arena, 4)? as usize;
+
+    let slice = match ctx.win32.get_handle(h_map) {
+        Some(Win32Handle::FileMapping { bytes }) => {
+            let start = off_low.min(bytes.len());
+            let end = if num_bytes == 0 {
+                bytes.len()
+            } else {
+                start.saturating_add(num_bytes).min(bytes.len())
+            };
+            bytes[start..end].to_vec()
+        }
+        _ => {
+            *ctx.last_error = ERROR_INVALID_HANDLE;
+            return_stdcall(cpu, ctx.arena, 5, 0)?;
+            return Ok(());
+        }
+    };
+
+    let alloc_len = slice.len().max(1);
+    let Ok(base) = ctx
+        .vmem
+        .virtual_alloc(ctx.arena, None, alloc_len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+    else {
+        *ctx.last_error = ERROR_NOT_ENOUGH_MEMORY;
+        return_stdcall(cpu, ctx.arena, 5, 0)?;
+        return Ok(());
+    };
+    if !slice.is_empty() {
+        ctx.arena.write_bytes(base, &slice)?;
+    }
+    ctx.win32.mapped_views.insert(base, alloc_len);
+    *ctx.last_error = ERROR_SUCCESS;
+    return_stdcall(cpu, ctx.arena, 5, base)?;
+    Ok(())
+}
+
+fn unmap_view_of_file(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let base = peek_arg_u32(cpu, ctx.arena, 0)?;
+    if ctx.win32.mapped_views.remove(&base).is_some() {
+        let _ = ctx.vmem.virtual_free(ctx.arena, base, 0, MEM_RELEASE);
+    }
+    return_stdcall(cpu, ctx.arena, 1, 1)?;
+    Ok(())
+}
+
+fn find_resource_null(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    *ctx.last_error = ERROR_FILE_NOT_FOUND;
+    return_stdcall(cpu, ctx.arena, 3, 0)?;
+    Ok(())
+}
+
+fn load_resource(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 2, 0)?;
+    Ok(())
+}
+
+fn lock_resource(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    Ok(())
+}
+
+fn sizeof_resource(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 2, 0)?;
+    Ok(())
+}
+
+fn set_file_attributes_a(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    Ok(())
+}
+
+fn copy_file_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let src_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let dst_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let fail_if_exists = peek_arg_u32(cpu, ctx.arena, 2)? != 0;
+    let src = ctx.win32.resolve_path(&ctx.arena.read_cstr(src_ptr, MAX_PATH_LEN)?);
+    let dst = ctx.win32.resolve_path(&ctx.arena.read_cstr(dst_ptr, MAX_PATH_LEN)?);
+
+    if fail_if_exists && dst.exists() {
+        *ctx.last_error = ERROR_ALREADY_EXISTS;
+        return_stdcall(cpu, ctx.arena, 3, 0)?;
+        return Ok(());
+    }
+    match std::fs::copy(&src, &dst) {
+        Ok(_) => {
+            *ctx.last_error = ERROR_SUCCESS;
+            return_stdcall(cpu, ctx.arena, 3, 1)?;
+        }
+        Err(err) => {
+            *ctx.last_error = map_io_error(&err);
+            return_stdcall(cpu, ctx.arena, 3, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_directory_a(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let path_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let path = ctx.win32.resolve_path(&ctx.arena.read_cstr(path_ptr, MAX_PATH_LEN)?);
+    match std::fs::remove_dir(&path) {
+        Ok(()) => {
+            *ctx.last_error = ERROR_SUCCESS;
+            return_stdcall(cpu, ctx.arena, 1, 1)?;
+        }
+        Err(err) => {
+            *ctx.last_error = map_io_error(&err);
+            return_stdcall(cpu, ctx.arena, 1, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn get_overlapped_result(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let bytes_ptr = peek_arg_u32(cpu, ctx.arena, 2)?;
+    if bytes_ptr != 0 {
+        ctx.arena.write_u32(bytes_ptr, 0)?;
+    }
+    return_stdcall(cpu, ctx.arena, 4, 1)?;
+    Ok(())
+}
+
+fn create_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let id_ptr = peek_arg_u32(cpu, ctx.arena, 5)?;
+    let handle = ctx.win32.alloc_handle(Win32Handle::Thread { exit_code: 0 });
+    if id_ptr != 0 {
+        ctx.arena.write_u32(id_ptr, handle)?;
+    }
+    return_stdcall(cpu, ctx.arena, 6, handle)?;
+    Ok(())
+}
+
+fn exit_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    Ok(())
+}
+
+fn get_exit_code_thread(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let code_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    if code_ptr != 0 {
+        ctx.arena.write_u32(code_ptr, 0)?;
+    }
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    Ok(())
+}
+
+fn set_thread_priority(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    Ok(())
+}
+
+fn get_thread_priority(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    Ok(())
+}
+
+fn set_thread_priority_boost(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    Ok(())
+}
+
+fn resume_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 1)?;
+    Ok(())
+}
+
+fn suspend_thread(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    Ok(())
+}
+
+fn pulse_event(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 1)?;
+    Ok(())
+}
+
+fn gdi_delete_object(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 1)?;
+    Ok(())
+}
+
+fn time_set_event(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 5, 1)?;
+    Ok(())
+}
+
+fn time_kill_event(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 1, 0)?;
     Ok(())
 }

@@ -267,6 +267,8 @@ fn explore_function(
             total_instrs += 1;
             block_end_va = next_va;
 
+            enqueue_immediate_code_pointers(image, &instr, queued_entries, fn_worklist);
+
             if recent.len() == LOOKBACK_INSTR_LIMIT {
                 recent.remove(0);
             }
@@ -527,14 +529,65 @@ fn scan_data_section_pointers(image: &PeImage) -> Vec<GuestAddr> {
     seeds
 }
 
+fn enqueue_immediate_code_pointers(
+    image: &PeImage,
+    instr: &Instruction,
+    queued_entries: &mut BTreeSet<GuestAddr>,
+    fn_worklist: &mut VecDeque<(GuestAddr, SeedKind)>,
+) {
+    for op_idx in 0..instr.op_count() {
+        if instr.op_kind(op_idx) == OpKind::Immediate32 {
+            let imm = instr.immediate32();
+            if is_valid_data_pointer_target(image, imm) {
+                enqueue_seed(
+                    image,
+                    imm,
+                    SeedKind::DataPointer,
+                    queued_entries,
+                    fn_worklist,
+                );
+            }
+        }
+    }
+}
+
 fn is_valid_data_pointer_target(image: &PeImage, target_va: GuestAddr) -> bool {
     let Some((_sec, slice)) = executable_slice_from_va(image, target_va) else {
         return false;
     };
+    if is_jmp_thunk_to_function(image, target_va, slice) {
+        return true;
+    }
     if !decodes_cleanly(slice, target_va, DATA_PTR_DECODE_MIN_INSTRS) {
         return false;
     }
     looks_like_msvc_prologue(slice) || is_preceded_by_padding_or_terminator(image, target_va)
+}
+
+fn is_jmp_thunk_to_function(image: &PeImage, va: GuestAddr, slice: &[u8]) -> bool {
+    if slice.len() < 5 || slice[0] != 0xE9 {
+        return false;
+    }
+    let Some(sec) = image.section_for_va(va) else {
+        return false;
+    };
+    let start_va = image.image_base.wrapping_add(sec.virtual_address);
+    let offset = (va - start_va) as usize;
+    let raw = sec.raw_bytes(&image.raw);
+    let preceded_by_thunk_or_pad = offset == 0
+        || is_preceded_by_padding_or_terminator(image, va)
+        || (offset >= 5 && offset <= raw.len() && raw[offset - 5] == 0xE9);
+    if !preceded_by_thunk_or_pad {
+        return false;
+    }
+    let rel = i32::from_le_bytes([slice[1], slice[2], slice[3], slice[4]]);
+    let target_va = va.wrapping_add(5).wrapping_add(rel as u32);
+    let Some((_tsec, target_slice)) = executable_slice_from_va(image, target_va) else {
+        return false;
+    };
+    decodes_cleanly(target_slice, target_va, DATA_PTR_DECODE_MIN_INSTRS)
+        && (looks_like_msvc_prologue(target_slice)
+            || is_preceded_by_padding_or_terminator(image, target_va))
 }
 
 fn decodes_cleanly(slice: &[u8], start_va: GuestAddr, min_instrs: usize) -> bool {

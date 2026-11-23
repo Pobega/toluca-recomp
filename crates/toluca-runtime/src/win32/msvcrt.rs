@@ -6,9 +6,9 @@ use toluca_core::GuestAddr;
 use toluca_core::cpu::{ExitReason, Gpr, GuestCpuState};
 
 use crate::arena::{ArenaError, GuestArena};
-use crate::callconv::{peek_arg_i32, peek_arg_u32, return_cdecl, return_cdecl_u64};
+use crate::callconv::{peek_arg_i32, peek_arg_u32, return_cdecl, return_cdecl_u64, return_stdcall};
 use crate::runtime::{ImportHandler, ImportRegistry, RuntimeContext, RuntimeError};
-use crate::win32::CFileEntry;
+use crate::win32::{CFileEntry, Win32Handle};
 
 const MAX_STR_SCAN: usize = 65536;
 const SEEK_SET: u32 = 0;
@@ -90,6 +90,44 @@ pub fn register_imports(registry: &mut ImportRegistry) {
         ("clock", c_clock),
         ("time", c_time),
         ("qsort", c_qsort),
+        ("__p__fmode", c_p_fmode),
+        ("__p__commode", c_p_commode),
+        ("__getmainargs", c_getmainargs),
+        ("__setusermatherr", c_stub_void_1),
+        ("_onexit", c_onexit),
+        ("__dllonexit", c_dllonexit),
+        ("_cexit", c_stub_void_0),
+        ("_c_exit", c_stub_void_0),
+        ("_amsg_exit", c_exit),
+        ("_XcptFilter", c_stub_void_0),
+        ("__security_error_handler", c_exit),
+        ("_except_handler3", c_stub_one),
+        ("__CxxFrameHandler", c_stub_one),
+        ("?terminate@@YAXXZ", c_terminate),
+        ("_CxxThrowException", c_cxx_throw_exception),
+        ("??_U@YAPAXI@Z", c_malloc),
+        ("??_V@YAXPAX@Z", c_free),
+        ("_aligned_malloc", c_aligned_malloc),
+        ("_aligned_free", c_aligned_free),
+        ("wcslen", c_wcslen),
+        ("isspace", c_isspace),
+        ("isdigit", c_isdigit),
+        ("iswascii", c_iswascii),
+        ("_finite", c_finite),
+        ("puts", c_puts),
+        ("fputs", c_fputs),
+        ("fprintf", c_fprintf),
+        ("printf", c_printf),
+        ("strtok", c_strtok),
+        ("_beginthread", c_beginthread),
+        ("??0exception@@QAE@XZ", c_exception_ctor_default),
+        ("??0exception@@QAE@ABV0@@Z", c_exception_ctor_copy),
+        ("??1exception@@UAE@XZ", c_exception_dtor),
+        ("??1type_info@@UAE@XZ", c_exception_dtor),
+        ("_CIasin", c_ci_asin),
+        ("_CIacos", c_ci_acos),
+        ("_CIpow", c_ci_pow),
+        ("_CIfmod", c_ci_fmod),
     ];
 
     for &dll in CRT_DLLS {
@@ -517,7 +555,7 @@ impl<'a> PrintfCursor<'a> {
     }
 }
 
-fn format_printf(
+pub(crate) fn format_printf(
     arena: &GuestArena,
     fmt: &str,
     arg_base: GuestAddr,
@@ -1334,5 +1372,344 @@ fn c_qsort(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), 
     let _ = ctx.heap.free(ctx.arena, tmp_a);
     let _ = ctx.heap.free(ctx.arena, tmp_b);
     return_cdecl(cpu, ctx.arena, 0)?;
+    Ok(())
+}
+
+fn c_p_fmode(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ptr = match ctx.win32.fmode_guest {
+        Some(existing) => existing,
+        None => {
+            let allocated = ctx.heap.alloc(ctx.arena, 4, true).unwrap_or(0);
+            ctx.win32.fmode_guest = (allocated != 0).then_some(allocated);
+            allocated
+        }
+    };
+    return_cdecl(cpu, ctx.arena, ptr)?;
+    Ok(())
+}
+
+fn c_p_commode(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ptr = match ctx.win32.commode_guest {
+        Some(existing) => existing,
+        None => {
+            let allocated = ctx.heap.alloc(ctx.arena, 4, true).unwrap_or(0);
+            ctx.win32.commode_guest = (allocated != 0).then_some(allocated);
+            allocated
+        }
+    };
+    return_cdecl(cpu, ctx.arena, ptr)?;
+    Ok(())
+}
+
+fn c_getmainargs(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let argc_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let argv_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let env_ptr = peek_arg_u32(cpu, ctx.arena, 2)?;
+
+    let exe_name = ctx.win32.config.exe_name.clone();
+    let arg0_va = ctx.heap.alloc(ctx.arena, exe_name.len() + 1, true).unwrap_or(0);
+    if arg0_va != 0 {
+        ctx.arena.write_cstr(arg0_va, &exe_name)?;
+    }
+
+    let argv_arr = ctx.heap.alloc(ctx.arena, 8, true).unwrap_or(0);
+    if argv_arr != 0 {
+        ctx.arena.write_u32(argv_arr, arg0_va)?;
+        ctx.arena.write_u32(argv_arr + 4, 0)?;
+    }
+
+    let env_arr = ctx.heap.alloc(ctx.arena, 4, true).unwrap_or(0);
+    if argc_ptr != 0 {
+        ctx.arena.write_u32(argc_ptr, 1)?;
+    }
+    if argv_ptr != 0 {
+        ctx.arena.write_u32(argv_ptr, argv_arr)?;
+    }
+    if env_ptr != 0 {
+        ctx.arena.write_u32(env_ptr, env_arr)?;
+    }
+
+    return_cdecl(cpu, ctx.arena, 0)?;
+    Ok(())
+}
+
+fn c_onexit(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let fn_va = peek_arg_u32(cpu, ctx.arena, 0)?;
+    if fn_va != 0 {
+        ctx.win32.atexit_callbacks.push(fn_va);
+    }
+    return_cdecl(cpu, ctx.arena, fn_va)?;
+    Ok(())
+}
+
+fn c_dllonexit(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let fn_va = peek_arg_u32(cpu, ctx.arena, 0)?;
+    if fn_va != 0 {
+        ctx.win32.atexit_callbacks.push(fn_va);
+    }
+    return_cdecl(cpu, ctx.arena, fn_va)?;
+    Ok(())
+}
+
+fn c_stub_void_0(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_cdecl(cpu, ctx.arena, 0)?;
+    Ok(())
+}
+
+fn c_stub_one(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_cdecl(cpu, ctx.arena, 1)?;
+    Ok(())
+}
+
+fn c_terminate(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    ctx.win32.exit_code = Some(1);
+    cpu.exit_reason = ExitReason::Halt as u32;
+    cpu.exit_detail = 1;
+    return_cdecl(cpu, ctx.arena, 1)?;
+    Ok(())
+}
+
+fn c_cxx_throw_exception(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let obj = peek_arg_u32(cpu, ctx.arena, 0)?;
+    cpu.exit_reason = ExitReason::GuestException as u32;
+    cpu.exit_detail = obj;
+    return_stdcall(cpu, ctx.arena, 2, 0)?;
+    Ok(())
+}
+
+fn c_aligned_malloc(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let size = peek_arg_u32(cpu, ctx.arena, 0)? as usize;
+    let align = (peek_arg_u32(cpu, ctx.arena, 1)? as usize).max(4);
+    let total = size.saturating_add(align).saturating_add(4);
+    let raw_ptr = ctx.heap.alloc(ctx.arena, total, false).unwrap_or(0);
+    if raw_ptr == 0 {
+        return_cdecl(cpu, ctx.arena, 0)?;
+        return Ok(());
+    }
+    let min_aligned = raw_ptr + 4;
+    let mask = (align as u32) - 1;
+    let aligned_ptr = (min_aligned + mask) & !mask;
+    ctx.arena.write_u32(aligned_ptr - 4, raw_ptr)?;
+    return_cdecl(cpu, ctx.arena, aligned_ptr)?;
+    Ok(())
+}
+
+fn c_aligned_free(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let mem_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    if mem_ptr != 0 {
+        if let Ok(raw_ptr) = ctx.arena.read_u32(mem_ptr - 4) {
+            let _ = ctx.heap.free(ctx.arena, raw_ptr);
+        }
+    }
+    return_cdecl(cpu, ctx.arena, 0)?;
+    Ok(())
+}
+
+fn c_wcslen(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let mut len = 0u32;
+    while (len as usize) < MAX_STR_SCAN {
+        if ctx.arena.read_u16(ptr + len * 2)? == 0 {
+            break;
+        }
+        len += 1;
+    }
+    return_cdecl(cpu, ctx.arena, len)?;
+    Ok(())
+}
+
+fn c_isspace(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ch = peek_arg_u32(cpu, ctx.arena, 0)? as u8;
+    return_cdecl(cpu, ctx.arena, u32::from(ch.is_ascii_whitespace()))?;
+    Ok(())
+}
+
+fn c_isdigit(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ch = peek_arg_u32(cpu, ctx.arena, 0)? as u8;
+    return_cdecl(cpu, ctx.arena, u32::from(ch.is_ascii_digit()))?;
+    Ok(())
+}
+
+fn c_iswascii(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ch = peek_arg_u32(cpu, ctx.arena, 0)?;
+    return_cdecl(cpu, ctx.arena, u32::from(ch < 0x80))?;
+    Ok(())
+}
+
+fn c_finite(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let val = peek_f64_arg(cpu, ctx.arena, 0)?;
+    return_cdecl(cpu, ctx.arena, u32::from(val.is_finite()))?;
+    Ok(())
+}
+
+fn c_puts(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    if ptr != 0 {
+        let text = ctx.arena.read_cstr(ptr, MAX_STR_SCAN)?;
+        if !ctx.win32.config.headless {
+            println!("{text}");
+        }
+    }
+    return_cdecl(cpu, ctx.arena, 0)?;
+    Ok(())
+}
+
+fn c_fputs(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let stream = peek_arg_u32(cpu, ctx.arena, 1)?;
+    if ptr != 0 {
+        let bytes = read_cstr_bytes(ctx.arena, ptr)?;
+        if let Some(entry) = ctx.win32.get_cfile_mut(stream) {
+            let _ = entry.file.write_all(&bytes);
+        }
+    }
+    return_cdecl(cpu, ctx.arena, 0)?;
+    Ok(())
+}
+
+fn c_fprintf(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let stream = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let fmt_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let fmt_str = ctx.arena.read_cstr(fmt_ptr, MAX_STR_SCAN)?;
+    let formatted = format_printf(ctx.arena, &fmt_str, cpu.gpr(Gpr::Esp) + 12)?;
+    let len = formatted.len() as u32;
+    if let Some(entry) = ctx.win32.get_cfile_mut(stream) {
+        let _ = entry.file.write_all(formatted.as_bytes());
+    }
+    return_cdecl(cpu, ctx.arena, len)?;
+    Ok(())
+}
+
+fn c_printf(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let fmt_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let fmt_str = ctx.arena.read_cstr(fmt_ptr, MAX_STR_SCAN)?;
+    let formatted = format_printf(ctx.arena, &fmt_str, cpu.gpr(Gpr::Esp) + 8)?;
+    if !ctx.win32.config.headless {
+        print!("{formatted}");
+    }
+    return_cdecl(cpu, ctx.arena, formatted.len() as u32)?;
+    Ok(())
+}
+
+fn c_strtok(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let str_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let delim_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let delims = read_cstr_bytes(ctx.arena, delim_ptr)?;
+
+    let mut cur = if str_ptr != 0 {
+        str_ptr
+    } else {
+        let Some(saved) = ctx.win32.strtok_cursor else {
+            return_cdecl(cpu, ctx.arena, 0)?;
+            return Ok(());
+        };
+        saved
+    };
+
+    loop {
+        let b = ctx.arena.read_u8(cur)?;
+        if b == 0 {
+            ctx.win32.strtok_cursor = None;
+            return_cdecl(cpu, ctx.arena, 0)?;
+            return Ok(());
+        }
+        if !delims.contains(&b) {
+            break;
+        }
+        cur += 1;
+    }
+
+    let token_start = cur;
+    loop {
+        let b = ctx.arena.read_u8(cur)?;
+        if b == 0 {
+            ctx.win32.strtok_cursor = None;
+            break;
+        }
+        if delims.contains(&b) {
+            ctx.arena.write_u8(cur, 0)?;
+            ctx.win32.strtok_cursor = Some(cur + 1);
+            break;
+        }
+        cur += 1;
+    }
+
+    return_cdecl(cpu, ctx.arena, token_start)?;
+    Ok(())
+}
+
+fn c_beginthread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let handle = ctx.win32.alloc_handle(Win32Handle::Thread { exit_code: 0 });
+    return_cdecl(cpu, ctx.arena, handle)?;
+    Ok(())
+}
+
+fn c_exception_ctor_default(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let this_va = cpu.gpr(Gpr::Ecx);
+    return_stdcall(cpu, ctx.arena, 0, this_va)?;
+    Ok(())
+}
+
+fn c_exception_ctor_copy(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let this_va = cpu.gpr(Gpr::Ecx);
+    return_stdcall(cpu, ctx.arena, 1, this_va)?;
+    Ok(())
+}
+
+fn c_exception_dtor(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let this_va = cpu.gpr(Gpr::Ecx);
+    return_stdcall(cpu, ctx.arena, 0, this_va)?;
+    Ok(())
+}
+
+fn c_ci_asin(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let x = cpu.x87.st(0);
+    *cpu.x87.st_mut(0) = x.asin();
+    let saved_eax = cpu.gpr(Gpr::Eax);
+    return_cdecl(cpu, ctx.arena, saved_eax)?;
+    Ok(())
+}
+
+fn c_ci_acos(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let x = cpu.x87.st(0);
+    *cpu.x87.st_mut(0) = x.acos();
+    let saved_eax = cpu.gpr(Gpr::Eax);
+    return_cdecl(cpu, ctx.arena, saved_eax)?;
+    Ok(())
+}
+
+fn c_ci_pow(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let exp = cpu.x87.pop();
+    let base = cpu.x87.st(0);
+    *cpu.x87.st_mut(0) = base.powf(exp);
+    let saved_eax = cpu.gpr(Gpr::Eax);
+    return_cdecl(cpu, ctx.arena, saved_eax)?;
+    Ok(())
+}
+
+fn c_ci_fmod(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let y = cpu.x87.pop();
+    let x = cpu.x87.st(0);
+    *cpu.x87.st_mut(0) = x % y;
+    let saved_eax = cpu.gpr(Gpr::Eax);
+    return_cdecl(cpu, ctx.arena, saved_eax)?;
     Ok(())
 }

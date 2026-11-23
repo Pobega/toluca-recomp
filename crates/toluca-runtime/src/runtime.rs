@@ -1,18 +1,19 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use toluca_core::GuestAddr;
 use toluca_core::aot::ImportSymbol;
 use toluca_core::bridge::{HostBridge, default_x87_helper};
 use toluca_core::cpu::{ExitReason, Gpr, GuestCpuState};
-use toluca_core::memory::{GUEST_TEB_ADDR, GUEST_THUNK_BASE, GUEST_THUNK_END};
+use toluca_core::memory::{GUEST_ARENA_SIZE, GUEST_TEB_ADDR, GUEST_THUNK_BASE, GUEST_THUNK_END};
 use toluca_core::pe::{PeError, PeImage};
 
 use crate::arena::{ArenaError, GuestArena};
 use crate::callconv;
-use crate::heap::{GuestHeap, VirtualMemoryManager};
+use crate::heap::{GuestHeap, HeapError, VirtualMemoryManager};
 use crate::loader::{AotCodeImage, LoaderError};
 use crate::win32::{Win32Config, Win32State};
 
@@ -52,6 +53,7 @@ pub enum RuntimeError {
     Pe(PeError),
     Loader(LoaderError),
     Arena(ArenaError),
+    Heap(HeapError),
     TooManyImports(usize),
     UnmappedEntry(GuestAddr),
     UnmappedCallback(GuestAddr),
@@ -66,6 +68,7 @@ impl fmt::Display for RuntimeError {
             Self::Pe(err) => write!(f, "PE32 parse error: {err}"),
             Self::Loader(err) => write!(f, "AOT loader error: {err}"),
             Self::Arena(err) => write!(f, "arena error: {err}"),
+            Self::Heap(err) => write!(f, "heap error: {err}"),
             Self::TooManyImports(count) => write!(f, "import count {count} exceeds thunk table capacity"),
             Self::UnmappedEntry(va) => write!(f, "no recompiled function found at entry VA 0x{va:08x}"),
             Self::UnmappedCallback(va) => write!(f, "no recompiled function found at callback VA 0x{va:08x}"),
@@ -89,6 +92,7 @@ impl std::error::Error for RuntimeError {
             Self::Pe(err) => Some(err),
             Self::Loader(err) => Some(err),
             Self::Arena(err) => Some(err),
+            Self::Heap(err) => Some(err),
             _ => None,
         }
     }
@@ -115,6 +119,12 @@ impl From<LoaderError> for RuntimeError {
 impl From<ArenaError> for RuntimeError {
     fn from(err: ArenaError) -> Self {
         Self::Arena(err)
+    }
+}
+
+impl From<HeapError> for RuntimeError {
+    fn from(err: HeapError) -> Self {
+        Self::Heap(err)
     }
 }
 
@@ -358,6 +368,9 @@ impl Runtime {
         arena.map_pe_image(&pe, &pe.raw)?;
         arena.init_thread_environment(pe.image_base)?;
 
+        let mut heap = GuestHeap::new();
+        let mut win32 = Win32State::new(config);
+
         let manifest_imports = &code.manifest().imports;
         if manifest_imports.len() > MAX_IMPORT_THUNK_SLOTS {
             return Err(RuntimeError::TooManyImports(manifest_imports.len()));
@@ -367,8 +380,14 @@ impl Runtime {
         let mut import_slot_map = HashMap::with_capacity(manifest_imports.len());
 
         for (slot_idx, imp) in manifest_imports.iter().enumerate() {
-            let thunk_va = import_slot_to_va(slot_idx);
-            arena.write_iat_u32(imp.iat_va, thunk_va)?;
+            if let Some(data_va) =
+                resolve_data_import(&imp.dll_name, &imp.symbol, &mut arena, &mut heap, &mut win32)?
+            {
+                arena.write_iat_u32(imp.iat_va, data_va)?;
+            } else {
+                let thunk_va = import_slot_to_va(slot_idx);
+                arena.write_iat_u32(imp.iat_va, thunk_va)?;
+            }
 
             let handler = registry.get(&imp.dll_name, &imp.symbol);
             let key = ImportKey::from_import(&imp.dll_name, &imp.symbol);
@@ -385,9 +404,9 @@ impl Runtime {
             pe,
             code,
             arena,
-            heap: GuestHeap::new(),
+            heap,
             vmem: VirtualMemoryManager::new(),
-            win32: Win32State::new(config),
+            win32,
             imports,
             import_slot_map,
             registry,
@@ -448,9 +467,11 @@ impl Runtime {
         let bridge = build_host_bridge((&mut ctx as *mut RuntimeContext<'_>).cast());
         cpu.bridge = &bridge;
 
+        let _sig_guard = SigsegvDiagnosticGuard::install(ctx.arena.base_ptr());
         unsafe {
             entry_fn(&mut cpu);
         }
+        drop(_sig_guard);
 
         if let Some(err) = pending_error {
             return Err(err);
@@ -600,6 +621,18 @@ fn dispatch_import_slot(ctx: &mut RuntimeContext<'_>, state: &mut GuestCpuState,
         return;
     };
 
+    record_last_import(&slot.dll_name, &slot.symbol);
+    if ctx.win32.config.trace_imports {
+        let a0 = callconv::peek_arg_u32(state, ctx.arena, 0).unwrap_or(0);
+        let a1 = callconv::peek_arg_u32(state, ctx.arena, 1).unwrap_or(0);
+        let a2 = callconv::peek_arg_u32(state, ctx.arena, 2).unwrap_or(0);
+        let a3 = callconv::peek_arg_u32(state, ctx.arena, 3).unwrap_or(0);
+        eprintln!(
+            "[import] {}!{:?}(0x{a0:08x}, 0x{a1:08x}, 0x{a2:08x}, 0x{a3:08x})",
+            slot.dll_name, slot.symbol
+        );
+    }
+
     let Some(handler) = slot.handler else {
         state.exit_reason = ExitReason::HostTrap as u32;
         state.exit_detail = import_index;
@@ -618,6 +651,161 @@ fn dispatch_import_slot(ctx: &mut RuntimeContext<'_>, state: &mut GuestCpuState,
             *ctx.pending_error = Some(err);
         }
     }
+}
+
+fn resolve_data_import(
+    dll_name: &str,
+    symbol: &ImportSymbol,
+    arena: &mut GuestArena,
+    heap: &mut GuestHeap,
+    win32: &mut Win32State,
+) -> Result<Option<GuestAddr>, RuntimeError> {
+    if !dll_name.eq_ignore_ascii_case("msvcr70.dll") && !dll_name.eq_ignore_ascii_case("msvcrt.dll")
+    {
+        return Ok(None);
+    }
+    let ImportSymbol::Name(name) = symbol else {
+        return Ok(None);
+    };
+    match name.as_str() {
+        "_acmdln" => {
+            let str_va = match win32.command_line_guest {
+                Some(existing) => existing,
+                None => {
+                    let cmd = win32.config.command_line.clone();
+                    let allocated = heap.alloc(arena, cmd.len() + 1, true)?;
+                    arena.write_cstr(allocated, &cmd)?;
+                    win32.command_line_guest = Some(allocated);
+                    allocated
+                }
+            };
+            let ptr_slot = heap.alloc(arena, 4, true)?;
+            arena.write_u32(ptr_slot, str_va)?;
+            Ok(Some(ptr_slot))
+        }
+        "_adjust_fdiv" => {
+            let slot = heap.alloc(arena, 4, true)?;
+            Ok(Some(slot))
+        }
+        _ => Ok(None),
+    }
+}
+
+const LAST_IMPORT_CAP: usize = 96;
+static ARENA_BASE_ADDR: AtomicUsize = AtomicUsize::new(0);
+static ARENA_END_ADDR: AtomicUsize = AtomicUsize::new(0);
+static LAST_IMPORT_LEN: AtomicUsize = AtomicUsize::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_U8: AtomicU8 = AtomicU8::new(0);
+static LAST_IMPORT_BUF: [AtomicU8; LAST_IMPORT_CAP] = [ZERO_U8; LAST_IMPORT_CAP];
+
+fn record_last_import(dll_name: &str, symbol: &ImportSymbol) {
+    let label = match symbol {
+        ImportSymbol::Name(name) => format!("{dll_name}!{name}"),
+        ImportSymbol::Ordinal(ord) => format!("{dll_name}!#{ord}"),
+    };
+    let bytes = label.as_bytes();
+    let len = bytes.len().min(LAST_IMPORT_CAP);
+    for (idx, &b) in bytes[..len].iter().enumerate() {
+        LAST_IMPORT_BUF[idx].store(b, Ordering::Relaxed);
+    }
+    LAST_IMPORT_LEN.store(len, Ordering::Relaxed);
+}
+
+struct SigsegvDiagnosticGuard {
+    prev_action: libc::sigaction,
+    installed: bool,
+}
+
+impl SigsegvDiagnosticGuard {
+    fn install(arena_base: *mut u8) -> Self {
+        let base = arena_base as usize;
+        let end = base.saturating_add(GUEST_ARENA_SIZE as usize);
+        ARENA_BASE_ADDR.store(base, Ordering::Relaxed);
+        ARENA_END_ADDR.store(end, Ordering::Relaxed);
+
+        let mut new_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        new_action.sa_sigaction = sigsegv_diagnostic_handler as usize;
+        new_action.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        let mut prev_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::sigaction(libc::SIGSEGV, &new_action, &mut prev_action) };
+        Self {
+            prev_action,
+            installed: rc == 0,
+        }
+    }
+}
+
+impl Drop for SigsegvDiagnosticGuard {
+    fn drop(&mut self) {
+        if self.installed {
+            unsafe {
+                libc::sigaction(libc::SIGSEGV, &self.prev_action, std::ptr::null_mut());
+            }
+        }
+        ARENA_BASE_ADDR.store(0, Ordering::Relaxed);
+        ARENA_END_ADDR.store(0, Ordering::Relaxed);
+    }
+}
+
+extern "C" fn sigsegv_diagnostic_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ucontext: *mut core::ffi::c_void,
+) {
+    let fault_addr = if info.is_null() {
+        0usize
+    } else {
+        unsafe { (*info).si_addr() as usize }
+    };
+    let base = ARENA_BASE_ADDR.load(Ordering::Relaxed);
+    let end = ARENA_END_ADDR.load(Ordering::Relaxed);
+
+    let mut out = [0u8; 256];
+    let mut pos = 0usize;
+    pos = push_bytes(&mut out, pos, b"[SIGSEGV] host=0x");
+    pos = push_hex_usize(&mut out, pos, fault_addr);
+    if base != 0 && fault_addr >= base && fault_addr < end {
+        pos = push_bytes(&mut out, pos, b" guest=0x");
+        pos = push_hex_usize(&mut out, pos, fault_addr - base);
+    } else {
+        pos = push_bytes(&mut out, pos, b" (outside guest arena)");
+    }
+    pos = push_bytes(&mut out, pos, b" last_import=");
+    let imp_len = LAST_IMPORT_LEN.load(Ordering::Relaxed).min(LAST_IMPORT_CAP);
+    for slot in &LAST_IMPORT_BUF[..imp_len] {
+        if pos < out.len() {
+            out[pos] = slot.load(Ordering::Relaxed);
+            pos += 1;
+        }
+    }
+    pos = push_bytes(&mut out, pos, b"\n");
+    unsafe {
+        libc::write(libc::STDERR_FILENO, out.as_ptr().cast(), pos);
+        libc::raise(sig);
+    }
+}
+
+fn push_bytes(buf: &mut [u8], mut pos: usize, src: &[u8]) -> usize {
+    for &b in src {
+        if pos < buf.len() {
+            buf[pos] = b;
+            pos += 1;
+        }
+    }
+    pos
+}
+
+fn push_hex_usize(buf: &mut [u8], mut pos: usize, val: usize) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digits = core::mem::size_of::<usize>() * 2;
+    for shift in (0..digits).rev() {
+        if pos < buf.len() {
+            buf[pos] = HEX[(val >> (shift * 4)) & 0xF];
+            pos += 1;
+        }
+    }
+    pos
 }
 
 unsafe extern "C" fn bridge_call_import(cpu: *mut GuestCpuState, import_index: u32) {
@@ -744,6 +932,9 @@ unsafe extern "C" fn bridge_unhandled_instruction(
     let Some((state, ctx)) = (unsafe { context_from_cpu(cpu) }) else {
         return;
     };
+    if ctx.win32.config.trace_imports {
+        eprintln!("[unhandled_insn] va=0x{guest_va:08x} reason={reason}");
+    }
     if state.exit_reason != ExitReason::Running as u32 {
         return;
     }

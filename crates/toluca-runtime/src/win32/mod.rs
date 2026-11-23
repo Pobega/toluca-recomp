@@ -1,4 +1,5 @@
 pub mod d3d8_stub;
+pub mod extra_dlls;
 pub mod kernel32;
 pub mod msvcrt;
 pub mod path;
@@ -54,6 +55,7 @@ pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub struct Win32Config {
     pub game_root: PathBuf,
     pub headless: bool,
+    pub trace_imports: bool,
     pub command_line: String,
     pub exe_name: String,
 }
@@ -63,6 +65,7 @@ impl Default for Win32Config {
         Self {
             game_root: PathBuf::from("."),
             headless: false,
+            trace_imports: false,
             command_line: "sh2pc.exe".to_owned(),
             exe_name: "sh2pc.exe".to_owned(),
         }
@@ -87,10 +90,17 @@ pub enum Win32Handle {
         file: File,
         path: PathBuf,
     },
+    FileMapping {
+        bytes: Vec<u8>,
+    },
     FindFile(FindState),
     Event {
         manual_reset: bool,
         signaled: bool,
+    },
+    Mutex,
+    Thread {
+        exit_code: u32,
     },
     Module {
         name: String,
@@ -194,12 +204,16 @@ pub struct Win32State {
     tls_values: Vec<u32>,
     c_files: HashMap<u32, CFileEntry>,
     next_cfile_ptr: u32,
+    pub mapped_views: HashMap<GuestAddr, usize>,
     pub window_mgr: WindowManager,
     pub d3d8_create_calls: Vec<u32>,
     pub exit_code: Option<u32>,
     pub command_line_guest: Option<GuestAddr>,
     pub module_filename_guest: Option<GuestAddr>,
     pub env_strings_guest: Option<GuestAddr>,
+    pub fmode_guest: Option<GuestAddr>,
+    pub commode_guest: Option<GuestAddr>,
+    pub strtok_cursor: Option<GuestAddr>,
     pub unhandled_exception_filter: GuestAddr,
     pub rng_state: u32,
     pub atexit_callbacks: Vec<GuestAddr>,
@@ -220,12 +234,16 @@ impl Win32State {
             tls_values: vec![0; TLS_INITIAL_SLOTS],
             c_files: HashMap::new(),
             next_cfile_ptr: FIRST_CFILE_PTR,
+            mapped_views: HashMap::new(),
             window_mgr: WindowManager::new(headless),
             d3d8_create_calls: Vec::new(),
             exit_code: None,
             command_line_guest: None,
             module_filename_guest: None,
             env_strings_guest: None,
+            fmode_guest: None,
+            commode_guest: None,
+            strtok_cursor: None,
             unhandled_exception_filter: 0,
             rng_state: 1,
             atexit_callbacks: Vec::new(),
@@ -363,6 +381,7 @@ pub fn register_all_win32(registry: &mut ImportRegistry) {
     register_kernel32_and_msvcrt(registry);
     user32::register_imports(registry);
     d3d8_stub::register_imports(registry);
+    extra_dlls::register_imports(registry);
 }
 
 fn is_rooted_win_path(raw: &str) -> bool {

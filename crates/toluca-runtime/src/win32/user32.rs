@@ -1,8 +1,9 @@
 use toluca_core::GuestAddr;
-use toluca_core::cpu::GuestCpuState;
+use toluca_core::cpu::{Gpr, GuestCpuState};
 
-use crate::callconv::{peek_arg_i32, peek_arg_u32, return_stdcall};
+use crate::callconv::{peek_arg_i32, peek_arg_u32, return_cdecl, return_stdcall};
 use crate::runtime::{ImportHandler, ImportRegistry, RuntimeContext, RuntimeError};
+use crate::win32::msvcrt::format_printf;
 use crate::win32::sdl2::SdlTranslatedEvent;
 use crate::win32::{Win32Msg, WindowClassInfo, WindowRecord};
 
@@ -88,6 +89,9 @@ pub fn register_imports(registry: &mut ImportRegistry) {
         ("GetKeyState", get_key_state),
         ("GetAsyncKeyState", get_async_key_state),
         ("MessageBoxA", message_box_a),
+        ("wsprintfA", wsprintf_a),
+        ("BeginPaint", begin_paint),
+        ("EndPaint", end_paint),
     ];
 
     for &(name, handler) in entries {
@@ -240,7 +244,16 @@ fn create_window_ex_a(
     }
 
     if wndproc != 0 {
+        if ctx.win32.config.trace_imports {
+            eprintln!(
+                "[user32] CreateWindowExA -> invoking WndProc(0x{wndproc:08x}, hwnd=0x{hwnd:08x}, WM_CREATE) esp=0x{:08x}",
+                cpu.gpr(toluca_core::cpu::Gpr::Esp)
+            );
+        }
         let create_res = ctx.invoke_guest_callback(cpu, wndproc, &[hwnd, WM_CREATE, 0, 0])?;
+        if ctx.win32.config.trace_imports {
+            eprintln!("[user32] WndProc(WM_CREATE) returned 0x{create_res:08x}");
+        }
         if create_res == u32::MAX {
             remove_window_record(ctx, hwnd);
             return_stdcall(cpu, ctx.arena, 12, 0)?;
@@ -248,6 +261,9 @@ fn create_window_ex_a(
         }
     }
 
+    if ctx.win32.config.trace_imports {
+        eprintln!("[user32] CreateWindowExA returning hwnd=0x{hwnd:08x}");
+    }
     return_stdcall(cpu, ctx.arena, 12, hwnd)?;
     Ok(())
 }
@@ -796,6 +812,30 @@ fn gdi_get_stock_object(
 ) -> Result<(), RuntimeError> {
     let obj_id = peek_arg_u32(cpu, ctx.arena, 0)?;
     return_stdcall(cpu, ctx.arena, 1, SYNTHETIC_GDI_STOCK_BASE + obj_id)?;
+    Ok(())
+}
+
+fn wsprintf_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let buf_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let fmt_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let fmt_str = ctx.arena.read_cstr(fmt_ptr, MAX_TITLE_LEN)?;
+    let formatted = format_printf(ctx.arena, &fmt_str, cpu.gpr(Gpr::Esp) + 12)?;
+    ctx.arena.write_cstr(buf_ptr, &formatted)?;
+    return_cdecl(cpu, ctx.arena, formatted.len() as u32)?;
+    Ok(())
+}
+
+fn begin_paint(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let ps_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    if ps_ptr != 0 {
+        ctx.arena.zero_range(ps_ptr, 64)?;
+    }
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    Ok(())
+}
+
+fn end_paint(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    return_stdcall(cpu, ctx.arena, 2, 1)?;
     Ok(())
 }
 

@@ -27,6 +27,9 @@ const HEADER_PAD_CHUNK_SIZE: usize = 4096;
 const X86_INT3_PADDING: u8 = 0xCC;
 const AARCH64_ZERO_PADDING: u8 = 0x00;
 const EXPECTED_SECTION_COUNT: usize = 5;
+const AARCH64_CALL26_IMM_MASK: u32 = 0x03FF_FFFF;
+const AARCH64_CALL26_OP_MASK: u32 = 0xFC00_0000;
+const AARCH64_CALL26_RANGE: i64 = 1i64 << 27;
 
 const CRC32_TABLE: [u32; 256] = make_crc32_table();
 
@@ -386,6 +389,11 @@ pub enum AotError {
     InvalidSection,
     InvalidStringTable,
     DuplicateFunction(u32),
+    UnresolvedRelocation(u32),
+    RelocationOutOfRange {
+        code_offset: u32,
+        target_va: u32,
+    },
 }
 
 impl fmt::Display for AotError {
@@ -407,6 +415,16 @@ impl fmt::Display for AotError {
             Self::InvalidSection => write!(f, "invalid or out-of-bounds AOT section"),
             Self::InvalidStringTable => write!(f, "invalid AOT string table entry"),
             Self::DuplicateFunction(va) => write!(f, "duplicate function VA: 0x{va:08x}"),
+            Self::UnresolvedRelocation(va) => {
+                write!(f, "unresolved internal relocation target VA: 0x{va:08x}")
+            }
+            Self::RelocationOutOfRange {
+                code_offset,
+                target_va,
+            } => write!(
+                f,
+                "relocation out of range at code offset 0x{code_offset:08x} targeting 0x{target_va:08x}"
+            ),
         }
     }
 }
@@ -626,6 +644,101 @@ impl<W: Write + Seek> AotWriter<W> {
         self.strings.push(0);
         self.string_intern.insert(text.to_owned(), offset);
         offset
+    }
+}
+
+impl<W: Read + Write + Seek> AotWriter<W> {
+    pub fn patch_internal_relocations(&mut self) -> Result<usize, AotError> {
+        let mut va_to_offset = HashMap::with_capacity(self.dispatch.len());
+        for entry in &self.dispatch {
+            va_to_offset.insert(entry.guest_va, entry.code_offset);
+        }
+
+        let mut patched = 0usize;
+        for reloc in &self.relocations {
+            let Some(kind) = RelocKind::from_u16(reloc.kind) else {
+                continue;
+            };
+            if !matches!(kind, RelocKind::X86_64Rel32 | RelocKind::AArch64Call26) {
+                continue;
+            }
+
+            let target_offset = *va_to_offset
+                .get(&reloc.target_va)
+                .ok_or(AotError::UnresolvedRelocation(reloc.target_va))?;
+
+            let end_offset = (reloc.code_offset as u64)
+                .checked_add(4)
+                .ok_or(AotError::RelocationOutOfRange {
+                    code_offset: reloc.code_offset,
+                    target_va: reloc.target_va,
+                })?;
+            if end_offset > self.code_bytes_written {
+                return Err(AotError::RelocationOutOfRange {
+                    code_offset: reloc.code_offset,
+                    target_va: reloc.target_va,
+                });
+            }
+
+            let file_pos = AOT_CODE_ALIGNMENT + reloc.code_offset as u64;
+            match kind {
+                RelocKind::X86_64Rel32 => {
+                    let disp = (target_offset as i64)
+                        - (reloc.code_offset as i64)
+                        + (reloc.addend as i64);
+                    let disp32 =
+                        i32::try_from(disp).map_err(|_| AotError::RelocationOutOfRange {
+                            code_offset: reloc.code_offset,
+                            target_va: reloc.target_va,
+                        })?;
+                    self.writer.seek(SeekFrom::Start(file_pos))?;
+                    self.writer.write_all(&disp32.to_le_bytes())?;
+                }
+                RelocKind::AArch64Call26 => {
+                    self.writer.seek(SeekFrom::Start(file_pos))?;
+                    let mut word_bytes = [0u8; 4];
+                    self.writer.read_exact(&mut word_bytes)?;
+                    let existing = u32::from_le_bytes(word_bytes);
+
+                    let byte_delta = (target_offset as i64)
+                        - (reloc.code_offset as i64)
+                        + (reloc.addend as i64);
+                    if (byte_delta & 3) != 0
+                        || !(-AARCH64_CALL26_RANGE..AARCH64_CALL26_RANGE).contains(&byte_delta)
+                    {
+                        return Err(AotError::RelocationOutOfRange {
+                            code_offset: reloc.code_offset,
+                            target_va: reloc.target_va,
+                        });
+                    }
+
+                    let imm26 = ((byte_delta >> 2) as u32) & AARCH64_CALL26_IMM_MASK;
+                    let updated = (existing & AARCH64_CALL26_OP_MASK) | imm26;
+                    self.writer.seek(SeekFrom::Start(file_pos))?;
+                    self.writer.write_all(&updated.to_le_bytes())?;
+                }
+                RelocKind::GotSlot32 => unreachable!(),
+            }
+            patched += 1;
+        }
+
+        if patched > 0 {
+            self.writer.seek(SeekFrom::Start(AOT_CODE_ALIGNMENT))?;
+            let mut remaining = self.code_bytes_written;
+            let mut chunk = vec![0u8; CRC_STREAM_CHUNK_SIZE];
+            let mut running_crc = 0u32;
+            while remaining > 0 {
+                let to_read = remaining.min(CRC_STREAM_CHUNK_SIZE as u64) as usize;
+                self.writer.read_exact(&mut chunk[..to_read])?;
+                running_crc = crc32_update(running_crc, &chunk[..to_read]);
+                remaining -= to_read as u64;
+            }
+            self.code_crc32 = running_crc;
+            self.writer
+                .seek(SeekFrom::Start(AOT_CODE_ALIGNMENT + self.code_bytes_written))?;
+        }
+
+        Ok(patched)
     }
 }
 
@@ -1151,6 +1264,166 @@ mod tests {
                 section: "code",
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn patch_internal_relocations_x86_64_and_aarch64_with_crc() {
+        // Test X86_64Rel32 forward and backward patching + full CRC verification
+        let mut cursor_x86 = Cursor::new(Vec::new());
+        let mut writer_x86 = AotWriter::new(
+            &mut cursor_x86,
+            TargetArch::X86_64,
+            [1; 20],
+            0x0040_1000,
+            0x0040_0000,
+        )
+        .unwrap();
+
+        // fn1 at offset 0: E8 <rel32 at +1> C3
+        let off1 = writer_x86
+            .write_function(0x0040_1000, FUNC_FLAG_ENTRY_POINT, &[0xE8, 0, 0, 0, 0, 0xC3])
+            .unwrap();
+        // fn2 at offset 16: E8 <rel32 at +17> C3
+        let off2 = writer_x86
+            .write_function(0x0040_2000, 0, &[0xE8, 0, 0, 0, 0, 0xC3])
+            .unwrap();
+        assert_eq!(off1, 0);
+        assert_eq!(off2, 16);
+
+        // Forward call fn1 -> fn2: disp = 16 - 1 - 4 = 11
+        writer_x86.add_relocation(RelocEntry {
+            code_offset: 1,
+            target_va: 0x0040_2000,
+            kind: RelocKind::X86_64Rel32 as u16,
+            flags: 0,
+            addend: -4,
+        });
+        // Backward call fn2 -> fn1: disp = 0 - 17 - 4 = -21
+        writer_x86.add_relocation(RelocEntry {
+            code_offset: 17,
+            target_va: 0x0040_1000,
+            kind: RelocKind::X86_64Rel32 as u16,
+            flags: 0,
+            addend: -4,
+        });
+
+        assert_eq!(writer_x86.patch_internal_relocations().unwrap(), 2);
+        writer_x86.finish().unwrap();
+
+        cursor_x86.set_position(0);
+        let manifest_x86 = AotManifest::read_from(&mut cursor_x86, true).unwrap();
+        assert_eq!(manifest_x86.relocations.len(), 2);
+
+        let raw_x86 = cursor_x86.into_inner();
+        let code_base = AOT_CODE_ALIGNMENT as usize;
+        let disp_fwd = i32::from_le_bytes(raw_x86[code_base + 1..code_base + 5].try_into().unwrap());
+        let disp_bwd =
+            i32::from_le_bytes(raw_x86[code_base + 17..code_base + 21].try_into().unwrap());
+        assert_eq!(disp_fwd, 11);
+        assert_eq!(disp_bwd, -21);
+
+        // Test AArch64Call26 forward and backward patching preserving upper 6 opcode bits (0x94000000 = BL)
+        let mut cursor_arm = Cursor::new(Vec::new());
+        let mut writer_arm = AotWriter::new(
+            &mut cursor_arm,
+            TargetArch::AArch64,
+            [2; 20],
+            0x0040_1000,
+            0x0040_0000,
+        )
+        .unwrap();
+        let bl_op = 0x9400_0000u32.to_le_bytes();
+        let ret_op = 0xD65F_03C0u32.to_le_bytes();
+        let mut fn_bytes = [0u8; 8];
+        fn_bytes[0..4].copy_from_slice(&bl_op);
+        fn_bytes[4..8].copy_from_slice(&ret_op);
+
+        writer_arm
+            .write_function(0x0040_1000, FUNC_FLAG_ENTRY_POINT, &fn_bytes)
+            .unwrap();
+        writer_arm.write_function(0x0040_2000, 0, &fn_bytes).unwrap();
+        // Forward: offset 0 -> offset 16 (imm26 = +4)
+        writer_arm.add_relocation(RelocEntry {
+            code_offset: 0,
+            target_va: 0x0040_2000,
+            kind: RelocKind::AArch64Call26 as u16,
+            flags: 0,
+            addend: 0,
+        });
+        // Backward: offset 16 -> offset 0 (imm26 = -4 -> 0x03FF_FFFC)
+        writer_arm.add_relocation(RelocEntry {
+            code_offset: 16,
+            target_va: 0x0040_1000,
+            kind: RelocKind::AArch64Call26 as u16,
+            flags: 0,
+            addend: 0,
+        });
+
+        assert_eq!(writer_arm.patch_internal_relocations().unwrap(), 2);
+        writer_arm.finish().unwrap();
+
+        cursor_arm.set_position(0);
+        AotManifest::read_from(&mut cursor_arm, true).unwrap();
+        let raw_arm = cursor_arm.into_inner();
+        let insn_fwd = u32::from_le_bytes(raw_arm[code_base..code_base + 4].try_into().unwrap());
+        let insn_bwd =
+            u32::from_le_bytes(raw_arm[code_base + 16..code_base + 20].try_into().unwrap());
+        assert_eq!(insn_fwd, 0x9400_0004);
+        assert_eq!(insn_bwd, 0x97FF_FFFC);
+    }
+
+    #[test]
+    fn patch_internal_relocations_rejects_unresolved_and_out_of_range() {
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer = AotWriter::new(
+            &mut cursor,
+            TargetArch::X86_64,
+            [0; 20],
+            0x0040_1000,
+            0x0040_0000,
+        )
+        .unwrap();
+        writer
+            .write_function(0x0040_1000, 0, &[0xE8, 0, 0, 0, 0, 0xC3])
+            .unwrap();
+        writer.add_relocation(RelocEntry {
+            code_offset: 1,
+            target_va: 0x0040_9999,
+            kind: RelocKind::X86_64Rel32 as u16,
+            flags: 0,
+            addend: -4,
+        });
+        assert!(matches!(
+            writer.patch_internal_relocations(),
+            Err(AotError::UnresolvedRelocation(0x0040_9999))
+        ));
+
+        let mut cursor2 = Cursor::new(Vec::new());
+        let mut writer2 = AotWriter::new(
+            &mut cursor2,
+            TargetArch::AArch64,
+            [0; 20],
+            0x0040_1000,
+            0x0040_0000,
+        )
+        .unwrap();
+        writer2
+            .write_function(0x0040_1000, 0, &[0, 0, 0, 0x94])
+            .unwrap();
+        writer2.add_relocation(RelocEntry {
+            code_offset: 100,
+            target_va: 0x0040_1000,
+            kind: RelocKind::AArch64Call26 as u16,
+            flags: 0,
+            addend: 0,
+        });
+        assert!(matches!(
+            writer2.patch_internal_relocations(),
+            Err(AotError::RelocationOutOfRange {
+                code_offset: 100,
+                target_va: 0x0040_1000
+            })
         ));
     }
 }

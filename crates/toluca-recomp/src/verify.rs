@@ -8,7 +8,9 @@ use crate::sha1::format_hex;
 pub const HIGH_ENTROPY_THRESHOLD: f64 = 7.2;
 pub const MIN_ENTROPY_SAMPLE_BYTES: usize = 1024;
 
-const SAFEDISC_SECTION_PREFIXES: &[&str] = &["stxt", ".icd", "clcd", ".sforce", "secdrv"];
+const SAFEDISC_SECTION_PREFIXES: &[&str] = &[
+    "stxt", ".icd", "clcd", ".sforce", "secdrv", ".cms_t", ".cms_d",
+];
 const SAFEDISC_IMPORT_DLLS: &[&str] = &["dplayerx.dll", "secdrv.sys"];
 const EXPECTED_TARGET_DLLS: &[&str] = &["d3d8.dll", "dsound.dll", "dinput8.dll", "binkw32.dll"];
 

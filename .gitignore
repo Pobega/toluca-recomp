@@ -3,6 +3,7 @@ Cargo.lock
 
 # Never commit copyrighted game binaries, assets, saves, or generated AOT caches
 /game/
+/gamedata/
 *.exe
 *.bik
 *.bin

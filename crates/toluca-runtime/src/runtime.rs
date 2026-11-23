@@ -14,6 +14,7 @@ use crate::arena::{ArenaError, GuestArena};
 use crate::callconv;
 use crate::heap::{GuestHeap, VirtualMemoryManager};
 use crate::loader::{AotCodeImage, LoaderError};
+use crate::win32::{Win32Config, Win32State};
 
 pub const IMPORT_THUNK_BASE: GuestAddr = GUEST_THUNK_BASE;
 pub const COM_THUNK_BASE: GuestAddr = 0x7080_0000;
@@ -221,8 +222,10 @@ pub struct RuntimeContext<'a> {
     pub arena: &'a mut GuestArena,
     pub heap: &'a mut GuestHeap,
     pub vmem: &'a mut VirtualMemoryManager,
+    pub win32: &'a mut Win32State,
     pub last_error: &'a mut u32,
     pub host_start_instant: Instant,
+    pub pe_image_base: GuestAddr,
     code: &'a AotCodeImage,
     imports: &'a mut Vec<ResolvedImportSlot>,
     import_slot_map: &'a mut HashMap<ImportKey, usize>,
@@ -258,6 +261,7 @@ impl<'a> RuntimeContext<'a> {
             .ok_or(RuntimeError::UnmappedCallback(target_va))?;
 
         let saved_eip = cpu.eip;
+        let saved_esp = cpu.gpr(Gpr::Esp);
         let saved_bridge = cpu.bridge;
         let saved_exit_reason = cpu.exit_reason;
         let saved_exit_detail = cpu.exit_detail;
@@ -292,6 +296,7 @@ impl<'a> RuntimeContext<'a> {
 
         let ret_eax = cpu.gpr(Gpr::Eax);
         cpu.eip = saved_eip;
+        cpu.set_gpr(Gpr::Esp, saved_esp);
         cpu.exit_reason = saved_exit_reason;
         cpu.exit_detail = saved_exit_detail;
         Ok(ret_eax)
@@ -304,6 +309,7 @@ pub struct Runtime {
     arena: GuestArena,
     heap: GuestHeap,
     vmem: VirtualMemoryManager,
+    win32: Win32State,
     imports: Vec<ResolvedImportSlot>,
     import_slot_map: HashMap<ImportKey, usize>,
     registry: ImportRegistry,
@@ -317,14 +323,32 @@ impl Runtime {
         aot_path: &Path,
         registry: ImportRegistry,
     ) -> Result<Self, RuntimeError> {
+        Self::load_with_config(pe_path, aot_path, registry, Win32Config::default())
+    }
+
+    pub fn load_with_config(
+        pe_path: &Path,
+        aot_path: &Path,
+        registry: ImportRegistry,
+        config: Win32Config,
+    ) -> Result<Self, RuntimeError> {
         let pe_bytes = std::fs::read(pe_path)?;
-        Self::load_from_bytes(pe_bytes, aot_path, registry)
+        Self::load_from_bytes_with_config(pe_bytes, aot_path, registry, config)
     }
 
     pub fn load_from_bytes(
         pe_bytes: Vec<u8>,
         aot_path: &Path,
         registry: ImportRegistry,
+    ) -> Result<Self, RuntimeError> {
+        Self::load_from_bytes_with_config(pe_bytes, aot_path, registry, Win32Config::default())
+    }
+
+    pub fn load_from_bytes_with_config(
+        pe_bytes: Vec<u8>,
+        aot_path: &Path,
+        registry: ImportRegistry,
+        config: Win32Config,
     ) -> Result<Self, RuntimeError> {
         let pe = PeImage::parse(pe_bytes)?;
         let code = AotCodeImage::load(aot_path)?;
@@ -363,6 +387,7 @@ impl Runtime {
             arena,
             heap: GuestHeap::new(),
             vmem: VirtualMemoryManager::new(),
+            win32: Win32State::new(config),
             imports,
             import_slot_map,
             registry,
@@ -408,8 +433,10 @@ impl Runtime {
             arena: &mut self.arena,
             heap: &mut self.heap,
             vmem: &mut self.vmem,
+            win32: &mut self.win32,
             last_error: &mut self.last_error,
             host_start_instant: self.host_start_instant,
+            pe_image_base: self.pe.image_base,
             code: &self.code,
             imports: &mut self.imports,
             import_slot_map: &mut self.import_slot_map,
@@ -466,6 +493,14 @@ impl Runtime {
 
     pub fn vmem(&self) -> &VirtualMemoryManager {
         &self.vmem
+    }
+
+    pub fn win32(&self) -> &Win32State {
+        &self.win32
+    }
+
+    pub fn win32_mut(&mut self) -> &mut Win32State {
+        &mut self.win32
     }
 
     pub fn last_error(&self) -> u32 {

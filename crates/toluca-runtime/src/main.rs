@@ -10,6 +10,7 @@ struct CliArgs {
     game_dir: Option<PathBuf>,
     headless: bool,
     trace_imports: bool,
+    trace_d3d8: bool,
 }
 
 fn main() -> ExitCode {
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
         game_root,
         headless: opts.headless,
         trace_imports: opts.trace_imports,
+        trace_d3d8: opts.trace_d3d8,
         command_line: exe_name.clone(),
         exe_name,
     };
@@ -116,6 +118,7 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut game_dir: Option<PathBuf> = None;
     let mut headless = false;
     let mut trace_imports = false;
+    let mut trace_d3d8 = false;
 
     let mut idx = 1usize;
     while idx < args.len() {
@@ -123,6 +126,7 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         match arg {
             "--headless" => headless = true,
             "--trace-imports" => trace_imports = true,
+            "--trace-d3d8" => trace_d3d8 = true,
             "--game-dir" => {
                 idx += 1;
                 let val = args.get(idx)?;
@@ -147,11 +151,14 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         game_dir,
         headless,
         trace_imports,
+        trace_d3d8,
     })
 }
 
 fn print_usage(args: &[String]) {
     let bin = args.first().map(String::as_str).unwrap_or("toluca-runtime");
     eprintln!("Usage:");
-    eprintln!("  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--headless] [--trace-imports]");
+    eprintln!(
+        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--headless] [--trace-imports] [--trace-d3d8]"
+    );
 }

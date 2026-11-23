@@ -1,0 +1,173 @@
+use toluca_core::GuestAddr;
+use toluca_core::cpu::{ExitReason, GuestCpuState};
+use toluca_d3d8::{ComInterfaceId, D3d8Context, GuestMemory};
+
+use crate::arena::GuestArena;
+use crate::callconv::{peek_arg_u32, return_stdcall};
+use crate::heap::GuestHeap;
+use crate::runtime::{ImportRegistry, RuntimeContext, RuntimeError, TrapInfo};
+use crate::win32::{ERROR_NOT_ENOUGH_MEMORY, ERROR_SUCCESS};
+
+pub struct ArenaGuestMemory<'a> {
+    pub arena: &'a mut GuestArena,
+    pub heap: &'a mut GuestHeap,
+}
+
+impl GuestMemory for ArenaGuestMemory<'_> {
+    fn read_bytes(&self, va: GuestAddr, len: usize) -> Result<Vec<u8>, String> {
+        self.arena
+            .read_bytes(va, len)
+            .map(|slice| slice.to_vec())
+            .map_err(|err| err.to_string())
+    }
+
+    fn read_into(&self, va: GuestAddr, buf: &mut [u8]) -> Result<(), String> {
+        let src = self
+            .arena
+            .read_bytes(va, buf.len())
+            .map_err(|err| err.to_string())?;
+        buf.copy_from_slice(src);
+        Ok(())
+    }
+
+    fn read_u32(&self, va: GuestAddr) -> Result<u32, String> {
+        self.arena.read_u32(va).map_err(|err| err.to_string())
+    }
+
+    fn write_bytes(&mut self, va: GuestAddr, data: &[u8]) -> Result<(), String> {
+        self.arena
+            .write_bytes(va, data)
+            .map_err(|err| err.to_string())
+    }
+
+    fn write_u32(&mut self, va: GuestAddr, val: u32) -> Result<(), String> {
+        self.arena
+            .write_u32(va, val)
+            .map_err(|err| err.to_string())
+    }
+
+    fn zero_range(&mut self, va: GuestAddr, len: usize) -> Result<(), String> {
+        self.arena
+            .zero_range(va, len)
+            .map_err(|err| err.to_string())
+    }
+
+    fn alloc(&mut self, size: usize, zeroed: bool) -> Result<GuestAddr, String> {
+        self.heap
+            .alloc(self.arena, size, zeroed)
+            .map_err(|err| err.to_string())
+    }
+
+    fn free(&mut self, va: GuestAddr) -> Result<(), String> {
+        self.heap
+            .free(self.arena, va)
+            .map_err(|err| err.to_string())
+    }
+}
+
+pub fn register_imports(registry: &mut ImportRegistry) {
+    registry.register_name("d3d8.dll", "Direct3DCreate8", direct3d_create_8);
+}
+
+fn direct3d_create_8(
+    ctx: &mut RuntimeContext<'_>,
+    cpu: &mut GuestCpuState,
+) -> Result<(), RuntimeError> {
+    let sdk_version = peek_arg_u32(cpu, ctx.arena, 0)?;
+    ctx.win32.d3d8_create_calls.push(sdk_version);
+
+    let mut mem = ArenaGuestMemory {
+        arena: ctx.arena,
+        heap: ctx.heap,
+    };
+    let obj_va = match ctx.win32.d3d8.create_direct3d8(&mut mem, sdk_version) {
+        Ok(va) => {
+            *ctx.last_error = ERROR_SUCCESS;
+            va
+        }
+        Err(_) => {
+            *ctx.last_error = ERROR_NOT_ENOUGH_MEMORY;
+            0
+        }
+    };
+
+    return_stdcall(cpu, ctx.arena, 1, obj_va)?;
+    Ok(())
+}
+
+pub fn dispatch_com_call(
+    ctx: &mut RuntimeContext<'_>,
+    state: &mut GuestCpuState,
+    iface: ComInterfaceId,
+    method_idx: u32,
+) {
+    let Some(arg_count) = D3d8Context::method_arg_count(iface, method_idx) else {
+        set_unimplemented_com_trap(ctx, state, iface as u32, method_idx);
+        return;
+    };
+
+    let mut args = Vec::with_capacity(arg_count as usize);
+    for idx in 0..arg_count {
+        match peek_arg_u32(state, ctx.arena, idx) {
+            Ok(val) => args.push(val),
+            Err(err) => {
+                fail_com_call(ctx, state, iface, method_idx, RuntimeError::Arena(err));
+                return;
+            }
+        }
+    }
+
+    let result = {
+        let mut mem = ArenaGuestMemory {
+            arena: ctx.arena,
+            heap: ctx.heap,
+        };
+        ctx.win32.d3d8.dispatch_com(&mut mem, iface, method_idx, &args)
+    };
+
+    match result {
+        Ok(call_res) => {
+            if let Err(err) = return_stdcall(state, ctx.arena, call_res.arg_count, call_res.ret_val)
+            {
+                fail_com_call(ctx, state, iface, method_idx, RuntimeError::Arena(err));
+            }
+        }
+        Err(msg) => {
+            fail_com_call(
+                ctx,
+                state,
+                iface,
+                method_idx,
+                RuntimeError::ImportHandlerFailed(msg),
+            );
+        }
+    }
+}
+
+fn set_unimplemented_com_trap(
+    ctx: &mut RuntimeContext<'_>,
+    state: &mut GuestCpuState,
+    interface_id: u32,
+    method_index: u32,
+) {
+    state.exit_reason = ExitReason::HostTrap as u32;
+    state.exit_detail = (interface_id << 16) | (method_index & 0xFFFF);
+    *ctx.trap = Some(TrapInfo::UnimplementedCom {
+        interface_id,
+        method_index,
+    });
+}
+
+fn fail_com_call(
+    ctx: &mut RuntimeContext<'_>,
+    state: &mut GuestCpuState,
+    iface: ComInterfaceId,
+    method_idx: u32,
+    err: RuntimeError,
+) {
+    state.exit_reason = ExitReason::HostTrap as u32;
+    state.exit_detail = ((iface as u32) << 16) | (method_idx & 0xFFFF);
+    if ctx.pending_error.is_none() {
+        *ctx.pending_error = Some(err);
+    }
+}

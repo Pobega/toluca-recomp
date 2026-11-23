@@ -1,4 +1,4 @@
-pub mod d3d8_stub;
+pub mod d3d8;
 pub mod extra_dlls;
 pub mod kernel32;
 pub mod msvcrt;
@@ -12,6 +12,7 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use toluca_core::GuestAddr;
+use toluca_d3d8::D3d8Context;
 
 use crate::runtime::ImportRegistry;
 
@@ -56,6 +57,7 @@ pub struct Win32Config {
     pub game_root: PathBuf,
     pub headless: bool,
     pub trace_imports: bool,
+    pub trace_d3d8: bool,
     pub command_line: String,
     pub exe_name: String,
 }
@@ -66,6 +68,7 @@ impl Default for Win32Config {
             game_root: PathBuf::from("."),
             headless: false,
             trace_imports: false,
+            trace_d3d8: false,
             command_line: "sh2pc.exe".to_owned(),
             exe_name: "sh2pc.exe".to_owned(),
         }
@@ -206,6 +209,7 @@ pub struct Win32State {
     next_cfile_ptr: u32,
     pub mapped_views: HashMap<GuestAddr, usize>,
     pub window_mgr: WindowManager,
+    pub d3d8: D3d8Context,
     pub d3d8_create_calls: Vec<u32>,
     pub exit_code: Option<u32>,
     pub command_line_guest: Option<GuestAddr>,
@@ -223,6 +227,8 @@ impl Win32State {
     pub fn new(config: Win32Config) -> Self {
         let current_dir = config.game_root.clone();
         let headless = config.headless;
+        let mut d3d8 = D3d8Context::new_null();
+        d3d8.trace_d3d8 = config.trace_d3d8;
         Self {
             config,
             current_dir,
@@ -236,6 +242,7 @@ impl Win32State {
             next_cfile_ptr: FIRST_CFILE_PTR,
             mapped_views: HashMap::new(),
             window_mgr: WindowManager::new(headless),
+            d3d8,
             d3d8_create_calls: Vec::new(),
             exit_code: None,
             command_line_guest: None,
@@ -380,7 +387,7 @@ pub fn register_kernel32_and_msvcrt(registry: &mut ImportRegistry) {
 pub fn register_all_win32(registry: &mut ImportRegistry) {
     register_kernel32_and_msvcrt(registry);
     user32::register_imports(registry);
-    d3d8_stub::register_imports(registry);
+    d3d8::register_imports(registry);
     extra_dlls::register_imports(registry);
 }
 

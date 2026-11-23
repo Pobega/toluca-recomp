@@ -240,8 +240,8 @@ pub struct RuntimeContext<'a> {
     imports: &'a mut Vec<ResolvedImportSlot>,
     import_slot_map: &'a mut HashMap<ImportKey, usize>,
     registry: &'a ImportRegistry,
-    trap: &'a mut Option<TrapInfo>,
-    pending_error: &'a mut Option<RuntimeError>,
+    pub(crate) trap: &'a mut Option<TrapInfo>,
+    pub(crate) pending_error: &'a mut Option<RuntimeError>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -840,6 +840,11 @@ unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u3
         return;
     }
 
+    if let Some((iface, method_idx)) = toluca_d3d8::decode_com_thunk(target_va) {
+        crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_idx);
+        return;
+    }
+
     if (COM_THUNK_BASE..GUEST_THUNK_END).contains(&target_va) {
         state.exit_reason = ExitReason::HostTrap as u32;
         state.exit_detail = target_va;
@@ -871,6 +876,10 @@ unsafe extern "C" fn bridge_call_com(
         return;
     };
     if state.exit_reason != ExitReason::Running as u32 {
+        return;
+    }
+    if let Some(iface) = toluca_d3d8::ComInterfaceId::from_u32(interface_id) {
+        crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_index);
         return;
     }
     state.exit_reason = ExitReason::HostTrap as u32;

@@ -1,7 +1,10 @@
 pub mod control_flow;
 pub mod flags;
+pub mod fpu;
 pub mod integer;
 pub mod operands;
+pub mod simd;
+pub mod string_ops;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -276,6 +279,13 @@ pub fn lift_function(
         let code = compiled.code_buffer().to_vec();
         let mut pending = Vec::new();
         for mach_reloc in compiled.buffer.relocs() {
+            if let FinalizedRelocTarget::ExternalName(ExternalName::LibCall(call)) =
+                &mach_reloc.target
+            {
+                return Err(LifterError::CraneliftCompile(format!(
+                    "unexpected Cranelift libcall relocation: {call:?}"
+                )));
+            }
             let Some(kind) = map_reloc_kind(mach_reloc.kind) else {
                 continue;
             };
@@ -372,6 +382,9 @@ fn lift_split_block(
             ControlFlowOutcome::NotHandled => {
                 if !lifter.lift_flag_instruction(&instr)
                     && !lifter.lift_integer_instruction(&instr)
+                    && !lifter.lift_fpu(&instr)
+                    && !lifter.lift_simd(&instr)
+                    && !lifter.lift_string_op(&instr)
                 {
                     lifter.emit_unsupported(instr.ip() as GuestAddr);
                 }
@@ -583,7 +596,8 @@ mod tests {
         assert_eq!(compiled.unsupported_count, 0);
 
         let mut arena = vec![0u8; 64 * 1024];
-        let bridge = HostBridge::new_stub();
+        let mut bridge = HostBridge::new_stub();
+        bridge.x87_helper = toluca_core::bridge::default_x87_helper;
         let mut cpu = GuestCpuState::new(arena.as_mut_ptr(), &bridge);
         cpu.set_gpr(Gpr::Esp, 0x8000);
         cpu.fs_base = 0x2000;
@@ -890,5 +904,285 @@ mod tests {
         assert_eq!(cpu2.gpr(Gpr::Eax), 0x777);
         assert_eq!(cpu2.eip, 0x3333_4444);
         assert_eq!(cpu2.gpr(Gpr::Esp), 0x8004);
+    }
+
+    #[test]
+    fn executes_x87_fpu_arithmetic_comparisons_and_transcendentals() {
+        // Arena addresses used:
+        //   0x4000: f32 (3.0)
+        //   0x4004: i32 (7)
+        //   0x4008: i32 output from fistp
+        //   0x400C: f64 (0.0) for fcos check
+        //   0x4014: f64 output from fstp
+        // Sequence:
+        //   fld dword ptr [0x4000]  -> st0 = 3.0
+        //   fild dword ptr [0x4004] -> st0 = 7.0, st1 = 3.0
+        //   fadd st(0), st(1)       -> st0 = 10.0, st1 = 3.0
+        //   fmul st(0), st(1)       -> st0 = 30.0, st1 = 3.0
+        //   fsub st(0), st(1)       -> st0 = 27.0, st1 = 3.0
+        //   fdiv st(0), st(1)       -> st0 = 9.0, st1 = 3.0
+        //   fsqrt                   -> st0 = 3.0, st1 = 3.0
+        //   fcomip st(0), st(1)     -> compare 3.0 == 3.0 (ZF=1, CF=0), pops -> st0 = 3.0
+        //   jne fail
+        //   fnstsw ax
+        //   fistp dword ptr [0x4008] -> [0x4008] = 3
+        //   fld qword ptr [0x400C]   -> st0 = 0.0
+        //   fcos                     -> st0 = 1.0
+        //   fld1                     -> st0 = 1.0, st1 = 1.0
+        //   faddp st(1), st(0)       -> st0 = 2.0
+        //   fstp qword ptr [0x4014]  -> [0x4014] = 2.0
+        //   mov ebx, 1
+        //   ret
+        // fail:
+        //   mov ebx, 0
+        //   ret
+        #[rustfmt::skip]
+        let code = [
+            0xD9, 0x05, 0x00, 0x40, 0x00, 0x00, // fld dword ptr [0x4000]
+            0xDB, 0x05, 0x04, 0x40, 0x00, 0x00, // fild dword ptr [0x4004]
+            0xD8, 0xC1,                         // fadd st(0), st(1)
+            0xD8, 0xC9,                         // fmul st(0), st(1)
+            0xD8, 0xE1,                         // fsub st(0), st(1)
+            0xD8, 0xF1,                         // fdiv st(0), st(1)
+            0xD9, 0xFA,                         // fsqrt
+            0xDF, 0xF1,                         // fcomip st(0), st(1)
+            0x75, 0x20,                         // jne +32 -> fail
+            0xDF, 0xE0,                         // fnstsw ax
+            0xDB, 0x1D, 0x08, 0x40, 0x00, 0x00, // fistp dword ptr [0x4008]
+            0xDD, 0x05, 0x0C, 0x40, 0x00, 0x00, // fld qword ptr [0x400C]
+            0xD9, 0xFF,                         // fcos
+            0xD9, 0xE8,                         // fld1
+            0xDE, 0xC1,                         // faddp st(1), st(0)
+            0xDD, 0x1D, 0x14, 0x40, 0x00, 0x00, // fstp qword ptr [0x4014]
+            0xBB, 0x01, 0x00, 0x00, 0x00,       // mov ebx, 1
+            0xC3,                               // ret
+            // fail:
+            0xBB, 0x00, 0x00, 0x00, 0x00,       // mov ebx, 0
+            0xC3,                               // ret
+        ];
+
+        let sin_code = [
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword ptr [0x4000]
+            0xD9, 0xFE,                         // fsin
+            0xC3,
+        ];
+        let sin_cpu = execute_snippet(&sin_code, |_cpu, arena| {
+            arena[0x4000..0x4008].copy_from_slice(&(core::f64::consts::FRAC_PI_2).to_le_bytes());
+        });
+        assert!((sin_cpu.x87.st(0) - 1.0).abs() < 1e-12);
+
+        let cpu = execute_snippet(&code, |_cpu, arena| {
+            arena[0x4000..0x4004].copy_from_slice(&3.0f32.to_le_bytes());
+            arena[0x4004..0x4008].copy_from_slice(&7i32.to_le_bytes());
+            arena[0x400C..0x4014].copy_from_slice(&0.0f64.to_le_bytes());
+        });
+        assert_eq!(cpu.gpr(Gpr::Ebx), 1);
+        assert_ne!(cpu.eflags & EFLAGS_ZF, 0);
+        // fnstsw ax saw top=7 (after fcomip popped once from top=6)
+        assert_eq!((cpu.gpr(Gpr::Eax) as u16 & 0x3800) >> 11, 7);
+
+        let mut arena_check = vec![0u8; 64 * 1024];
+        arena_check[0x4000..0x4004].copy_from_slice(&3.0f32.to_le_bytes());
+        arena_check[0x4004..0x4008].copy_from_slice(&7i32.to_le_bytes());
+        arena_check[0x400C..0x4014].copy_from_slice(&0.0f64.to_le_bytes());
+        let arch = TargetArch::current().unwrap();
+        let isa = build_isa(arch).unwrap();
+        let compiled = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &code).unwrap();
+        let mut bridge = HostBridge::new_stub();
+        bridge.x87_helper = toluca_core::bridge::default_x87_helper;
+        let mut cpu2 = GuestCpuState::new(arena_check.as_mut_ptr(), &bridge);
+        cpu2.set_gpr(Gpr::Esp, 0x8000);
+        let exec = ExecBuffer::new(&compiled.code);
+        unsafe {
+            (exec.as_fn())(&mut cpu2);
+        }
+        let int_out = i32::from_le_bytes(arena_check[0x4008..0x400C].try_into().unwrap());
+        let f64_out = f64::from_le_bytes(arena_check[0x4014..0x401C].try_into().unwrap());
+        assert_eq!(int_out, 3);
+        assert!((f64_out - 2.0).abs() < 1e-12);
+        assert_eq!(cpu2.x87.top, 0);
+    }
+
+    #[test]
+    fn executes_sse_and_mmx_operations() {
+        // Memory:
+        //   0x4000: [1.0, 2.0, 3.0, 4.0]
+        //   0x4010: [10.0, 20.0, 30.0, 40.0]
+        //   0x4020: MMX [100u32, 200u32]
+        // Sequence:
+        //   movaps xmm0, [0x4000]
+        //   movaps xmm1, [0x4010]
+        //   addps xmm0, xmm1       -> [11, 22, 33, 44]
+        //   shufps xmm0, xmm0, 0x1B -> reverse [44, 33, 22, 11]
+        //   mulps xmm0, [0x4000]   -> [44, 66, 66, 44]
+        //   xorps xmm2, xmm2
+        //   mov eax, 7
+        //   cvtsi2ss xmm2, eax     -> xmm2[0] = 7.0
+        //   ucomiss xmm0, xmm2     -> 44.0 > 7.0 (ZF=0, CF=0)
+        //   cvttss2si ecx, xmm0    -> ecx = 44
+        //   movq mm0, [0x4020]
+        //   paddd mm0, mm0         -> [200, 400]
+        //   pxor mm1, mm1
+        //   emms
+        //   ret
+        #[rustfmt::skip]
+        let code = [
+            0x0F, 0x28, 0x05, 0x00, 0x40, 0x00, 0x00, // movaps xmm0, [0x4000]
+            0x0F, 0x28, 0x0D, 0x10, 0x40, 0x00, 0x00, // movaps xmm1, [0x4010]
+            0x0F, 0x58, 0xC1,                         // addps xmm0, xmm1
+            0x0F, 0xC6, 0xC0, 0x1B,                   // shufps xmm0, xmm0, 0x1B
+            0x0F, 0x59, 0x05, 0x00, 0x40, 0x00, 0x00, // mulps xmm0, [0x4000]
+            0x0F, 0x57, 0xD2,                         // xorps xmm2, xmm2
+            0xB8, 0x07, 0x00, 0x00, 0x00,             // mov eax, 7
+            0xF3, 0x0F, 0x2A, 0xD0,                   // cvtsi2ss xmm2, eax
+            0x0F, 0x2E, 0xC2,                         // ucomiss xmm0, xmm2
+            0xF3, 0x0F, 0x2C, 0xC8,                   // cvttss2si ecx, xmm0
+            0x0F, 0x6F, 0x05, 0x20, 0x40, 0x00, 0x00, // movq mm0, [0x4020]
+            0x0F, 0xFE, 0xC0,                         // paddd mm0, mm0
+            0x0F, 0xEF, 0xC9,                         // pxor mm1, mm1
+            0x0F, 0x77,                               // emms
+            0xC3,                                     // ret
+        ];
+
+        let cpu = execute_snippet(&code, |cpu, arena| {
+            cpu.x87.tag_word = 0x0000;
+            for (i, v) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+                arena[0x4000 + i * 4..0x4004 + i * 4].copy_from_slice(&v.to_le_bytes());
+            }
+            for (i, v) in [10.0f32, 20.0, 30.0, 40.0].iter().enumerate() {
+                arena[0x4010 + i * 4..0x4014 + i * 4].copy_from_slice(&v.to_le_bytes());
+            }
+            arena[0x4020..0x4024].copy_from_slice(&100u32.to_le_bytes());
+            arena[0x4024..0x4028].copy_from_slice(&200u32.to_le_bytes());
+        });
+
+        assert_eq!(cpu.xmm[0].to_f32x4(), [44.0, 66.0, 66.0, 44.0]);
+        assert_eq!(cpu.xmm[2].to_f32x4(), [7.0, 0.0, 0.0, 0.0]);
+        assert_eq!(cpu.gpr(Gpr::Ecx), 44);
+        assert_eq!(cpu.eflags & (EFLAGS_ZF | EFLAGS_CF), 0);
+        assert_eq!(cpu.mm[0], (400u64 << 32) | 200u64);
+        assert_eq!(cpu.mm[1], 0);
+        assert_eq!(cpu.x87.tag_word, toluca_core::cpu::X87_DEFAULT_TAG_WORD);
+    }
+
+    #[test]
+    fn executes_string_operations_forward_reverse_and_rep_variants() {
+        let arch = TargetArch::current().unwrap();
+        let isa = build_isa(arch).unwrap();
+        let bridge = HostBridge::new_stub();
+
+        // 1. cld; rep movsd (forward copy 3 dwords)
+        let movsd_code = [0xFC, 0xF3, 0xA5, 0xC3];
+        let mut arena_fwd = vec![0u8; 64 * 1024];
+        arena_fwd[0x4000..0x4004].copy_from_slice(&0x1111_2222u32.to_le_bytes());
+        arena_fwd[0x4004..0x4008].copy_from_slice(&0x3333_4444u32.to_le_bytes());
+        arena_fwd[0x4008..0x400C].copy_from_slice(&0x5555_6666u32.to_le_bytes());
+        let comp_movsd = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &movsd_code).unwrap();
+        let mut cpu = GuestCpuState::new(arena_fwd.as_mut_ptr(), &bridge);
+        cpu.set_gpr(Gpr::Esp, 0x8000);
+        cpu.set_gpr(Gpr::Esi, 0x4000);
+        cpu.set_gpr(Gpr::Edi, 0x5000);
+        cpu.set_gpr(Gpr::Ecx, 3);
+        let exec_movsd = ExecBuffer::new(&comp_movsd.code);
+        unsafe {
+            (exec_movsd.as_fn())(&mut cpu);
+        }
+        assert_eq!(cpu.gpr(Gpr::Ecx), 0);
+        assert_eq!(cpu.gpr(Gpr::Esi), 0x400C);
+        assert_eq!(cpu.gpr(Gpr::Edi), 0x500C);
+        assert_eq!(&arena_fwd[0x5000..0x500C], &arena_fwd[0x4000..0x400C]);
+
+        // 2. std; rep movsb (reverse copy 4 bytes)
+        let rev_code = [0xFD, 0xF3, 0xA4, 0xFC, 0xC3];
+        let comp_rev = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &rev_code).unwrap();
+        let mut arena_rev = vec![0u8; 64 * 1024];
+        arena_rev[0x4000..0x4004].copy_from_slice(b"ABCD");
+        let mut cpu_rev = GuestCpuState::new(arena_rev.as_mut_ptr(), &bridge);
+        cpu_rev.set_gpr(Gpr::Esp, 0x8000);
+        cpu_rev.set_gpr(Gpr::Esi, 0x4003);
+        cpu_rev.set_gpr(Gpr::Edi, 0x5003);
+        cpu_rev.set_gpr(Gpr::Ecx, 4);
+        let exec_rev = ExecBuffer::new(&comp_rev.code);
+        unsafe {
+            (exec_rev.as_fn())(&mut cpu_rev);
+        }
+        assert_eq!(&arena_rev[0x5000..0x5004], b"ABCD");
+        assert_eq!(cpu_rev.gpr(Gpr::Esi), 0x3FFF);
+        assert_eq!(cpu_rev.gpr(Gpr::Edi), 0x4FFF);
+
+        // 3. rep stosd (memset 4 dwords to 0xDEAD_BEEF)
+        let stos_code = [0xFC, 0xF3, 0xAB, 0xC3];
+        let comp_stos = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &stos_code).unwrap();
+        let mut arena_stos = vec![0u8; 64 * 1024];
+        let mut cpu_stos = GuestCpuState::new(arena_stos.as_mut_ptr(), &bridge);
+        cpu_stos.set_gpr(Gpr::Esp, 0x8000);
+        cpu_stos.set_gpr(Gpr::Eax, 0xDEAD_BEEF);
+        cpu_stos.set_gpr(Gpr::Edi, 0x5000);
+        cpu_stos.set_gpr(Gpr::Ecx, 4);
+        let exec_stos = ExecBuffer::new(&comp_stos.code);
+        unsafe {
+            (exec_stos.as_fn())(&mut cpu_stos);
+        }
+        for slot in arena_stos[0x5000..0x5010].chunks_exact(4) {
+            assert_eq!(slot, &0xDEAD_BEEFu32.to_le_bytes());
+        }
+
+        // 4. repe cmpsb (find first mismatch at index 2 in "ABXD" vs "ABCD")
+        let cmps_code = [0xFC, 0xF3, 0xA6, 0xC3];
+        let comp_cmps = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &cmps_code).unwrap();
+        let mut arena_cmps = vec![0u8; 64 * 1024];
+        arena_cmps[0x4000..0x4004].copy_from_slice(b"ABXD");
+        arena_cmps[0x5000..0x5004].copy_from_slice(b"ABCD");
+        let mut cpu_cmps = GuestCpuState::new(arena_cmps.as_mut_ptr(), &bridge);
+        cpu_cmps.set_gpr(Gpr::Esp, 0x8000);
+        cpu_cmps.set_gpr(Gpr::Esi, 0x4000);
+        cpu_cmps.set_gpr(Gpr::Edi, 0x5000);
+        cpu_cmps.set_gpr(Gpr::Ecx, 4);
+        let exec_cmps = ExecBuffer::new(&comp_cmps.code);
+        unsafe {
+            (exec_cmps.as_fn())(&mut cpu_cmps);
+        }
+        cpu_cmps.materialize_flags();
+        // Compared index 0, 1, 2 (mismatch 'X' vs 'C') -> ECX left = 1, EDI = 0x5003, ZF=0
+        assert_eq!(cpu_cmps.gpr(Gpr::Ecx), 1);
+        assert_eq!(cpu_cmps.gpr(Gpr::Edi), 0x5003);
+        assert_eq!(cpu_cmps.eflags & EFLAGS_ZF, 0);
+
+        // 5. repne scasb (strlen of "hello\0" -> finds '\0' at index 5)
+        let scas_code = [0xFC, 0xF2, 0xAE, 0xC3];
+        let comp_scas = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &scas_code).unwrap();
+        let mut arena_scas = vec![0u8; 64 * 1024];
+        arena_scas[0x5000..0x5006].copy_from_slice(b"hello\0");
+        let mut cpu_scas = GuestCpuState::new(arena_scas.as_mut_ptr(), &bridge);
+        cpu_scas.set_gpr(Gpr::Esp, 0x8000);
+        cpu_scas.set_gpr(Gpr::Eax, 0);
+        cpu_scas.set_gpr(Gpr::Edi, 0x5000);
+        cpu_scas.set_gpr(Gpr::Ecx, 16);
+        let exec_scas = ExecBuffer::new(&comp_scas.code);
+        unsafe {
+            (exec_scas.as_fn())(&mut cpu_scas);
+        }
+        cpu_scas.materialize_flags();
+        assert_eq!(cpu_scas.gpr(Gpr::Ecx), 10);
+        assert_eq!(cpu_scas.gpr(Gpr::Edi), 0x5006);
+        assert_ne!(cpu_scas.eflags & EFLAGS_ZF, 0);
+    }
+
+    #[test]
+    fn cross_compile_aarch64_mixed_fpu_simd_and_string() {
+        let isa = build_isa(TargetArch::AArch64).unwrap();
+        #[rustfmt::skip]
+        let code = [
+            0xD9, 0xE8,             // fld1
+            0xD9, 0xFA,             // fsqrt
+            0xD9, 0xFE,             // fsin
+            0x0F, 0x57, 0xC0,       // xorps xmm0, xmm0
+            0x0F, 0x58, 0xC0,       // addps xmm0, xmm0
+            0xFC, 0xF3, 0xA4,       // cld; rep movsb
+            0xC3,                   // ret
+        ];
+        let compiled = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &code).unwrap();
+        assert!(!compiled.code.is_empty());
+        assert_eq!(compiled.unsupported_count, 0);
     }
 }

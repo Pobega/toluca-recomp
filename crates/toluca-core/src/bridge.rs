@@ -1,12 +1,17 @@
 use core::ffi::c_void;
 use core::mem::offset_of;
 
-use crate::cpu::{ExitReason, GuestCpuState};
+use crate::cpu::{ExitReason, GuestCpuState, X87_SW_C2};
 
 pub type RecompiledFn = unsafe extern "C" fn(cpu: *mut GuestCpuState);
 
 const COM_INTERFACE_SHIFT: u32 = 16;
 const COM_METHOD_MASK: u32 = 0xFFFF;
+const X87_CW_ROUND_SHIFT: u16 = 10;
+const X87_CW_ROUND_MASK: u16 = 0x3;
+const X87_RC_NEAREST_EVEN: u16 = 0;
+const X87_RC_FLOOR: u16 = 1;
+const X87_RC_CEIL: u16 = 2;
 
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -151,6 +156,89 @@ unsafe extern "C" fn stub_unhandled_instruction(
 }
 
 unsafe extern "C" fn stub_trace_hook(_cpu: *mut GuestCpuState, _guest_va: u32) {}
+
+/// Executes an x87 transcendental/rounding helper operation on `cpu.x87`.
+///
+/// # Safety
+/// `cpu` must either be null or point to a valid, exclusively accessible `GuestCpuState`.
+pub unsafe extern "C" fn default_x87_helper(cpu: *mut GuestCpuState, op: u32) {
+    let Some(state) = (unsafe { cpu.as_mut() }) else {
+        return;
+    };
+    let Some(kind) = X87HelperOp::from_u32(op) else {
+        unsafe { set_exit(cpu, ExitReason::UnsupportedInstruction, op) };
+        return;
+    };
+
+    let x87 = &mut state.x87;
+    match kind {
+        X87HelperOp::Fsin => {
+            *x87.st_mut(0) = x87.st(0).sin();
+            x87.status_word &= !X87_SW_C2;
+        }
+        X87HelperOp::Fcos => {
+            *x87.st_mut(0) = x87.st(0).cos();
+            x87.status_word &= !X87_SW_C2;
+        }
+        X87HelperOp::Fsincos => {
+            let x = x87.st(0);
+            *x87.st_mut(0) = x.sin();
+            x87.push(x.cos());
+            x87.status_word &= !X87_SW_C2;
+        }
+        X87HelperOp::Fptan => {
+            let x = x87.st(0);
+            *x87.st_mut(0) = x.tan();
+            x87.push(1.0);
+            x87.status_word &= !X87_SW_C2;
+        }
+        X87HelperOp::Fpatan => {
+            let x = x87.pop();
+            let y = x87.st(0);
+            *x87.st_mut(0) = y.atan2(x);
+        }
+        X87HelperOp::F2xm1 => {
+            *x87.st_mut(0) = x87.st(0).exp2() - 1.0;
+        }
+        X87HelperOp::Fyl2x => {
+            let x = x87.pop();
+            let y = x87.st(0);
+            *x87.st_mut(0) = y * x.log2();
+        }
+        X87HelperOp::Fyl2xp1 => {
+            let x = x87.pop();
+            let y = x87.st(0);
+            *x87.st_mut(0) = y * (x + 1.0).log2();
+        }
+        X87HelperOp::Fscale => {
+            let exp = x87.st(1).trunc();
+            *x87.st_mut(0) *= exp.exp2();
+        }
+        X87HelperOp::Fprem => {
+            let d = x87.st(1);
+            let q = (x87.st(0) / d).trunc();
+            *x87.st_mut(0) -= q * d;
+            x87.status_word &= !X87_SW_C2;
+        }
+        X87HelperOp::Fprem1 => {
+            let d = x87.st(1);
+            let q = (x87.st(0) / d).round_ties_even();
+            *x87.st_mut(0) -= q * d;
+            x87.status_word &= !X87_SW_C2;
+        }
+        X87HelperOp::Frndint => {
+            let val = x87.st(0);
+            let mode = (x87.control_word >> X87_CW_ROUND_SHIFT) & X87_CW_ROUND_MASK;
+            let rounded = match mode {
+                X87_RC_NEAREST_EVEN => val.round_ties_even(),
+                X87_RC_FLOOR => val.floor(),
+                X87_RC_CEIL => val.ceil(),
+                _ => val.trunc(),
+            };
+            *x87.st_mut(0) = rounded;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -65,7 +65,7 @@
 - [ ] Emit a summary report (discovered functions, byte coverage, jump tables, imported Win32 DLL/symbol list) and validate against vanilla `sh2pc.exe`. *(Summary report CLI implemented; awaiting real vanilla `sh2pc.exe` validation.)*
 
 ### Phase 2 — Streaming Cranelift Lifter & Verification (`toluca-recomp` Back-End)
-- [ ] Implement the x86-32 → Cranelift IR lifter in small, modular files (`integer.rs`, `flags.rs`, `control_flow.rs`, `fpu.rs`, `simd.rs`, `string_ops.rs`).
+- [x] Implement the x86-32 → Cranelift IR lifter in small, modular files (`integer.rs`, `flags.rs`, `control_flow.rs`, `fpu.rs`, `simd.rs`, `string_ops.rs`).
 - [ ] Implement streaming compilation to `toluca_code.bin` (resetting Cranelift context per function and logging peak RSS).
 - [ ] Build a desktop-only differential test harness (`unicorn-engine` dev-dependency) that runs unit tests and sampled `sh2pc.exe` functions side-by-side against a reference x86 emulator, asserting identical register/flag/memory output.
 - [ ] Benchmark full `sh2pc.exe` recompilation time and peak RAM on both x86-64 and ARM64.

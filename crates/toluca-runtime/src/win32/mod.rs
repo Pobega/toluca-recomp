@@ -1,8 +1,12 @@
+pub mod d3d8_stub;
 pub mod kernel32;
 pub mod msvcrt;
 pub mod path;
+pub mod sdl2;
+pub mod user32;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::c_void;
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -101,6 +105,84 @@ pub struct CFileEntry {
     pub eof: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct WindowClassInfo {
+    pub style: u32,
+    pub wndproc: GuestAddr,
+    pub hinstance: u32,
+    pub atom: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowRecord {
+    pub hwnd: u32,
+    pub class_name: String,
+    pub wndproc: GuestAddr,
+    pub width: i32,
+    pub height: i32,
+    pub visible: bool,
+    pub user_data: u32,
+    pub sdl_window: Option<*mut c_void>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Win32Msg {
+    pub hwnd: u32,
+    pub message: u32,
+    pub wparam: u32,
+    pub lparam: u32,
+    pub time: u32,
+    pub pt_x: i32,
+    pub pt_y: i32,
+}
+
+const FIRST_HWND: u32 = 0x0002_0000;
+const HWND_STRIDE: u32 = 4;
+
+pub struct WindowManager {
+    pub registered_classes: HashMap<String, WindowClassInfo>,
+    pub class_atoms: HashMap<u16, String>,
+    pub next_atom: u16,
+    pub windows: HashMap<u32, WindowRecord>,
+    pub next_hwnd: u32,
+    pub active_hwnd: Option<u32>,
+    pub focused_hwnd: Option<u32>,
+    pub msg_queue: VecDeque<Win32Msg>,
+    pub quit_requested: bool,
+    pub quit_code: u32,
+    pub cursor_count: i32,
+    pub current_cursor: u32,
+    pub key_states: [bool; 256],
+    pub sdl: Option<sdl2::Sdl2WindowBackend>,
+}
+
+impl WindowManager {
+    pub fn new(headless: bool) -> Self {
+        Self {
+            registered_classes: HashMap::new(),
+            class_atoms: HashMap::new(),
+            next_atom: 1,
+            windows: HashMap::new(),
+            next_hwnd: FIRST_HWND,
+            active_hwnd: None,
+            focused_hwnd: None,
+            msg_queue: VecDeque::new(),
+            quit_requested: false,
+            quit_code: 0,
+            cursor_count: 0,
+            current_cursor: 0,
+            key_states: [false; 256],
+            sdl: sdl2::Sdl2WindowBackend::try_init(headless),
+        }
+    }
+
+    pub fn alloc_hwnd(&mut self) -> u32 {
+        let hwnd = self.next_hwnd;
+        self.next_hwnd = self.next_hwnd.wrapping_add(HWND_STRIDE);
+        hwnd
+    }
+}
+
 pub struct Win32State {
     pub config: Win32Config,
     pub current_dir: PathBuf,
@@ -112,6 +194,7 @@ pub struct Win32State {
     tls_values: Vec<u32>,
     c_files: HashMap<u32, CFileEntry>,
     next_cfile_ptr: u32,
+    pub window_mgr: WindowManager,
     pub d3d8_create_calls: Vec<u32>,
     pub exit_code: Option<u32>,
     pub command_line_guest: Option<GuestAddr>,
@@ -125,6 +208,7 @@ pub struct Win32State {
 impl Win32State {
     pub fn new(config: Win32Config) -> Self {
         let current_dir = config.game_root.clone();
+        let headless = config.headless;
         Self {
             config,
             current_dir,
@@ -136,6 +220,7 @@ impl Win32State {
             tls_values: vec![0; TLS_INITIAL_SLOTS],
             c_files: HashMap::new(),
             next_cfile_ptr: FIRST_CFILE_PTR,
+            window_mgr: WindowManager::new(headless),
             d3d8_create_calls: Vec::new(),
             exit_code: None,
             command_line_guest: None,
@@ -272,6 +357,12 @@ impl Win32State {
 pub fn register_kernel32_and_msvcrt(registry: &mut ImportRegistry) {
     kernel32::register_imports(registry);
     msvcrt::register_imports(registry);
+}
+
+pub fn register_all_win32(registry: &mut ImportRegistry) {
+    register_kernel32_and_msvcrt(registry);
+    user32::register_imports(registry);
+    d3d8_stub::register_imports(registry);
 }
 
 fn is_rooted_win_path(raw: &str) -> bool {

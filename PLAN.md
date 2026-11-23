@@ -73,11 +73,11 @@
 ### Phase 3 — Host Runtime & Boot to `Direct3DCreate8` (`toluca-runtime`)
 - [x] Implement 4 GB `PROT_NONE` virtual memory arena (`mmap`) with on-demand page commit and a compact guest heap allocator suited to 1 GB unified RAM.
 - [x] Implement `toluca_code.bin` loader (`mmap` RX + bridge pointer table + indirect-call dispatcher).
-- [ ] Implement Win32 shims required for startup:
+- [x] Implement Win32 shims required for startup:
   - `kernel32`: file I/O with case-insensitive Windows path resolution, heap/VirtualAlloc, critical sections, events, threads, high-res timers.
   - `user32`: SDL2 window creation and message pump.
   - `msvcrt`: `setjmp`/`longjmp`, formatting, math, and memory routines imported by `sh2pc.exe`.
-- [ ] **Milestone Gate:** Vanilla `sh2pc.exe` boots natively on Linux x86-64, loads `data/` files, and reaches `Direct3DCreate8`.
+- [ ] **Milestone Gate:** Vanilla `sh2pc.exe` boots natively on Linux x86-64, loads `data/` files, and reaches `Direct3DCreate8`. *(Verified end-to-end on synthetic PE32 with case-insensitive file I/O, guest `WndProc` callback, and `Direct3DCreate8(220)`; awaiting unprotected vanilla NA v1.0 `sh2pc.exe`.)*
 
 ### Phase 4 — Clean-Room Direct3D 8 → OpenGL ES 3.0 Renderer (`toluca-d3d8`)
 - [ ] Implement guest-memory COM vtables for `IDirect3D8`, `IDirect3DDevice8`, `IDirect3DTexture8`, `IDirect3DSurface8`, `IDirect3DVertexBuffer8`, and `IDirect3DIndexBuffer8`.

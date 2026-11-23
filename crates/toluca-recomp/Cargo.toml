@@ -7,3 +7,9 @@ license.workspace = true
 [dependencies]
 toluca-core = { path = "../toluca-core" }
 iced-x86 = "1.21"
+cranelift-codegen = { version = "0.130", default-features = false, features = ["std", "x86", "arm64"] }
+cranelift-frontend = "0.130"
+target-lexicon = "0.13"
+
+[dev-dependencies]
+libc = "0.2"

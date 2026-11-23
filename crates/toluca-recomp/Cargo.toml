@@ -13,3 +13,6 @@ target-lexicon = "0.13"
 
 [dev-dependencies]
 libc = "0.2"
+
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86"] }

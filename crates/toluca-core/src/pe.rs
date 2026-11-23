@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use toluca_core::GuestAddr;
-use toluca_core::aot::ImportSymbol;
-
+use crate::GuestAddr;
+use crate::aot::ImportSymbol;
 use crate::sha1::sha1;
 
 pub const DOS_MAGIC: u16 = 0x5A4D;
@@ -29,6 +28,7 @@ const DOS_LFANEW_OFFSET: usize = 0x3C;
 const PE_SIGNATURE_SIZE: usize = 4;
 const COFF_HEADER_SIZE: usize = 20;
 const PE32_OPT_HEADER_FIXED_SIZE: usize = 96;
+const OPT_SIZE_OF_HEADERS_OFFSET: usize = 60;
 const DATA_DIR_ENTRY_SIZE: usize = 8;
 const MAX_DATA_DIRECTORIES: usize = 16;
 const SECTION_HEADER_SIZE: usize = 40;
@@ -150,6 +150,7 @@ pub struct PeImage {
     pub section_alignment: u32,
     pub file_alignment: u32,
     pub size_of_image: u32,
+    pub size_of_headers: u32,
     pub data_directories: Vec<DataDirectory>,
     pub sections: Vec<PeSection>,
     pub imports: Vec<PeImport>,
@@ -218,6 +219,7 @@ impl PeImage {
         let section_alignment = read_u32(&bytes, opt_start + 32)?;
         let file_alignment = read_u32(&bytes, opt_start + 36)?;
         let size_of_image = read_u32(&bytes, opt_start + 56)?;
+        let size_of_headers = read_u32(&bytes, opt_start + OPT_SIZE_OF_HEADERS_OFFSET)?;
         let number_of_rva_and_sizes = read_u32(&bytes, opt_start + 92)? as usize;
 
         let dir_area_bytes = size_of_optional_header - PE32_OPT_HEADER_FIXED_SIZE;
@@ -278,6 +280,7 @@ impl PeImage {
             section_alignment,
             file_alignment,
             size_of_image,
+            size_of_headers,
             data_directories,
             sections,
             imports: Vec::new(),
@@ -557,8 +560,8 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PeError> {
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-#[cfg(test)]
-pub(crate) mod test_helpers {
+#[doc(hidden)]
+pub mod test_helpers {
     use super::*;
 
     pub struct TestSectionSpec<'a> {
@@ -617,7 +620,8 @@ pub(crate) mod test_helpers {
             .unwrap_or(section_alignment);
         let size_of_image = last_end.div_ceil(section_alignment) * section_alignment;
         buf[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
-        buf[opt + 60..opt + 64].copy_from_slice(&(size_of_headers as u32).to_le_bytes());
+        buf[opt + OPT_SIZE_OF_HEADERS_OFFSET..opt + OPT_SIZE_OF_HEADERS_OFFSET + 4]
+            .copy_from_slice(&(size_of_headers as u32).to_le_bytes());
         buf[opt + 92..opt + 96].copy_from_slice(&(MAX_DATA_DIRECTORIES as u32).to_le_bytes());
 
         let dirs_base = opt + PE32_OPT_HEADER_FIXED_SIZE;
@@ -676,22 +680,17 @@ mod tests {
 
     #[test]
     fn parses_sections_and_imports_with_original_and_fallback_thunks() {
-        // Build .rdata at RVA 0x2000 containing import descriptors, thunks, strings
         let rdata_rva = 0x2000u32;
         let mut rdata = vec![0u8; 256];
 
-        // Descriptor 0 (OriginalFirstThunk = 0x2060, Name = 0x2080, FirstThunk = 0x2070)
         rdata[0..4].copy_from_slice(&0x2060u32.to_le_bytes());
         rdata[12..16].copy_from_slice(&0x2080u32.to_le_bytes());
         rdata[16..20].copy_from_slice(&0x2070u32.to_le_bytes());
-        // Descriptor 1 (OriginalFirstThunk = 0 fallback, Name = 0x20A0, FirstThunk = 0x2078)
         rdata[20..24].copy_from_slice(&0u32.to_le_bytes());
         rdata[32..36].copy_from_slice(&0x20A0u32.to_le_bytes());
         rdata[36..40].copy_from_slice(&0x2078u32.to_le_bytes());
 
-        // OriginalFirstThunk for desc 0 -> Hint/Name at 0x20B0
         rdata[0x60..0x64].copy_from_slice(&0x20B0u32.to_le_bytes());
-        // FirstThunk for desc 1 -> Ordinal 42
         rdata[0x78..0x7C].copy_from_slice(&(ORDINAL_FLAG_32 | 42).to_le_bytes());
 
         rdata[0x80..0x8D].copy_from_slice(b"KERNEL32.dll\0");
@@ -721,6 +720,7 @@ mod tests {
 
         let pe = PeImage::parse(bytes).unwrap();
         assert_eq!(pe.entry_va(), 0x0040_1000);
+        assert_eq!(pe.size_of_headers, 0x200);
         assert!(!pe.is_dll());
         assert_eq!(pe.imports.len(), 2);
 

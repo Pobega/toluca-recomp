@@ -71,7 +71,7 @@
 - [ ] Benchmark full `sh2pc.exe` recompilation time and peak RAM on both x86-64 and ARM64.
 
 ### Phase 3 — Host Runtime & Boot to `Direct3DCreate8` (`toluca-runtime`)
-- [ ] Implement 4 GB `PROT_NONE` virtual memory arena (`mmap`) with on-demand page commit and a compact guest heap allocator suited to 1 GB unified RAM.
+- [x] Implement 4 GB `PROT_NONE` virtual memory arena (`mmap`) with on-demand page commit and a compact guest heap allocator suited to 1 GB unified RAM.
 - [ ] Implement `toluca_code.bin` loader (`mmap` RX + bridge pointer table + indirect-call dispatcher).
 - [ ] Implement Win32 shims required for startup:
   - `kernel32`: file I/O with case-insensitive Windows path resolution, heap/VirtualAlloc, critical sections, events, threads, high-res timers.

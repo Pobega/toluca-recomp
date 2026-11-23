@@ -5,6 +5,8 @@ pub mod aot;
 pub mod bridge;
 pub mod cpu;
 pub mod memory;
+pub mod pe;
+pub mod sha1;
 
 pub use aot::{AOT_FORMAT_VERSION, AOT_MAGIC, AotHeader, AotManifest, AotWriter};
 pub use bridge::HostBridge;

@@ -72,7 +72,7 @@
 
 ### Phase 3 — Host Runtime & Boot to `Direct3DCreate8` (`toluca-runtime`)
 - [x] Implement 4 GB `PROT_NONE` virtual memory arena (`mmap`) with on-demand page commit and a compact guest heap allocator suited to 1 GB unified RAM.
-- [ ] Implement `toluca_code.bin` loader (`mmap` RX + bridge pointer table + indirect-call dispatcher).
+- [x] Implement `toluca_code.bin` loader (`mmap` RX + bridge pointer table + indirect-call dispatcher).
 - [ ] Implement Win32 shims required for startup:
   - `kernel32`: file I/O with case-insensitive Windows path resolution, heap/VirtualAlloc, critical sections, events, threads, high-res timers.
   - `user32`: SDL2 window creation and message pump.

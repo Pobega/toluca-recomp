@@ -8,3 +8,6 @@ license.workspace = true
 libc = "0.2"
 toluca-core = { path = "../toluca-core" }
 toluca-d3d8 = { path = "../toluca-d3d8" }
+
+[dev-dependencies]
+toluca-recomp = { path = "../toluca-recomp" }

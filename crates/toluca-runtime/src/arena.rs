@@ -404,6 +404,31 @@ impl GuestArena {
         self.write_bytes(addr, &val.to_le_bytes())
     }
 
+    pub fn write_iat_u32(&mut self, addr: GuestAddr, val: u32) -> Result<(), ArenaError> {
+        self.ensure_readable(addr, 4)?;
+        let start_page = (addr as usize) >> GUEST_PAGE_SHIFT;
+        let end_page = (((addr as u64 + 3) as usize) >> GUEST_PAGE_SHIFT) + 1;
+        if self.writable.all_in_range(start_page, end_page) {
+            return self.write_u32(addr, val);
+        }
+
+        let was_writable: [bool; 2] = [
+            self.writable.get(start_page),
+            start_page + 1 < end_page && self.writable.get(start_page + 1),
+        ];
+
+        self.commit_range(addr, 4, true)?;
+        let write_result = self.write_u32(addr, val);
+
+        for (offset, page) in (start_page..end_page).enumerate() {
+            if !was_writable[offset] {
+                let page_addr = (page as GuestAddr) << GUEST_PAGE_SHIFT;
+                let _ = self.commit_range(page_addr, GUEST_PAGE_SIZE as usize, false);
+            }
+        }
+        write_result
+    }
+
     pub fn read_cstr(&self, addr: GuestAddr, max_len: usize) -> Result<String, ArenaError> {
         if addr < NULL_GUARD_END {
             return Err(ArenaError::Unmapped(addr));
@@ -844,6 +869,24 @@ mod tests {
         assert_eq!(
             arena.commit_stack_down_to(GUEST_STACK_BASE - 4).unwrap_err(),
             ArenaError::StackOverflow(GUEST_STACK_BASE - 4)
+        );
+    }
+
+    #[test]
+    fn write_iat_u32_patches_readonly_page_and_restores_protection() {
+        let mut arena = GuestArena::new().unwrap();
+        let ro_addr = 0x0040_3000;
+        arena.commit_range(ro_addr, GUEST_PAGE_SIZE as usize, false).unwrap();
+
+        assert_eq!(
+            arena.write_u32(ro_addr, 0x1122_3344).unwrap_err(),
+            ArenaError::ReadOnly(ro_addr)
+        );
+        arena.write_iat_u32(ro_addr, 0x7000_0008).unwrap();
+        assert_eq!(arena.read_u32(ro_addr).unwrap(), 0x7000_0008);
+        assert_eq!(
+            arena.write_u32(ro_addr, 0x9999_9999).unwrap_err(),
+            ArenaError::ReadOnly(ro_addr)
         );
     }
 }

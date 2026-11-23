@@ -383,13 +383,36 @@ pub const D3DTOP_DISABLE: u32 = 1;
 pub const D3DTOP_SELECTARG1: u32 = 2;
 pub const D3DTOP_SELECTARG2: u32 = 3;
 pub const D3DTOP_MODULATE: u32 = 4;
+pub const D3DTOP_MODULATE2X: u32 = 5;
+pub const D3DTOP_MODULATE4X: u32 = 6;
+pub const D3DTOP_ADD: u32 = 7;
+pub const D3DTOP_ADDSIGNED: u32 = 8;
+pub const D3DTOP_ADDSIGNED2X: u32 = 9;
+pub const D3DTOP_SUBTRACT: u32 = 10;
+pub const D3DTOP_BLENDDIFFUSEALPHA: u32 = 12;
+pub const D3DTOP_BLENDTEXTUREALPHA: u32 = 13;
+pub const D3DTOP_BLENDFACTORALPHA: u32 = 14;
+pub const D3DTOP_BLENDCURRENTALPHA: u32 = 16;
+pub const D3DTOP_DOTPRODUCT3: u32 = 24;
 
+pub const D3DTA_SELECTMASK: u32 = 0x0F;
 pub const D3DTA_DIFFUSE: u32 = 0;
 pub const D3DTA_CURRENT: u32 = 1;
 pub const D3DTA_TEXTURE: u32 = 2;
 pub const D3DTA_TFACTOR: u32 = 3;
 pub const D3DTA_SPECULAR: u32 = 4;
 pub const D3DTA_TEMP: u32 = 5;
+pub const D3DTA_COMPLEMENT: u32 = 0x10;
+pub const D3DTA_ALPHAREPLICATE: u32 = 0x20;
+
+pub const D3DLIGHT_POINT: u32 = 1;
+pub const D3DLIGHT_SPOT: u32 = 2;
+pub const D3DLIGHT_DIRECTIONAL: u32 = 3;
+
+pub const D3DFOG_NONE: u32 = 0;
+pub const D3DFOG_EXP: u32 = 1;
+pub const D3DFOG_EXP2: u32 = 2;
+pub const D3DFOG_LINEAR: u32 = 3;
 
 pub const D3DTADDRESS_WRAP: u32 = 1;
 pub const D3DTADDRESS_MIRROR: u32 = 2;

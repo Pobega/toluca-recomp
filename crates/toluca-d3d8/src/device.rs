@@ -4,6 +4,7 @@ use toluca_core::GuestAddr;
 
 use crate::backend::{NullBackend, RenderBackend};
 use crate::mem::{ComInterfaceId, ComObjectTable, GuestMemory};
+use crate::shader_asm::{VertexDeclElement, parse_vertex_declaration};
 use crate::state::{DeviceState, StateBlockData, StreamBinding};
 use crate::texture::prepare_texture_upload;
 use crate::types::{
@@ -280,6 +281,7 @@ pub struct Direct3D8Obj {
 
 pub struct VertexShaderObj {
     pub declaration: Vec<u32>,
+    pub parsed_decl: Vec<VertexDeclElement>,
     pub function: Vec<u32>,
     pub usage: u32,
 }
@@ -415,6 +417,18 @@ impl D3d8Context {
 
     pub fn backend_mut(&mut self) -> &mut dyn RenderBackend {
         self.backend.as_mut()
+    }
+
+    pub fn vertex_shader(&self, device_handle: u32, vs_handle: u32) -> Option<&VertexShaderObj> {
+        self.devices
+            .get(&device_handle)
+            .and_then(|d| d.vertex_shaders.get(&vs_handle))
+    }
+
+    pub fn pixel_shader(&self, device_handle: u32, ps_handle: u32) -> Option<&PixelShaderObj> {
+        self.devices
+            .get(&device_handle)
+            .and_then(|d| d.pixel_shaders.get(&ps_handle))
     }
 
     pub fn method_arg_count(iface: ComInterfaceId, method_idx: u32) -> Option<u32> {
@@ -1669,6 +1683,9 @@ impl D3d8Context {
                     return Ok(D3DERR_INVALIDCALL);
                 }
                 let declaration = read_terminated_tokens(mem, p_decl, SHADER_DECL_END)?;
+                let Ok(parsed_decl) = parse_vertex_declaration(&declaration) else {
+                    return Ok(D3DERR_INVALIDCALL);
+                };
                 let function = if p_func != 0 {
                     read_terminated_tokens(mem, p_func, SHADER_FUNC_END)?
                 } else {
@@ -1683,6 +1700,7 @@ impl D3d8Context {
                     vs_handle,
                     VertexShaderObj {
                         declaration,
+                        parsed_decl,
                         function,
                         usage,
                     },

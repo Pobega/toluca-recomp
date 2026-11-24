@@ -17,6 +17,7 @@ struct CliArgs {
     dump_frame: Option<PathBuf>,
     script_keys: Vec<ScriptedKeyEvent>,
     headless: bool,
+    no_gamepad: bool,
     trace_imports: bool,
     trace_d3d8: bool,
     fullscreen: bool,
@@ -62,6 +63,7 @@ fn main() -> ExitCode {
     let config = Win32Config {
         game_root,
         headless: opts.headless,
+        no_gamepad: opts.no_gamepad,
         trace_imports: opts.trace_imports,
         trace_d3d8: opts.trace_d3d8,
         shader_cache_path: shader_cache_path.clone(),
@@ -214,6 +216,7 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut dump_frame: Option<PathBuf> = None;
     let mut script_keys: Vec<ScriptedKeyEvent> = Vec::new();
     let mut headless = false;
+    let mut no_gamepad = false;
     let mut trace_imports = false;
     let mut trace_d3d8 = false;
     let mut fullscreen = false;
@@ -226,6 +229,7 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         let arg = args[idx].as_str();
         match arg {
             "--headless" => headless = true,
+            "--no-gamepad" => no_gamepad = true,
             "--trace-imports" => trace_imports = true,
             "--trace-d3d8" => trace_d3d8 = true,
             "--fullscreen" => fullscreen = true,
@@ -301,6 +305,7 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         dump_frame,
         script_keys,
         headless,
+        no_gamepad,
         trace_imports,
         trace_d3d8,
         fullscreen,
@@ -314,7 +319,7 @@ fn print_usage(args: &[String]) {
     let bin = args.first().map(String::as_str).unwrap_or("toluca-runtime");
     eprintln!("Usage:");
     eprintln!(
-        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--script-keys <SPEC>] [--fullscreen] [--width <W>] [--height <H>] [--aspect <4:3|16:9|stretch>] [--headless] [--trace-imports] [--trace-d3d8]"
+        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--script-keys <SPEC>] [--fullscreen] [--width <W>] [--height <H>] [--aspect <4:3|16:9|stretch>] [--headless] [--no-gamepad] [--trace-imports] [--trace-d3d8]"
     );
 }
 
@@ -342,6 +347,7 @@ mod tests {
         ]);
         let parsed = parse_args(&args).unwrap();
         assert!(parsed.fullscreen);
+        assert!(!parsed.no_gamepad);
         assert_eq!(parsed.width, Some(1280));
         assert_eq!(parsed.height, Some(720));
         assert_eq!(parsed.aspect_mode, AspectMode::Stretch);
@@ -349,12 +355,20 @@ mod tests {
         let default_args = to_args(&["toluca-runtime", "sh2pc.exe", "toluca.aot"]);
         let parsed_default = parse_args(&default_args).unwrap();
         assert!(!parsed_default.fullscreen);
+        assert!(!parsed_default.no_gamepad);
         assert_eq!(parsed_default.width, None);
         assert_eq!(parsed_default.height, None);
         assert_eq!(parsed_default.aspect_mode, AspectMode::Ratio4x3);
 
         let bad_aspect = to_args(&["toluca-runtime", "sh2pc.exe", "toluca.aot", "--aspect", "21:9"]);
         assert!(parse_args(&bad_aspect).is_none());
+    }
+
+    #[test]
+    fn parse_args_supports_no_gamepad_flag() {
+        let args = to_args(&["toluca-runtime", "sh2pc.exe", "toluca.aot", "--no-gamepad"]);
+        let parsed = parse_args(&args).unwrap();
+        assert!(parsed.no_gamepad);
     }
 
     #[test]

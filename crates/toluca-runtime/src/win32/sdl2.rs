@@ -48,6 +48,7 @@ pub const SDL_SCANCODE_COUNT: usize = 512;
 pub const SDL_GAMEPAD_AXIS_COUNT: usize = 6;
 pub const SDL_GAMEPAD_BUTTON_COUNT: usize = 16;
 const SDL_TRIGGER_DIGITAL_THRESHOLD: i16 = 8192;
+const DPAD_AXIS_DEADZONE: i32 = 8192;
 const DI_POV_CENTERED: u32 = 0xFFFF_FFFF;
 
 const SDL_CONTROLLER_BUTTON_A: i32 = 0;
@@ -55,7 +56,6 @@ const SDL_CONTROLLER_BUTTON_B: i32 = 1;
 const SDL_CONTROLLER_BUTTON_X: i32 = 2;
 const SDL_CONTROLLER_BUTTON_Y: i32 = 3;
 const SDL_CONTROLLER_BUTTON_BACK: i32 = 4;
-const SDL_CONTROLLER_BUTTON_GUIDE: i32 = 5;
 const SDL_CONTROLLER_BUTTON_START: i32 = 6;
 const SDL_CONTROLLER_BUTTON_LEFTSTICK: i32 = 7;
 const SDL_CONTROLLER_BUTTON_RIGHTSTICK: i32 = 8;
@@ -396,6 +396,7 @@ pub struct Sdl2WindowBackend {
     windows: Vec<*mut c_void>,
     window_sizes: std::collections::HashMap<usize, (u32, u32)>,
     audio_inited: bool,
+    no_gamepad: bool,
     gamecontroller_inited: bool,
     active_controller: Option<*mut c_void>,
     key_scancodes: [bool; SDL_SCANCODE_COUNT],
@@ -403,7 +404,7 @@ pub struct Sdl2WindowBackend {
 }
 
 impl Sdl2WindowBackend {
-    pub fn try_init(headless: bool) -> Option<Self> {
+    pub fn try_init(headless: bool, no_gamepad: bool) -> Option<Self> {
         if headless {
             return None;
         }
@@ -443,14 +444,22 @@ impl Sdl2WindowBackend {
         };
 
         let init_subsystem_fn = load_sym::<SdlInitSubSystemFn>(lib_handle, c"SDL_InitSubSystem");
-        let mut gamecontroller_inited = unsafe { init_fn(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) } == 0;
-        if !gamecontroller_inited {
+        let mut gamecontroller_inited = false;
+        if no_gamepad {
             if unsafe { init_fn(SDL_INIT_VIDEO) } != 0 {
                 unsafe { libc::dlclose(lib_handle) };
                 return None;
             }
-            if let Some(init_sub) = init_subsystem_fn {
-                gamecontroller_inited = unsafe { init_sub(SDL_INIT_GAMECONTROLLER) } == 0;
+        } else {
+            gamecontroller_inited = unsafe { init_fn(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) } == 0;
+            if !gamecontroller_inited {
+                if unsafe { init_fn(SDL_INIT_VIDEO) } != 0 {
+                    unsafe { libc::dlclose(lib_handle) };
+                    return None;
+                }
+                if let Some(init_sub) = init_subsystem_fn {
+                    gamecontroller_inited = unsafe { init_sub(SDL_INIT_GAMECONTROLLER) } == 0;
+                }
             }
         }
 
@@ -545,13 +554,14 @@ impl Sdl2WindowBackend {
             windows: Vec::new(),
             window_sizes: std::collections::HashMap::new(),
             audio_inited: false,
+            no_gamepad,
             gamecontroller_inited,
             active_controller: None,
             key_scancodes: [false; SDL_SCANCODE_COUNT],
             mouse_wheel_delta: 0,
         };
 
-        if backend.gamecontroller_inited {
+        if !backend.no_gamepad && backend.gamecontroller_inited {
             backend.load_controller_mapping_files();
             backend.open_first_controller();
         }
@@ -599,7 +609,7 @@ impl Sdl2WindowBackend {
     }
 
     fn open_first_controller(&mut self) {
-        if self.active_controller.is_some() {
+        if self.no_gamepad || self.active_controller.is_some() {
             return;
         }
         let Some(num_joysticks) = self.num_joysticks_fn else {
@@ -614,7 +624,7 @@ impl Sdl2WindowBackend {
     }
 
     fn try_open_controller_at(&mut self, device_index: i32) -> bool {
-        if self.active_controller.is_some() {
+        if self.no_gamepad || self.active_controller.is_some() {
             return false;
         }
         let Some(is_gc) = self.is_game_controller_fn else {
@@ -670,6 +680,9 @@ impl Sdl2WindowBackend {
     }
 
     pub fn init_controller_subsystem(&mut self) -> bool {
+        if self.no_gamepad {
+            return false;
+        }
         if self.gamecontroller_inited {
             return true;
         }
@@ -951,7 +964,6 @@ impl Sdl2WindowBackend {
             buttons[7] = pressed(SDL_CONTROLLER_BUTTON_START);
             buttons[10] = pressed(SDL_CONTROLLER_BUTTON_LEFTSTICK);
             buttons[11] = pressed(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
-            buttons[12] = pressed(SDL_CONTROLLER_BUTTON_GUIDE);
             dpad_up = pressed(SDL_CONTROLLER_BUTTON_DPAD_UP);
             dpad_down = pressed(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
             dpad_left = pressed(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
@@ -960,6 +972,7 @@ impl Sdl2WindowBackend {
 
         buttons[8] = axes[4] > SDL_TRIGGER_DIGITAL_THRESHOLD;
         buttons[9] = axes[5] > SDL_TRIGGER_DIGITAL_THRESHOLD;
+        apply_dpad_to_left_stick(&mut axes, dpad_up, dpad_down, dpad_left, dpad_right);
 
         Some(GamepadSnapshot {
             axes,
@@ -1058,6 +1071,29 @@ pub fn dpad_to_pov(up: bool, down: bool, left: bool, right: bool) -> u32 {
     }
 }
 
+pub fn apply_dpad_to_left_stick(
+    axes: &mut [i16; SDL_GAMEPAD_AXIS_COUNT],
+    dpad_up: bool,
+    dpad_down: bool,
+    dpad_left: bool,
+    dpad_right: bool,
+) {
+    if i32::from(axes[0]).abs() < DPAD_AXIS_DEADZONE {
+        if dpad_left && !dpad_right {
+            axes[0] = i16::MIN;
+        } else if dpad_right && !dpad_left {
+            axes[0] = i16::MAX;
+        }
+    }
+    if i32::from(axes[1]).abs() < DPAD_AXIS_DEADZONE {
+        if dpad_up && !dpad_down {
+            axes[1] = i16::MIN;
+        } else if dpad_down && !dpad_up {
+            axes[1] = i16::MAX;
+        }
+    }
+}
+
 impl Drop for Sdl2WindowBackend {
     fn drop(&mut self) {
         if let Some(ctrl) = self.active_controller.take() {
@@ -1145,7 +1181,8 @@ mod tests {
 
     #[test]
     fn headless_returns_none_and_scancode_mapping_matches_win32_vk() {
-        assert!(Sdl2WindowBackend::try_init(true).is_none());
+        assert!(Sdl2WindowBackend::try_init(true, false).is_none());
+        assert!(Sdl2WindowBackend::try_init(true, true).is_none());
         assert_eq!(scancode_to_vk(SDL_SCANCODE_A), Some(b'A'));
         assert_eq!(scancode_to_vk(SDL_SCANCODE_Z), Some(b'Z'));
         assert_eq!(scancode_to_vk(SDL_SCANCODE_0), Some(b'0'));
@@ -1170,5 +1207,18 @@ mod tests {
         assert_eq!(dpad_to_pov(false, true, true, false), 22500);
         assert_eq!(dpad_to_pov(false, false, true, false), 27000);
         assert_eq!(dpad_to_pov(true, false, true, false), 31500);
+    }
+
+    #[test]
+    fn dpad_mirrors_onto_left_stick_only_within_deadzone() {
+        let mut axes = [100, -200, 0, 0, 0, 0];
+        apply_dpad_to_left_stick(&mut axes, true, false, true, false);
+        assert_eq!(axes[0], -32768);
+        assert_eq!(axes[1], -32768);
+
+        let mut active_stick = [15000, -15000, 0, 0, 0, 0];
+        apply_dpad_to_left_stick(&mut active_stick, false, true, true, false);
+        assert_eq!(active_stick[0], 15000);
+        assert_eq!(active_stick[1], -15000);
     }
 }

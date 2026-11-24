@@ -907,6 +907,7 @@ struct BinkInstance {
 pub struct BinkState {
     ffmpeg: Option<FfmpegApi>,
     ffmpeg_load_attempted: bool,
+    logged_missing_ffmpeg: bool,
     requested_sound_tracks: Vec<u32>,
     instances: HashMap<GuestAddr, BinkInstance>,
 }
@@ -922,6 +923,7 @@ impl BinkState {
         Self {
             ffmpeg: None,
             ffmpeg_load_attempted: false,
+            logged_missing_ffmpeg: false,
             requested_sound_tracks: Vec::new(),
             instances: HashMap::new(),
         }
@@ -1039,11 +1041,15 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
 
     let (audio_ordinal, selected_audio_track) =
         select_audio_track(&header, &ctx.win32.bink.requested_sound_tracks, flags);
-    let decoder = ctx
-        .win32
-        .bink
-        .ensure_ffmpeg()
-        .and_then(|api| FfmpegDecoder::open(api, &host_path, audio_ordinal));
+    let decoder = if let Some(api) = ctx.win32.bink.ensure_ffmpeg() {
+        FfmpegDecoder::open(api, &host_path, audio_ordinal)
+    } else {
+        if !ctx.win32.config.headless && !ctx.win32.bink.logged_missing_ffmpeg {
+            ctx.win32.bink.logged_missing_ffmpeg = true;
+            eprintln!("toluca: FFmpeg (libavcodec/libavformat/libavutil) not found; skipping Bink FMV playback");
+        }
+        None
+    };
 
     let bink_va = ctx.heap.alloc(ctx.arena, BINK_STRUCT_ALLOC_BYTES, true)?;
     write_guest_bink_struct(ctx.arena, bink_va, &header, 1, 0, flags)?;
@@ -1154,8 +1160,10 @@ fn bink_wait(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
         return Ok(());
     }
     let wait = match ctx.win32.bink.instances.get(&bink_va) {
-        Some(inst) => u32::from(inst.paused || Instant::now() < inst.next_frame_due),
-        None => 0,
+        Some(inst) if inst.decoder.is_some() => {
+            u32::from(inst.paused || Instant::now() < inst.next_frame_due)
+        }
+        _ => 0,
     };
     return_stdcall(cpu, ctx.arena, 1, wait)?;
     Ok(())

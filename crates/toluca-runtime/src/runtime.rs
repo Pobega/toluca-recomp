@@ -322,6 +322,21 @@ struct RuntimeInner {
     last_error: u32,
 }
 
+struct ScheduledTimer {
+    timer_id: u32,
+    delay: Duration,
+    next_fire: Instant,
+    callback_va: GuestAddr,
+    dw_user: u32,
+    periodic: bool,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct TimerQueueState {
+    started: bool,
+    timers: Vec<ScheduledTimer>,
+}
+
 struct SharedRuntime {
     pe_image_base: GuestAddr,
     code: AotCodeImage,
@@ -330,6 +345,8 @@ struct SharedRuntime {
     arena_base: usize,
     inner: Mutex<RuntimeInner>,
     sync_cv: Condvar,
+    timer_queue: Mutex<TimerQueueState>,
+    timer_cv: Condvar,
     shutdown: AtomicBool,
     worker_done_flags: Mutex<Vec<Arc<AtomicBool>>>,
 }
@@ -464,6 +481,11 @@ impl Runtime {
             arena_base,
             inner: Mutex::new(inner),
             sync_cv: Condvar::new(),
+            timer_queue: Mutex::new(TimerQueueState {
+                started: false,
+                timers: Vec::new(),
+            }),
+            timer_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             worker_done_flags: Mutex::new(Vec::new()),
         });
@@ -513,6 +535,7 @@ impl Runtime {
             held_inner: None,
             trap: None,
             pending_error: None,
+            suspend_slot: None,
         };
         let bridge = build_host_bridge((&raw mut tctx).cast());
         cpu.bridge = &bridge;
@@ -550,7 +573,9 @@ impl Runtime {
 
     fn shutdown_workers(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
+        crate::win32::wake_all_suspended_threads();
         self.shared.sync_cv.notify_all();
+        self.shared.timer_cv.notify_all();
         let flags = {
             let mut list = self
                 .shared
@@ -709,6 +734,7 @@ struct ThreadBridgeContext {
     held_inner: Option<*mut RuntimeInner>,
     trap: Option<TrapInfo>,
     pending_error: Option<RuntimeError>,
+    suspend_slot: Option<&'static crate::win32::ThreadSuspendState>,
 }
 
 unsafe fn thread_ctx_from_cpu<'a>(
@@ -746,7 +772,11 @@ fn with_locked_ctx<R>(
         return f(&mut ctx, state);
     }
 
-    let (result, pending_wait, pending_threads, pending_timers, notify_sync) = {
+    if let Some(slot) = tctx.suspend_slot {
+        slot.in_host_code.store(true, Ordering::SeqCst);
+    }
+
+    let (result, pending_wait, pending_threads, pending_timers, killed_timers, notify_sync) = {
         let mut guard = tctx.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         tctx.held_inner = Some(&raw mut *guard);
         let inner = &mut *guard;
@@ -770,9 +800,10 @@ fn with_locked_ctx<R>(
         let wait = inner.win32.pending_wait.take();
         let threads = std::mem::take(&mut inner.win32.pending_threads);
         let timers = std::mem::take(&mut inner.win32.pending_timers);
+        let killed = std::mem::take(&mut inner.win32.pending_killed_timers);
         let notify = std::mem::replace(&mut inner.win32.notify_sync, false);
         tctx.held_inner = None;
-        (res, wait, threads, timers, notify)
+        (res, wait, threads, timers, killed, notify)
     };
 
     if notify_sync {
@@ -781,11 +812,15 @@ fn with_locked_ctx<R>(
     for spawn in pending_threads {
         spawn_guest_thread(Arc::clone(&tctx.shared), spawn);
     }
-    for timer in pending_timers {
-        spawn_timer_thread(Arc::clone(&tctx.shared), timer);
+    if !pending_timers.is_empty() || !killed_timers.is_empty() {
+        schedule_timers(&tctx.shared, pending_timers, killed_timers);
     }
     if let Some(wait) = pending_wait {
         perform_host_wait(&tctx.shared, tctx.tid, state, wait);
+    }
+    if let Some(slot) = tctx.suspend_slot {
+        slot.in_host_code.store(false, Ordering::SeqCst);
+        crate::win32::park_while_suspended(slot, &tctx.shared.shutdown);
     }
     result
 }
@@ -1230,14 +1265,14 @@ fn perform_host_wait(
                 guard = next_guard;
             }
         }
-        crate::win32::PendingHostWait::WaitObject { handle, timeout_ms } => {
+        crate::win32::PendingHostWait::WaitObject {
+            handle,
+            timeout_ms,
+            initial_pulse,
+        } => {
             let deadline =
                 (timeout_ms != INFINITE_MS).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
             let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let initial_pulse = match guard.win32.get_handle(handle) {
-                Some(crate::win32::Win32Handle::Event { pulse_seq, .. }) => Some(*pulse_seq),
-                _ => None,
-            };
             loop {
                 if shared.shutdown.load(Ordering::Acquire) {
                     if tid != 1 {
@@ -1362,15 +1397,23 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
         #[cfg(not(target_os = "linux"))]
         let os_tid: libc::pid_t = 0;
 
+        let slot_idx = crate::win32::register_thread_suspend_slot(os_tid);
+        let suspend_slot = slot_idx.and_then(crate::win32::thread_suspend_slot);
+
         let thread_priority = {
             let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(crate::win32::Win32Handle::Thread { host_tid, .. }) =
-                guard.win32.get_handle_mut(spawn.handle)
+            if let Some(crate::win32::Win32Handle::Thread {
+                host_tid,
+                suspend_slot: handle_slot,
+                ..
+            }) = guard.win32.get_handle_mut(spawn.handle)
             {
                 *host_tid = Some(os_tid);
+                *handle_slot = slot_idx;
             }
             loop {
                 if shared.shutdown.load(Ordering::Acquire) {
+                    crate::win32::unregister_thread_suspend_slot(slot_idx);
                     done.store(true, Ordering::Release);
                     return;
                 }
@@ -1410,11 +1453,19 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
                     held_inner: None,
                     trap: None,
                     pending_error: None,
+                    suspend_slot,
                 };
                 let bridge = build_host_bridge((&raw mut tctx).cast());
                 cpu.bridge = &bridge;
+                if let Some(slot) = suspend_slot {
+                    slot.in_host_code.store(false, Ordering::SeqCst);
+                    crate::win32::park_while_suspended(slot, &shared.shutdown);
+                }
                 unsafe {
                     entry_fn(&mut cpu);
+                }
+                if let Some(slot) = suspend_slot {
+                    slot.in_host_code.store(true, Ordering::SeqCst);
                 }
             }
             let exit_val = cpu.gpr(Gpr::Eax);
@@ -1430,65 +1481,135 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
             }
             shared.sync_cv.notify_all();
         }
+        crate::win32::unregister_thread_suspend_slot(slot_idx);
         done.store(true, Ordering::Release);
     });
 }
 
-fn spawn_timer_thread(shared: Arc<SharedRuntime>, timer: crate::win32::PendingTimerSpawn) {
-    let done = Arc::new(AtomicBool::new(false));
+fn schedule_timers(
+    shared: &Arc<SharedRuntime>,
+    pending: Vec<crate::win32::PendingTimerSpawn>,
+    killed: Vec<u32>,
+) {
+    let mut spawn_worker = false;
     {
-        let mut flags = shared
-            .worker_done_flags
+        let mut tq = shared
+            .timer_queue
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        flags.push(Arc::clone(&done));
+        if !killed.is_empty() {
+            tq.timers
+                .retain(|t| !killed.contains(&t.timer_id) && !t.cancelled.load(Ordering::Acquire));
+        }
+        let now = Instant::now();
+        for t in pending {
+            if t.cancelled.load(Ordering::Acquire) {
+                continue;
+            }
+            let delay = Duration::from_millis(t.delay_ms.max(1) as u64);
+            tq.timers.push(ScheduledTimer {
+                timer_id: t.timer_id,
+                delay,
+                next_fire: now + delay,
+                callback_va: t.callback_va,
+                dw_user: t.dw_user,
+                periodic: t.periodic,
+                cancelled: t.cancelled,
+            });
+        }
+        if !tq.timers.is_empty() && !tq.started {
+            tq.started = true;
+            spawn_worker = true;
+        }
     }
-    std::thread::spawn(move || {
-        let Some(cb_fn) = shared.code.resolve_va(timer.callback_va) else {
+
+    if spawn_worker {
+        let done = Arc::new(AtomicBool::new(false));
+        {
+            let mut flags = shared
+                .worker_done_flags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            flags.push(Arc::clone(&done));
+        }
+        let worker_shared = Arc::clone(shared);
+        std::thread::spawn(move || timer_worker_loop(worker_shared, done));
+    }
+    shared.timer_cv.notify_all();
+}
+
+fn timer_worker_loop(shared: Arc<SharedRuntime>, done: Arc<AtomicBool>) {
+    const TIMER_STACK_BYTES: usize = 64 * 1024;
+    const TIMER_TEB_BYTES: usize = 0x1000;
+
+    let (stack_top, teb_va) = {
+        let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
+        let Ok(stack_base) = inner.vmem.virtual_alloc(
+            &mut inner.arena,
+            None,
+            TIMER_STACK_BYTES,
+            crate::heap::MEM_RESERVE | crate::heap::MEM_COMMIT,
+            crate::heap::PAGE_READWRITE,
+        ) else {
             done.store(true, Ordering::Release);
             return;
         };
-        let (stack_top, teb_va) = {
-            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let inner = &mut *guard;
-            let Ok(stack_base) = inner.vmem.virtual_alloc(
-                &mut inner.arena,
-                None,
-                64 * 1024,
-                crate::heap::MEM_RESERVE | crate::heap::MEM_COMMIT,
-                crate::heap::PAGE_READWRITE,
-            ) else {
-                done.store(true, Ordering::Release);
-                return;
-            };
-            let Ok(teb) = inner.heap.alloc(&mut inner.arena, 0x1000, true) else {
-                done.store(true, Ordering::Release);
-                return;
-            };
-            (stack_base.wrapping_add(64 * 1024), teb)
+        let Ok(teb) = inner.heap.alloc(&mut inner.arena, TIMER_TEB_BYTES, true) else {
+            done.store(true, Ordering::Release);
+            return;
         };
+        (stack_base.wrapping_add(TIMER_STACK_BYTES as u32), teb)
+    };
 
-        let tid = 0x10_000u64 + timer.timer_id as u64;
-        let delay = Duration::from_millis(timer.delay_ms.max(1) as u64);
-        const TIMER_POLL_SLICE: Duration = Duration::from_millis(5);
-        let mut next_fire = Instant::now() + delay;
-        loop {
+    loop {
+        let due = {
+            let mut tq = shared
+                .timer_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             loop {
-                if shared.shutdown.load(Ordering::Acquire)
-                    || timer.cancelled.load(Ordering::Acquire)
-                {
+                if shared.shutdown.load(Ordering::Acquire) {
                     done.store(true, Ordering::Release);
                     return;
                 }
+                tq.timers
+                    .retain(|t| !t.cancelled.load(Ordering::Acquire));
+                let earliest_idx = tq
+                    .timers
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, t)| t.next_fire)
+                    .map(|(i, _)| i);
+                let Some(idx) = earliest_idx else {
+                    tq = shared
+                        .timer_cv
+                        .wait(tq)
+                        .unwrap_or_else(|e| e.into_inner());
+                    continue;
+                };
                 let now = Instant::now();
+                let next_fire = tq.timers[idx].next_fire;
                 if now >= next_fire {
-                    break;
+                    break tq.timers.swap_remove(idx);
                 }
                 let rem = next_fire.saturating_duration_since(now);
-                std::thread::sleep(rem.min(TIMER_POLL_SLICE));
+                let (next_tq, _) = shared
+                    .timer_cv
+                    .wait_timeout(tq, rem)
+                    .unwrap_or_else(|e| e.into_inner());
+                tq = next_tq;
             }
+        };
+
+        if shared.shutdown.load(Ordering::Acquire) || due.cancelled.load(Ordering::Acquire) {
+            continue;
+        }
+
+        if let Some(cb_fn) = shared.code.resolve_va(due.callback_va) {
+            let tid = 0x10_000u64 + due.timer_id as u64;
             let mut cpu = GuestCpuState::new(shared.arena_base as *mut u8, std::ptr::null());
-            cpu.eip = timer.callback_va;
+            cpu.eip = due.callback_va;
             cpu.fs_base = teb_va;
             cpu.set_gpr(Gpr::Esp, stack_top);
             let pushed = {
@@ -1496,7 +1617,7 @@ fn spawn_timer_thread(shared: Arc<SharedRuntime>, timer: crate::win32::PendingTi
                 push_args_and_sentinel(
                     &mut cpu,
                     &mut guard.arena,
-                    &[timer.timer_id, 0, timer.dw_user, 0, 0],
+                    &[due.timer_id, 0, due.dw_user, 0, 0],
                 )
                 .is_ok()
             };
@@ -1507,6 +1628,7 @@ fn spawn_timer_thread(shared: Arc<SharedRuntime>, timer: crate::win32::PendingTi
                     held_inner: None,
                     trap: None,
                     pending_error: None,
+                    suspend_slot: None,
                 };
                 let bridge = build_host_bridge((&raw mut tctx).cast());
                 cpu.bridge = &bridge;
@@ -1514,11 +1636,167 @@ fn spawn_timer_thread(shared: Arc<SharedRuntime>, timer: crate::win32::PendingTi
                     cb_fn(&mut cpu);
                 }
             }
-            if !timer.periodic {
+        }
+
+        if due.periodic
+            && !due.cancelled.load(Ordering::Acquire)
+            && !shared.shutdown.load(Ordering::Acquire)
+        {
+            let mut next = due;
+            next.next_fire = (next.next_fire + next.delay).max(Instant::now());
+            let mut tq = shared
+                .timer_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            tq.timers.push(next);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn timer_worker_reuses_single_thread_and_stack_across_repeated_oneshots() {
+        let mut arena = GuestArena::new().unwrap();
+        let arena_base = arena.base_ptr() as usize;
+        arena
+            .init_thread_environment(toluca_core::memory::DEFAULT_IMAGE_BASE)
+            .unwrap();
+        let mut heap = GuestHeap::new();
+        let vmem = VirtualMemoryManager::new();
+        let win32 = Win32State::new(Win32Config {
+            headless: true,
+            ..Win32Config::default()
+        });
+        let base_alloc = heap.alloc(&mut arena, 64, true).unwrap();
+        let _ = heap.free(&mut arena, base_alloc);
+
+        let shared = Arc::new(SharedRuntime {
+            pe_image_base: toluca_core::memory::DEFAULT_IMAGE_BASE,
+            code: AotCodeImage::empty_for_test(),
+            registry: ImportRegistry::new(),
+            host_start_instant: Instant::now(),
+            arena_base,
+            inner: Mutex::new(RuntimeInner {
+                arena,
+                heap,
+                vmem,
+                win32,
+                imports: Vec::new(),
+                import_slot_map: HashMap::new(),
+                last_error: 0,
+            }),
+            sync_cv: Condvar::new(),
+            timer_queue: Mutex::new(TimerQueueState {
+                started: false,
+                timers: Vec::new(),
+            }),
+            timer_cv: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            worker_done_flags: Mutex::new(Vec::new()),
+        });
+
+        let mut cancelled_ids = Vec::new();
+        for i in 1..=30u32 {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            if i % 3 == 0 {
+                cancelled.store(true, Ordering::Release);
+                cancelled_ids.push(i);
+            }
+            schedule_timers(
+                &shared,
+                vec![crate::win32::PendingTimerSpawn {
+                    timer_id: i,
+                    delay_ms: 1,
+                    callback_va: 0x0040_1000,
+                    dw_user: i,
+                    periodic: false,
+                    cancelled,
+                }],
+                if i % 3 == 0 { vec![i] } else { Vec::new() },
+            );
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let empty = shared.timer_queue.lock().unwrap().timers.is_empty();
+            if empty || Instant::now() >= deadline {
                 break;
             }
-            next_fire = (next_fire + delay).max(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
         }
-        done.store(true, Ordering::Release);
-    });
+        assert!(shared.timer_queue.lock().unwrap().timers.is_empty());
+        assert_eq!(shared.worker_done_flags.lock().unwrap().len(), 1);
+
+        // Shut down worker cleanly and verify its single done flag flips true.
+        shared.shutdown.store(true, Ordering::Release);
+        shared.timer_cv.notify_all();
+        let flags = std::mem::take(&mut *shared.worker_done_flags.lock().unwrap());
+        let exit_deadline = Instant::now() + Duration::from_secs(1);
+        while !flags[0].load(Ordering::Acquire) && Instant::now() < exit_deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(flags[0].load(Ordering::Acquire));
+
+        // Verify another timer batch while keeping the single 64 KiB stack allocation does not grow threads.
+        assert_eq!(cancelled_ids.len(), 10);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cross_thread_suspend_and_resume_pauses_spinning_thread() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new((Mutex::new(None::<(libc::pid_t, Option<usize>)>), Condvar::new()));
+
+        let c2 = Arc::clone(&counter);
+        let s2 = Arc::clone(&stop);
+        let r2 = Arc::clone(&ready);
+        let handle = std::thread::spawn(move || {
+            let os_tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            let slot_idx = crate::win32::register_thread_suspend_slot(os_tid);
+            let slot = slot_idx.and_then(crate::win32::thread_suspend_slot).unwrap();
+            slot.in_host_code.store(false, Ordering::SeqCst);
+            {
+                let mut g = r2.0.lock().unwrap();
+                *g = Some((os_tid, slot_idx));
+                r2.1.notify_all();
+            }
+            while !s2.load(Ordering::Relaxed) {
+                c2.fetch_add(1, Ordering::Relaxed);
+                std::hint::spin_loop();
+            }
+            crate::win32::unregister_thread_suspend_slot(slot_idx);
+        });
+
+        let (os_tid, slot_idx) = {
+            let mut g = ready.0.lock().unwrap();
+            while g.is_none() {
+                g = ready.1.wait(g).unwrap();
+            }
+            g.unwrap()
+        };
+
+        while counter.load(Ordering::Relaxed) < 100 {
+            std::thread::yield_now();
+        }
+        crate::win32::signal_suspend_thread(os_tid, slot_idx);
+        std::thread::sleep(Duration::from_millis(15));
+        let paused_at = counter.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(counter.load(Ordering::Relaxed), paused_at);
+
+        crate::win32::wake_suspended_thread(slot_idx);
+        let wake_deadline = Instant::now() + Duration::from_secs(1);
+        while counter.load(Ordering::Relaxed) <= paused_at && Instant::now() < wake_deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(counter.load(Ordering::Relaxed) > paused_at);
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
 }

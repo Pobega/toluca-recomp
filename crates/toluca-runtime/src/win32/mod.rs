@@ -15,8 +15,8 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Once};
 
 use toluca_core::GuestAddr;
 use toluca_d3d8::D3d8Context;
@@ -141,6 +141,7 @@ pub enum Win32Handle {
         suspended: bool,
         priority: i32,
         host_tid: Option<libc::pid_t>,
+        suspend_slot: Option<usize>,
     },
     Module {
         name: String,
@@ -148,6 +149,195 @@ pub enum Win32Handle {
     Heap {
         id: u32,
     },
+}
+
+const MAX_TRACKED_THREADS: usize = 32;
+
+pub struct ThreadSuspendState {
+    os_tid: AtomicI32,
+    pub suspend_flag: AtomicU32,
+    pub in_host_code: AtomicBool,
+}
+
+impl ThreadSuspendState {
+    const fn new() -> Self {
+        Self {
+            os_tid: AtomicI32::new(0),
+            suspend_flag: AtomicU32::new(0),
+            in_host_code: AtomicBool::new(false),
+        }
+    }
+}
+
+static SUSPEND_SLOTS: [ThreadSuspendState; MAX_TRACKED_THREADS] =
+    [const { ThreadSuspendState::new() }; MAX_TRACKED_THREADS];
+#[cfg(target_os = "linux")]
+static SUSPEND_HANDLER_ONCE: Once = Once::new();
+
+#[cfg(target_os = "linux")]
+const FUTEX_WAIT_PRIVATE: libc::c_int = libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG;
+#[cfg(target_os = "linux")]
+const FUTEX_WAKE_PRIVATE: libc::c_int = libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG;
+
+#[cfg(target_os = "linux")]
+extern "C" fn suspend_sigusr2_handler(_sig: libc::c_int) {
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+    if tid <= 0 {
+        return;
+    }
+    for slot in &SUSPEND_SLOTS {
+        if slot.os_tid.load(Ordering::Acquire) == tid {
+            if slot.in_host_code.load(Ordering::SeqCst) {
+                return;
+            }
+            while slot.suspend_flag.load(Ordering::SeqCst) != 0 {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        (&raw const slot.suspend_flag).cast::<u32>(),
+                        FUTEX_WAIT_PRIVATE,
+                        1u32,
+                        std::ptr::null::<libc::timespec>(),
+                        0usize,
+                        0usize,
+                    );
+                }
+            }
+            return;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_suspend_signal_handler() {
+    SUSPEND_HANDLER_ONCE.call_once(|| {
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = suspend_sigusr2_handler as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        unsafe {
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn futex_wake_slot(slot: &ThreadSuspendState) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            (&raw const slot.suspend_flag).cast::<u32>(),
+            FUTEX_WAKE_PRIVATE,
+            i32::MAX,
+            0usize,
+            0usize,
+            0usize,
+        );
+    }
+}
+
+pub fn register_thread_suspend_slot(os_tid: libc::pid_t) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        if os_tid <= 0 {
+            return None;
+        }
+        ensure_suspend_signal_handler();
+        for (idx, slot) in SUSPEND_SLOTS.iter().enumerate() {
+            if slot
+                .os_tid
+                .compare_exchange(0, -1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                slot.suspend_flag.store(0, Ordering::SeqCst);
+                slot.in_host_code.store(true, Ordering::SeqCst);
+                slot.os_tid.store(os_tid, Ordering::Release);
+                return Some(idx);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = os_tid;
+        None
+    }
+}
+
+pub fn unregister_thread_suspend_slot(slot_idx: Option<usize>) {
+    let Some(slot) = slot_idx.and_then(|i| SUSPEND_SLOTS.get(i)) else {
+        return;
+    };
+    slot.suspend_flag.store(0, Ordering::SeqCst);
+    #[cfg(target_os = "linux")]
+    futex_wake_slot(slot);
+    slot.in_host_code.store(false, Ordering::SeqCst);
+    slot.os_tid.store(0, Ordering::Release);
+}
+
+pub fn thread_suspend_slot(slot_idx: usize) -> Option<&'static ThreadSuspendState> {
+    SUSPEND_SLOTS.get(slot_idx)
+}
+
+pub fn signal_suspend_thread(os_tid: libc::pid_t, slot_idx: Option<usize>) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(slot) = slot_idx.and_then(|i| SUSPEND_SLOTS.get(i)) {
+            slot.suspend_flag.store(1, Ordering::SeqCst);
+        }
+        if os_tid > 0 {
+            unsafe {
+                libc::syscall(libc::SYS_tgkill, libc::getpid(), os_tid, libc::SIGUSR2);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (os_tid, slot_idx);
+    }
+}
+
+pub fn wake_suspended_thread(slot_idx: Option<usize>) {
+    #[cfg(target_os = "linux")]
+    if let Some(slot) = slot_idx.and_then(|i| SUSPEND_SLOTS.get(i)) {
+        slot.suspend_flag.store(0, Ordering::SeqCst);
+        futex_wake_slot(slot);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = slot_idx;
+    }
+}
+
+pub fn wake_all_suspended_threads() {
+    #[cfg(target_os = "linux")]
+    for slot in &SUSPEND_SLOTS {
+        if slot.os_tid.load(Ordering::Acquire) > 0 {
+            slot.suspend_flag.store(0, Ordering::SeqCst);
+            futex_wake_slot(slot);
+        }
+    }
+}
+
+pub fn park_while_suspended(slot: &ThreadSuspendState, shutdown: &AtomicBool) {
+    #[cfg(target_os = "linux")]
+    while slot.suspend_flag.load(Ordering::SeqCst) != 0 && !shutdown.load(Ordering::Acquire) {
+        unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                (&raw const slot.suspend_flag).cast::<u32>(),
+                FUTEX_WAIT_PRIVATE,
+                1u32,
+                std::ptr::null::<libc::timespec>(),
+                0usize,
+                0usize,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (slot, shutdown);
+    }
 }
 
 pub fn apply_host_thread_priority(os_tid: libc::pid_t, win32_priority: i32) {
@@ -186,7 +376,11 @@ pub fn apply_host_thread_priority(os_tid: libc::pid_t, win32_priority: i32) {
 #[derive(Clone, Debug)]
 pub enum PendingHostWait {
     SleepMs(u32),
-    WaitObject { handle: u32, timeout_ms: u32 },
+    WaitObject {
+        handle: u32,
+        timeout_ms: u32,
+        initial_pulse: Option<u64>,
+    },
     EnterCriticalSection { cs_addr: GuestAddr },
     SuspendSelf { handle: u32 },
 }
@@ -486,6 +680,7 @@ pub struct Win32State {
     pub pending_wait: Option<PendingHostWait>,
     pub pending_threads: Vec<PendingThreadSpawn>,
     pub pending_timers: Vec<PendingTimerSpawn>,
+    pub pending_killed_timers: Vec<u32>,
     pub notify_sync: bool,
     pub main_thread_priority: i32,
 }
@@ -536,6 +731,7 @@ impl Win32State {
             pending_wait: None,
             pending_threads: Vec::new(),
             pending_timers: Vec::new(),
+            pending_killed_timers: Vec::new(),
             notify_sync: false,
             main_thread_priority: 0,
         }

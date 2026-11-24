@@ -1128,7 +1128,7 @@ fn wait_for_single_object(
         Some(Win32Handle::Event {
             manual_reset,
             signaled,
-            ..
+            pulse_seq,
         }) => {
             if *signaled {
                 if !*manual_reset {
@@ -1138,7 +1138,11 @@ fn wait_for_single_object(
             } else if timeout_ms == 0 {
                 WAIT_TIMEOUT
             } else {
-                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject { handle, timeout_ms });
+                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject {
+                    handle,
+                    timeout_ms,
+                    initial_pulse: Some(*pulse_seq),
+                });
                 WAIT_TIMEOUT
             }
         }
@@ -1153,7 +1157,11 @@ fn wait_for_single_object(
             } else if timeout_ms == 0 {
                 WAIT_TIMEOUT
             } else {
-                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject { handle, timeout_ms });
+                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject {
+                    handle,
+                    timeout_ms,
+                    initial_pulse: None,
+                });
                 WAIT_TIMEOUT
             }
         }
@@ -1163,7 +1171,11 @@ fn wait_for_single_object(
             } else if timeout_ms == 0 {
                 WAIT_TIMEOUT
             } else {
-                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject { handle, timeout_ms });
+                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject {
+                    handle,
+                    timeout_ms,
+                    initial_pulse: None,
+                });
                 WAIT_TIMEOUT
             }
         }
@@ -2282,6 +2294,7 @@ pub(crate) fn alloc_and_queue_guest_thread(
         suspended,
         priority: 0,
         host_tid: None,
+        suspend_slot: None,
     });
     ctx.arena.write_u32(teb_va, 0xFFFF_FFFF)?;
     ctx.arena.write_u32(teb_va + 4, stack_top)?;
@@ -2431,9 +2444,14 @@ fn set_thread_priority_boost(
 fn resume_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
     let prev = match ctx.win32.get_handle_mut(handle) {
-        Some(Win32Handle::Thread { suspended, .. }) => {
+        Some(Win32Handle::Thread {
+            suspended,
+            suspend_slot,
+            ..
+        }) => {
             let was = u32::from(*suspended);
             *suspended = false;
+            super::wake_suspended_thread(*suspend_slot);
             ctx.win32.notify_sync = true;
             was
         }
@@ -2447,13 +2465,25 @@ fn suspend_thread(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
-    let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let raw_handle = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let handle = if raw_handle == CURRENT_THREAD_HANDLE {
+        u32::try_from(ctx.active_host_tid).unwrap_or(raw_handle)
+    } else {
+        raw_handle
+    };
     let prev = match ctx.win32.get_handle_mut(handle) {
-        Some(Win32Handle::Thread { suspended, .. }) => {
+        Some(Win32Handle::Thread {
+            suspended,
+            host_tid,
+            suspend_slot,
+            ..
+        }) => {
             let was = u32::from(*suspended);
             *suspended = true;
             if handle as u64 == ctx.active_host_tid {
                 ctx.win32.pending_wait = Some(PendingHostWait::SuspendSelf { handle });
+            } else if let Some(os_tid) = *host_tid {
+                super::signal_suspend_thread(os_tid, *suspend_slot);
             }
             was
         }
@@ -2525,6 +2555,7 @@ fn time_kill_event(
     let timer_id = peek_arg_u32(cpu, ctx.arena, 0)?;
     if let Some(cancelled) = ctx.win32.timers.remove(&timer_id) {
         cancelled.store(true, Ordering::Release);
+        ctx.win32.pending_killed_timers.push(timer_id);
         ctx.win32.notify_sync = true;
     }
     return_stdcall(cpu, ctx.arena, 1, 0)?;

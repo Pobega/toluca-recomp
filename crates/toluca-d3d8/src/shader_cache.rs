@@ -239,20 +239,13 @@ impl ShaderRecipeCache {
         Ok(cache)
     }
 
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.serialize()
+    }
+
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
         let bytes = self.serialize();
-        let mut tmp_os = OsString::from(path.as_os_str());
-        tmp_os.push(".tmp");
-        let tmp_path = std::path::PathBuf::from(tmp_os);
-        if let Err(err) = fs::write(&tmp_path, bytes) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!("failed to write {}: {err}", tmp_path.display()));
-        }
-        if let Err(err) = fs::rename(&tmp_path, path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!("failed to rename {} to {}: {err}", tmp_path.display(), path.display()));
-        }
-        Ok(())
+        save_bytes_atomically(path, &bytes)
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
@@ -260,6 +253,25 @@ impl ShaderRecipeCache {
             fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
         Self::deserialize(&bytes)
     }
+}
+
+pub fn save_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut tmp_os = OsString::from(path.as_os_str());
+    tmp_os.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_os);
+    if let Err(err) = fs::write(&tmp_path, bytes) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("failed to write {}: {err}", tmp_path.display()));
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to rename {} to {}: {err}",
+            tmp_path.display(),
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn encode_stages(buf: &mut Vec<u8>, stages: &[TextureStageKey; MAX_FFP_STAGES]) {

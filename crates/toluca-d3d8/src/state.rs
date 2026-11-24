@@ -104,6 +104,7 @@ pub struct DeviceState {
     material_gen: u64,
     vs_const_gen: u64,
     ps_const_gen: u64,
+    palette_gen: u64,
 }
 
 impl DeviceState {
@@ -143,6 +144,7 @@ impl DeviceState {
             material_gen: 1,
             vs_const_gen: 1,
             ps_const_gen: 1,
+            palette_gen: 1,
         };
         state.transforms.insert(D3DTS_VIEW, IDENTITY_MATRIX_4X4);
         state.transforms.insert(D3DTS_PROJECTION, IDENTITY_MATRIX_4X4);
@@ -158,6 +160,7 @@ impl DeviceState {
         let material_gen = self.material_gen + 1;
         let vs_const_gen = self.vs_const_gen + 1;
         let ps_const_gen = self.ps_const_gen + 1;
+        let palette_gen = self.palette_gen + 1;
         *self = Self::new(width, height, z_enable);
         self.frame_count = frame_count;
         self.transforms_gen = transforms_gen;
@@ -166,6 +169,7 @@ impl DeviceState {
         self.material_gen = material_gen;
         self.vs_const_gen = vs_const_gen;
         self.ps_const_gen = ps_const_gen;
+        self.palette_gen = palette_gen;
     }
 
     pub fn transforms_gen(&self) -> u64 {
@@ -190,6 +194,22 @@ impl DeviceState {
 
     pub fn ps_const_gen(&self) -> u64 {
         self.ps_const_gen
+    }
+
+    pub fn palette_gen(&self) -> u64 {
+        self.palette_gen
+    }
+
+    pub fn set_palette_entries(&mut self, pal_num: u32, entries: Vec<[u8; 4]>) {
+        self.palette_entries.insert(pal_num, entries);
+        self.palette_gen += 1;
+    }
+
+    pub fn set_current_palette(&mut self, pal: u32) {
+        if self.current_palette != pal {
+            self.current_palette = pal;
+            self.palette_gen += 1;
+        }
     }
 
     pub fn get_transform(&self, state: u32) -> [f32; 16] {

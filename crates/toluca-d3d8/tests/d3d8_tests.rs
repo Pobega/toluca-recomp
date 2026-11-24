@@ -694,3 +694,122 @@ fn lock_rect_unlock_sub_upload_uses_sub_rect_hook_and_staging_cache() {
     assert_eq!(&rec.pixels[0..4], &[0x11, 0x22, 0x33, 0xFF]);
     assert_eq!(&rec.pixels[12..16], &[0x44, 0x55, 0x66, 0xFF]);
 }
+
+#[test]
+fn unchanged_full_surface_unlock_skips_upload_until_bytes_or_palette_change() {
+    use std::any::Any;
+    use toluca_d3d8::backend::{ActiveShaders, RenderBackend};
+    use toluca_d3d8::state::DeviceState;
+    use toluca_d3d8::texture::PreparedTextureUpload;
+    use toluca_d3d8::types::{D3DFMT_P8, D3dRect};
+
+    #[derive(Default)]
+    struct SkipTrackBackend {
+        full_uploads: u32,
+        skipped_uploads: u32,
+    }
+
+    impl RenderBackend for SkipTrackBackend {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn max_texture_size(&self) -> u32 {
+            2048
+        }
+        fn supports_s3tc(&self) -> bool {
+            false
+        }
+        fn on_device_create(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_device_reset(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_clear(&mut self, _: u32, _: u32, _: f32, _: u32, _: &[D3dRect]) {}
+        fn on_texture_upload(&mut self, _: u32, _: u32, _: &PreparedTextureUpload) {
+            self.full_uploads += 1;
+        }
+        fn on_texture_upload_skipped(&mut self) {
+            self.skipped_uploads += 1;
+        }
+        fn on_texture_destroy(&mut self, _: u32) {}
+        fn on_vb_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_vb_destroy(&mut self, _: u32) {}
+        fn on_ib_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_ib_destroy(&mut self, _: u32) {}
+        fn on_draw_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32) {}
+        fn on_draw_indexed_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32, _: u32, _: u32) {}
+        fn on_present(&mut self) {}
+    }
+
+    let mut mem = MockMemory::new();
+    let mut ctx = D3d8Context::new(Box::new(SkipTrackBackend::default()));
+
+    let pp_va = mem.alloc(D3dPresentParameters::SIZE, true).unwrap();
+    let out_ptr = mem.alloc(4, true).unwrap();
+    let d3d8_va = ctx.create_direct3d8(&mut mem, D3D_SDK_VERSION).unwrap();
+    let pp = D3dPresentParameters {
+        back_buffer_width: 640,
+        back_buffer_height: 480,
+        back_buffer_format: D3DFMT_X8R8G8B8,
+        back_buffer_count: 1,
+        swap_effect: 1,
+        windowed: 1,
+        ..Default::default()
+    };
+    pp.write_to(&mut mem, pp_va).unwrap();
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            d3d8_va,
+            15,
+            &[0, D3DDEVTYPE_HAL, 0x0002_0000, 0x40, pp_va, out_ptr]
+        ),
+        D3D_OK
+    );
+    let dev_va = mem.read_u32(out_ptr).unwrap();
+    let lr_va = mem.alloc(8, true).unwrap();
+
+    // P8 texture so palette change invalidation is also covered.
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            20,
+            &[4, 4, 1, 0, D3DFMT_P8, D3DPOOL_MANAGED, out_ptr]
+        ),
+        D3D_OK
+    );
+    let tex_va = mem.read_u32(out_ptr).unwrap();
+
+    // Initial full lock + unlock uploads once.
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+    let lr = D3dLockedRect::read_from(&mem, lr_va).unwrap();
+    mem.write_u32(lr.p_bits, 0x0102_0304).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+    // Second full lock + unlock without modifying bytes skips upload.
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+    // Modifying a byte triggers a real re-upload.
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+    mem.write_u32(lr.p_bits, 0x0506_0708).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+    // Changing palette entries invalidates P8 cache and forces re-upload even with unchanged texels.
+    let pal_va = mem.alloc(1024, true).unwrap();
+    mem.write_u32(pal_va, 0xFFFF_0000).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 66, &[0, pal_va]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+    let backend = ctx
+        .backend()
+        .as_any()
+        .downcast_ref::<SkipTrackBackend>()
+        .unwrap();
+    assert_eq!(backend.full_uploads, 3);
+    assert_eq!(backend.skipped_uploads, 1);
+}

@@ -3,6 +3,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::backend::{ActiveShaders, RenderBackend};
@@ -12,7 +14,9 @@ use crate::shader_asm::{
     D3DVSDT_SHORT2, D3DVSDT_SHORT4, D3DVSDT_UBYTE4, VertexDeclElement, translate_ps_1_x,
     translate_vs_1_x,
 };
-use crate::shader_cache::{CachedProgramBinary, ShaderRecipe, ShaderRecipeCache};
+use crate::shader_cache::{
+    CachedProgramBinary, ShaderRecipe, ShaderRecipeCache, save_bytes_atomically,
+};
 use crate::shader_ffp::{
     ATTR_DIFFUSE, ATTR_NORMAL, ATTR_POS, ATTR_SPECULAR, ATTR_TEX0, FfpShaderKey, MAX_FFP_LIGHTS,
     MAX_FFP_STAGES, TextureStageKey, generate_ffp_shaders,
@@ -512,6 +516,85 @@ struct GlTexture {
     wrap_t: GLenum,
     mag_filter: GLenum,
     min_filter: GLenum,
+    drawn_this_frame: bool,
+}
+
+struct CacheWriterShared {
+    pending: Option<(PathBuf, Vec<u8>)>,
+    shutdown: bool,
+}
+
+struct CacheWriter {
+    shared: Arc<(Mutex<CacheWriterShared>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CacheWriter {
+    fn new() -> Self {
+        Self {
+            shared: Arc::new((
+                Mutex::new(CacheWriterShared {
+                    pending: None,
+                    shutdown: false,
+                }),
+                Condvar::new(),
+            )),
+            handle: None,
+        }
+    }
+
+    fn ensure_started(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        let worker_shared = Arc::clone(&self.shared);
+        self.handle = std::thread::Builder::new()
+            .name("toluca-shader-cache".to_owned())
+            .spawn(move || loop {
+                let job = {
+                    let (lock, cv) = &*worker_shared;
+                    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while guard.pending.is_none() && !guard.shutdown {
+                        guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if let Some(job) = guard.pending.take() {
+                        job
+                    } else if guard.shutdown {
+                        break;
+                    } else {
+                        continue;
+                    }
+                };
+                let _ = save_bytes_atomically(&job.0, &job.1);
+            })
+            .ok();
+    }
+
+    fn submit(&mut self, path: PathBuf, bytes: Vec<u8>) {
+        self.ensure_started();
+        let (lock, cv) = &*self.shared;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.pending = Some((path, bytes));
+        cv.notify_one();
+    }
+
+    fn shutdown(&mut self) {
+        {
+            let (lock, cv) = &*self.shared;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            guard.shutdown = true;
+            cv.notify_one();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for CacheWriter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 struct GlBuffer {
@@ -613,8 +696,17 @@ struct PerfStats {
     up_draws: u32,
     tex_full: u32,
     tex_sub: u32,
+    tex_skip: u32,
+    tex_new: u32,
     vb_up: u32,
     ib_up: u32,
+    prog_compile: u32,
+    max_tex_w: u32,
+    max_tex_h: u32,
+    tex_us: u64,
+    draw_us: u64,
+    swap_us: u64,
+    prog_us: u64,
 }
 
 impl PerfStats {
@@ -629,8 +721,24 @@ impl PerfStats {
             up_draws: 0,
             tex_full: 0,
             tex_sub: 0,
+            tex_skip: 0,
+            tex_new: 0,
             vb_up: 0,
             ib_up: 0,
+            prog_compile: 0,
+            max_tex_w: 0,
+            max_tex_h: 0,
+            tex_us: 0,
+            draw_us: 0,
+            swap_us: 0,
+            prog_us: 0,
+        }
+    }
+
+    fn record_tex_dims(&mut self, w: u32, h: u32) {
+        if self.enabled {
+            self.max_tex_w = self.max_tex_w.max(w);
+            self.max_tex_h = self.max_tex_h.max(h);
         }
     }
 
@@ -643,9 +751,24 @@ impl PerfStats {
         if elapsed >= PERF_LOG_INTERVAL {
             let secs = elapsed.as_secs_f64().max(0.001);
             let fps = f64::from(self.frames) / secs;
+            let tex_ms = (self.tex_us as f64) / 1000.0;
+            let draw_ms = (self.draw_us as f64) / 1000.0;
+            let swap_ms = (self.swap_us as f64) / 1000.0;
+            let prog_ms = (self.prog_us as f64) / 1000.0;
             eprintln!(
-                "[toluca-perf] fps={fps:.1} frames={} draws={} up_draws={} tex_full={} tex_sub={} vb_up={} ib_up={}",
-                self.frames, self.draws, self.up_draws, self.tex_full, self.tex_sub, self.vb_up, self.ib_up
+                "[toluca-perf] fps={fps:.1} frames={} draws={} up_draws={} tex_full={} tex_sub={} tex_skip={} tex_new={} vb_up={} ib_up={} progs={} max_tex={}x{} ms(tex={tex_ms:.1} draw={draw_ms:.1} swap={swap_ms:.1} prog={prog_ms:.1})",
+                self.frames,
+                self.draws,
+                self.up_draws,
+                self.tex_full,
+                self.tex_sub,
+                self.tex_skip,
+                self.tex_new,
+                self.vb_up,
+                self.ib_up,
+                self.prog_compile,
+                self.max_tex_w,
+                self.max_tex_h,
             );
             self.last_log = now;
             self.frames = 0;
@@ -653,8 +776,17 @@ impl PerfStats {
             self.up_draws = 0;
             self.tex_full = 0;
             self.tex_sub = 0;
+            self.tex_skip = 0;
+            self.tex_new = 0;
             self.vb_up = 0;
             self.ib_up = 0;
+            self.prog_compile = 0;
+            self.max_tex_w = 0;
+            self.max_tex_h = 0;
+            self.tex_us = 0;
+            self.draw_us = 0;
+            self.swap_us = 0;
+            self.prog_us = 0;
         }
     }
 }
@@ -1020,6 +1152,7 @@ pub struct Gles3Backend {
     cache_dirty: bool,
     last_cache_change: Instant,
     last_cache_save: Instant,
+    cache_writer: CacheWriter,
     aspect_mode: AspectMode,
     perf: PerfStats,
     pub draw_calls: u64,
@@ -1083,6 +1216,7 @@ impl Gles3Backend {
             cache_dirty: false,
             last_cache_change: now,
             last_cache_save: now,
+            cache_writer: CacheWriter::new(),
             aspect_mode: AspectMode::default(),
             perf: PerfStats::new(now),
             draw_calls: 0,
@@ -1143,8 +1277,9 @@ impl Gles3Backend {
         let now = Instant::now();
         if now.duration_since(self.last_cache_change) >= CACHE_FLUSH_INTERVAL
             && now.duration_since(self.last_cache_save) >= CACHE_FLUSH_INTERVAL
-            && self.recipe_cache.save_to_file(path).is_ok()
         {
+            let bytes = self.recipe_cache.to_bytes();
+            self.cache_writer.submit(path.to_path_buf(), bytes);
             self.cache_dirty = false;
             self.last_cache_save = now;
         }
@@ -1329,6 +1464,7 @@ impl Gles3Backend {
             }
         }
 
+        let t0 = self.perf.enabled.then(Instant::now);
         let mut program_from_bin = None;
         if let Some(bin) = cached_bin {
             program_from_bin = load_program_from_binary(&self.gl, bin);
@@ -1365,6 +1501,10 @@ impl Gles3Backend {
         } else if is_new_recipe {
             self.cache_dirty = true;
             self.last_cache_change = Instant::now();
+        }
+        self.perf.prog_compile += 1;
+        if let Some(start) = t0 {
+            self.perf.prog_us += start.elapsed().as_micros() as u64;
         }
 
         let idx = self.programs.len();
@@ -1688,6 +1828,7 @@ impl Gles3Backend {
 
 impl Drop for Gles3Backend {
     fn drop(&mut self) {
+        self.cache_writer.shutdown();
         if self.cache_dirty {
             if let Some(path) = self.recipe_cache_path.as_deref() {
                 let _ = self.save_recipe_cache(path);
@@ -1797,6 +1938,7 @@ impl RenderBackend for Gles3Backend {
     }
 
     fn on_texture_upload(&mut self, tex_handle: u32, level: u32, upload: &PreparedTextureUpload) {
+        let t0 = self.perf.enabled.then(Instant::now);
         let mut created = false;
         let tex_id = self
             .textures
@@ -1815,6 +1957,7 @@ impl RenderBackend for Gles3Backend {
                     wrap_t: GL_REPEAT,
                     mag_filter: GL_NEAREST,
                     min_filter: GL_NEAREST,
+                    drawn_this_frame: false,
                 }
             })
             .id;
@@ -1823,6 +1966,7 @@ impl RenderBackend for Gles3Backend {
         let entry = self.textures.get_mut(&tex_handle).unwrap();
 
         if created {
+            self.perf.tex_new += 1;
             unsafe {
                 (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
                 (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
@@ -1851,13 +1995,13 @@ impl RenderBackend for Gles3Backend {
             }
         }
 
-        unsafe {
+        let (tex_w, tex_h) = unsafe {
             (self.gl.gl_pixel_storei)(GL_UNPACK_ALIGNMENT, 1);
 
             match upload {
                 PreparedTextureUpload::Rgba8(img) => {
-                    let can_sub = entry.levels.get(&level)
-                        == Some(&(img.width, img.height, GL_RGBA8));
+                    let can_sub = !entry.drawn_this_frame
+                        && entry.levels.get(&level) == Some(&(img.width, img.height, GL_RGBA8));
                     if can_sub {
                         (self.gl.gl_tex_sub_image2d)(
                             GL_TEXTURE_2D,
@@ -1885,7 +2029,9 @@ impl RenderBackend for Gles3Backend {
                         entry
                             .levels
                             .insert(level, (img.width, img.height, GL_RGBA8));
+                        entry.drawn_this_frame = false;
                     }
+                    (img.width, img.height)
                 }
                 PreparedTextureUpload::CompressedS3tc {
                     format,
@@ -1899,8 +2045,8 @@ impl RenderBackend for Gles3Backend {
                         D3DFMT_DXT5 => GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
                         _ => GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
                     };
-                    let can_sub =
-                        entry.levels.get(&level) == Some(&(*width, *height, internal_fmt));
+                    let can_sub = !entry.drawn_this_frame
+                        && entry.levels.get(&level) == Some(&(*width, *height, internal_fmt));
                     if can_sub {
                         (self.gl.gl_compressed_tex_sub_image2d)(
                             GL_TEXTURE_2D,
@@ -1925,12 +2071,18 @@ impl RenderBackend for Gles3Backend {
                             data.as_ptr().cast(),
                         );
                         entry.levels.insert(level, (*width, *height, internal_fmt));
+                        entry.drawn_this_frame = false;
                     }
+                    (*width, *height)
                 }
             }
-        }
+        };
         self.state_cache.bind_texture(&self.gl, 0, 0);
         self.perf.tex_full += 1;
+        self.perf.record_tex_dims(tex_w, tex_h);
+        if let Some(start) = t0 {
+            self.perf.tex_us += start.elapsed().as_micros() as u64;
+        }
     }
 
     fn on_texture_sub_upload(
@@ -1955,6 +2107,7 @@ impl RenderBackend for Gles3Backend {
         {
             return false;
         }
+        let t0 = self.perf.enabled.then(Instant::now);
         let tex_id = tex.id;
         self.state_cache.bind_texture_active(&self.gl, 0, tex_id);
         unsafe {
@@ -1973,7 +2126,15 @@ impl RenderBackend for Gles3Backend {
         }
         self.state_cache.bind_texture(&self.gl, 0, 0);
         self.perf.tex_sub += 1;
+        self.perf.record_tex_dims(upload.width, upload.height);
+        if let Some(start) = t0 {
+            self.perf.tex_us += start.elapsed().as_micros() as u64;
+        }
         true
+    }
+
+    fn on_texture_upload_skipped(&mut self) {
+        self.perf.tex_skip += 1;
     }
 
     fn on_texture_destroy(&mut self, tex_handle: u32) {
@@ -2108,6 +2269,7 @@ impl RenderBackend for Gles3Backend {
         if vtx_count == 0 || self.fbo == 0 {
             return;
         }
+        let t0 = self.perf.enabled.then(Instant::now);
         if self.bind_pipeline_and_uniforms(state, shaders).is_none() {
             return;
         }
@@ -2119,6 +2281,9 @@ impl RenderBackend for Gles3Backend {
         }
         self.draw_calls += 1;
         self.perf.draws += 1;
+        if let Some(start) = t0 {
+            self.perf.draw_us += start.elapsed().as_micros() as u64;
+        }
     }
 
     fn on_draw_indexed_primitive(
@@ -2148,15 +2313,6 @@ impl RenderBackend for Gles3Backend {
         else {
             return;
         };
-        if self.bind_pipeline_and_uniforms(state, shaders).is_none() {
-            return;
-        }
-
-        let base_off = base_vertex_idx.max(0) as usize;
-        if !self.bind_vertex_attributes(state, shaders, None, base_off) {
-            return;
-        }
-
         let (gl_idx_type, idx_elem_bytes) = if ib_format == D3DFMT_INDEX32 {
             (GL_UNSIGNED_INT, 4usize)
         } else {
@@ -2164,6 +2320,15 @@ impl RenderBackend for Gles3Backend {
         };
         let byte_offset = (start_index as usize) * idx_elem_bytes;
         if byte_offset + (idx_count as usize) * idx_elem_bytes > ib_len {
+            return;
+        }
+
+        let t0 = self.perf.enabled.then(Instant::now);
+        if self.bind_pipeline_and_uniforms(state, shaders).is_none() {
+            return;
+        }
+        let base_off = base_vertex_idx.max(0) as usize;
+        if !self.bind_vertex_attributes(state, shaders, None, base_off) {
             return;
         }
 
@@ -2178,6 +2343,9 @@ impl RenderBackend for Gles3Backend {
         }
         self.draw_calls += 1;
         self.perf.draws += 1;
+        if let Some(start) = t0 {
+            self.perf.draw_us += start.elapsed().as_micros() as u64;
+        }
     }
 
     fn on_draw_primitive_up(
@@ -2196,6 +2364,7 @@ impl RenderBackend for Gles3Backend {
         if vtx_count == 0 || vertex_data.is_empty() || self.fbo == 0 {
             return;
         }
+        let t0 = self.perf.enabled.then(Instant::now);
         if self.bind_pipeline_and_uniforms(state, shaders).is_none() {
             return;
         }
@@ -2210,6 +2379,9 @@ impl RenderBackend for Gles3Backend {
         self.draw_calls += 1;
         self.perf.draws += 1;
         self.perf.up_draws += 1;
+        if let Some(start) = t0 {
+            self.perf.draw_us += start.elapsed().as_micros() as u64;
+        }
     }
 
     fn on_draw_indexed_primitive_up(
@@ -2232,6 +2404,7 @@ impl RenderBackend for Gles3Backend {
         if idx_count == 0 || index_data.is_empty() || vertex_data.is_empty() || self.fbo == 0 {
             return;
         }
+        let t0 = self.perf.enabled.then(Instant::now);
         if self.bind_pipeline_and_uniforms(state, shaders).is_none() {
             return;
         }
@@ -2257,6 +2430,9 @@ impl RenderBackend for Gles3Backend {
         self.draw_calls += 1;
         self.perf.draws += 1;
         self.perf.up_draws += 1;
+        if let Some(start) = t0 {
+            self.perf.draw_us += start.elapsed().as_micros() as u64;
+        }
     }
 
     fn on_present(&mut self) {
@@ -2304,8 +2480,15 @@ impl RenderBackend for Gles3Backend {
             (self.gl.gl_draw_arrays)(GL_TRIANGLE_STRIP, 0, 4);
         }
 
+        let swap_t0 = self.perf.enabled.then(Instant::now);
         self.present_target.swap_buffers();
+        if let Some(start) = swap_t0 {
+            self.perf.swap_us += start.elapsed().as_micros() as u64;
+        }
         self.state_cache.invalidate_all();
+        for tex in self.textures.values_mut() {
+            tex.drawn_this_frame = false;
+        }
         unsafe {
             (self.gl.gl_bind_vertex_array)(0);
         }
@@ -2785,6 +2968,7 @@ fn bind_textures(
             continue;
         };
         state_cache.bind_texture(gl, s, gl_tex.id);
+        gl_tex.drawn_this_frame = true;
 
         let addr_u = map_tex_address(state.get_texture_stage_state(s, D3DTSS_ADDRESSU));
         let addr_v = map_tex_address(state.get_texture_stage_state(s, D3DTSS_ADDRESSV));

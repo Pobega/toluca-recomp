@@ -34,6 +34,7 @@ pub trait RenderBackend {
     ) -> bool {
         false
     }
+    fn on_texture_upload_skipped(&mut self) {}
     fn on_texture_destroy(&mut self, tex_handle: u32);
     fn on_vb_upload(&mut self, vb_handle: u32, data: &[u8], fvf: u32, usage: u32);
     fn on_vb_sub_upload(

@@ -346,6 +346,8 @@ pub struct SurfaceObj {
     pub lock_flags: Option<u32>,
     pub staging_synced: bool,
     pub locked_rect: Option<(u32, u32, u32, u32)>,
+    pub uploaded_once: bool,
+    pub last_palette_gen: u64,
 }
 
 pub struct VertexBufferObj {
@@ -389,6 +391,7 @@ pub struct D3d8Context {
     index_buffers: HashMap<u32, IndexBufferObj>,
     scratch_vtx: Vec<u8>,
     scratch_idx: Vec<u8>,
+    scratch_tex: Vec<u8>,
 }
 
 impl Default for D3d8Context {
@@ -412,6 +415,7 @@ impl D3d8Context {
             index_buffers: HashMap::new(),
             scratch_vtx: Vec::new(),
             scratch_idx: Vec::new(),
+            scratch_tex: Vec::new(),
         }
     }
 
@@ -913,6 +917,8 @@ impl D3d8Context {
                 lock_flags: None,
                 staging_synced: false,
                 locked_rect: None,
+                uploaded_once: false,
+                last_palette_gen: 0,
             },
         );
         handle
@@ -1570,7 +1576,7 @@ impl D3d8Context {
                     entries.push([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
                 if let Some(dev) = self.devices.get_mut(&handle) {
-                    dev.state.palette_entries.insert(pal_num, entries);
+                    dev.state.set_palette_entries(pal_num, entries);
                 }
                 Ok(D3D_OK)
             }
@@ -1595,7 +1601,7 @@ impl D3d8Context {
             }
             68 => {
                 if let Some(dev) = self.devices.get_mut(&handle) {
-                    dev.state.current_palette = args[1];
+                    dev.state.set_current_palette(args[1]);
                 }
                 Ok(D3D_OK)
             }
@@ -2351,16 +2357,20 @@ impl D3d8Context {
         {
             return Ok(D3DERR_INVALIDCALL);
         }
-        let Some(src_data) = self.surfaces.get(&src_h).map(|s| s.data.clone()) else {
+        if !self.surfaces.contains_key(&dst_h) {
             return Ok(D3DERR_INVALIDCALL);
-        };
-        let Some(dst) = self.surfaces.get_mut(&dst_h) else {
-            return Ok(D3DERR_INVALIDCALL);
-        };
-        let copy_len = src_data.len().min(dst.data.len());
-        dst.data[..copy_len].copy_from_slice(&src_data[..copy_len]);
-        dst.staging_synced = false;
-        self.upload_surface_texture(dst_h);
+        }
+        let mut buf = std::mem::take(&mut self.scratch_tex);
+        {
+            let Some(src) = self.surfaces.get(&src_h) else {
+                self.scratch_tex = buf;
+                return Ok(D3DERR_INVALIDCALL);
+            };
+            buf.clear();
+            buf.extend_from_slice(&src.data);
+        }
+        self.copy_into_surface_and_upload(&buf, dst_h);
+        self.scratch_tex = buf;
         Ok(D3D_OK)
     }
 
@@ -2390,19 +2400,49 @@ impl D3d8Context {
         };
 
         let levels = src_mips.len().min(dst_mips.len());
+        let mut buf = std::mem::take(&mut self.scratch_tex);
         for level in 0..levels {
-            let Some(src_data) = self.surfaces.get(&src_mips[level]).map(|s| s.data.clone()) else {
-                continue;
-            };
-            let dst_surf_h = dst_mips[level];
-            if let Some(dst_surf) = self.surfaces.get_mut(&dst_surf_h) {
-                let copy_len = src_data.len().min(dst_surf.data.len());
-                dst_surf.data[..copy_len].copy_from_slice(&src_data[..copy_len]);
-                dst_surf.staging_synced = false;
+            {
+                let Some(src) = self.surfaces.get(&src_mips[level]) else {
+                    continue;
+                };
+                buf.clear();
+                buf.extend_from_slice(&src.data);
             }
-            self.upload_surface_texture(dst_surf_h);
+            self.copy_into_surface_and_upload(&buf, dst_mips[level]);
         }
+        self.scratch_tex = buf;
         Ok(D3D_OK)
+    }
+
+    fn copy_into_surface_and_upload(&mut self, src_data: &[u8], dst_h: u32) {
+        let Some((dev_h, fmt)) = self.surfaces.get(&dst_h).map(|s| (s.device_handle, s.format))
+        else {
+            return;
+        };
+        let cur_pal_gen = self.surface_palette_gen(dev_h);
+        let Some(dst) = self.surfaces.get_mut(&dst_h) else {
+            return;
+        };
+        let copy_len = src_data.len().min(dst.data.len());
+        let palette_same = fmt != D3DFMT_P8 || cur_pal_gen == dst.last_palette_gen;
+        if dst.uploaded_once
+            && palette_same
+            && copy_len == dst.data.len()
+            && dst.data == src_data[..copy_len]
+        {
+            self.backend.on_texture_upload_skipped();
+            return;
+        }
+        dst.data[..copy_len].copy_from_slice(&src_data[..copy_len]);
+        dst.staging_synced = false;
+        self.upload_surface_texture(dst_h);
+    }
+
+    fn surface_palette_gen(&self, device_handle: u32) -> u64 {
+        self.devices
+            .get(&device_handle)
+            .map_or(0, |dev| dev.state.palette_gen())
     }
 
     fn surface_palette(&self, device_handle: u32, format: u32) -> Option<[[u8; 4]; 256]> {
@@ -2420,27 +2460,34 @@ impl D3d8Context {
     }
 
     fn upload_surface_texture(&mut self, surf_handle: u32) {
-        let Some(surf) = self.surfaces.get(&surf_handle) else {
+        let Some((tex_h, level, dev_h, fmt, width, height)) = self.surfaces.get(&surf_handle).and_then(|s| {
+            let (tex_h, level) = s.parent_texture?;
+            Some((tex_h, level, s.device_handle, s.format, s.width, s.height))
+        }) else {
             return;
         };
-        let Some((tex_h, level)) = surf.parent_texture else {
-            return;
+        let palette = self.surface_palette(dev_h, fmt);
+        let cur_pal_gen = self.surface_palette_gen(dev_h);
+        let pitch = surface_row_pitch(fmt, width);
+        let prepared = {
+            let surf = self.surfaces.get(&surf_handle).unwrap();
+            prepare_texture_upload(
+                fmt,
+                width,
+                height,
+                pitch,
+                &surf.data,
+                palette.as_ref(),
+                self.backend.max_texture_size(),
+                self.backend.supports_s3tc(),
+            )
         };
-        let palette = self.surface_palette(surf.device_handle, surf.format);
-        let surf = self.surfaces.get(&surf_handle).unwrap();
-
-        let pitch = surface_row_pitch(surf.format, surf.width);
-        if let Ok(prepared) = prepare_texture_upload(
-            surf.format,
-            surf.width,
-            surf.height,
-            pitch,
-            &surf.data,
-            palette.as_ref(),
-            self.backend.max_texture_size(),
-            self.backend.supports_s3tc(),
-        ) {
+        if let Ok(prepared) = prepared {
             self.backend.on_texture_upload(tex_h, level, &prepared);
+            if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
+                surf.uploaded_once = true;
+                surf.last_palette_gen = cur_pal_gen;
+            }
         }
     }
 
@@ -2835,67 +2882,106 @@ impl D3d8Context {
         surf_handle: u32,
     ) -> Result<HResult, String> {
         let max_tex_size = self.backend.max_texture_size();
-        let Some(surf) = self.surfaces.get_mut(&surf_handle) else {
-            return Ok(D3DERR_INVALIDCALL);
+        let (flags, locked_rect, dev_h, fmt, w, h, staging_va, data_len, uploaded_once, last_pal_gen) = {
+            let Some(surf) = self.surfaces.get_mut(&surf_handle) else {
+                return Ok(D3DERR_INVALIDCALL);
+            };
+            let Some(flags) = surf.lock_flags.take() else {
+                return Ok(D3DERR_INVALIDCALL);
+            };
+            let locked_rect = surf.locked_rect.take();
+            (
+                flags,
+                locked_rect,
+                surf.device_handle,
+                surf.format,
+                surf.width,
+                surf.height,
+                surf.staging_guest_va,
+                surf.data.len(),
+                surf.uploaded_once,
+                surf.last_palette_gen,
+            )
         };
-        let Some(flags) = surf.lock_flags.take() else {
-            return Ok(D3DERR_INVALIDCALL);
-        };
-        let locked_rect = surf.locked_rect.take();
-        if (flags & D3DLOCK_READONLY) == 0 {
-            let sub_rect = locked_rect.filter(|&(rx, ry, rw, rh)| {
-                dxt_block_bytes(surf.format).is_none()
-                    && surf.width <= max_tex_size
-                    && surf.height <= max_tex_size
-                    && (rx > 0 || ry > 0 || rw < surf.width || rh < surf.height)
-            });
-            if let Some((rx, ry, rw, rh)) = sub_rect {
-                let pitch = surface_row_pitch(surf.format, surf.width);
-                if let Some(staging_va) = surf.staging_guest_va {
+        if (flags & D3DLOCK_READONLY) != 0 {
+            return Ok(D3D_OK);
+        }
+
+        let cur_pal_gen = self.surface_palette_gen(dev_h);
+        let palette_same = fmt != D3DFMT_P8 || cur_pal_gen == last_pal_gen;
+        let sub_rect = locked_rect.filter(|&(rx, ry, rw, rh)| {
+            dxt_block_bytes(fmt).is_none()
+                && w <= max_tex_size
+                && h <= max_tex_size
+                && palette_same
+                && (rx > 0 || ry > 0 || rw < w || rh < h)
+        });
+
+        if let Some((rx, ry, rw, rh)) = sub_rect {
+            let pitch = surface_row_pitch(fmt, w);
+            let parent_tex = {
+                let surf = self.surfaces.get_mut(&surf_handle).unwrap();
+                if let Some(va) = staging_va {
                     if !surf.data.is_empty() {
                         let row_start = (ry as usize) * (pitch as usize);
                         let row_end = ((ry + rh) as usize) * (pitch as usize);
                         let clamped_end = row_end.min(surf.data.len());
                         if row_start < clamped_end {
                             mem.read_into(
-                                staging_va + row_start as u32,
+                                va + row_start as u32,
                                 &mut surf.data[row_start..clamped_end],
                             )?;
                         }
                     }
                 }
-                if let Some((tex_h, level)) = surf.parent_texture {
-                    let dev_h = surf.device_handle;
-                    let surf_fmt = surf.format;
-                    let palette = self.surface_palette(dev_h, surf_fmt);
-                    let surf = self.surfaces.get(&surf_handle).unwrap();
-                    let uploaded = convert_surface_rect_to_rgba8(
-                        surf.format,
-                        pitch,
-                        &surf.data,
-                        rx,
-                        ry,
-                        rw,
-                        rh,
-                        palette.as_ref(),
-                    )
-                    .is_ok_and(|decoded| {
-                        self.backend
-                            .on_texture_sub_upload(tex_h, level, rx, ry, &decoded)
-                    });
-                    if uploaded {
+                surf.parent_texture
+            };
+            if let Some((tex_h, level)) = parent_tex {
+                let palette = self.surface_palette(dev_h, fmt);
+                let surf = self.surfaces.get(&surf_handle).unwrap();
+                let uploaded = convert_surface_rect_to_rgba8(
+                    fmt,
+                    pitch,
+                    &surf.data,
+                    rx,
+                    ry,
+                    rw,
+                    rh,
+                    palette.as_ref(),
+                )
+                .is_ok_and(|decoded| {
+                    self.backend
+                        .on_texture_sub_upload(tex_h, level, rx, ry, &decoded)
+                });
+                if uploaded {
+                    if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
+                        surf.uploaded_once = true;
+                        surf.last_palette_gen = cur_pal_gen;
+                    }
+                    return Ok(D3D_OK);
+                }
+            }
+            self.upload_surface_texture(surf_handle);
+        } else {
+            if let Some(va) = staging_va {
+                if data_len > 0 {
+                    let mut tex_buf = std::mem::take(&mut self.scratch_tex);
+                    tex_buf.resize(data_len, 0);
+                    if let Err(err) = mem.read_into(va, &mut tex_buf) {
+                        self.scratch_tex = tex_buf;
+                        return Err(err);
+                    }
+                    let surf = self.surfaces.get_mut(&surf_handle).unwrap();
+                    if uploaded_once && palette_same && tex_buf == surf.data {
+                        self.scratch_tex = tex_buf;
+                        self.backend.on_texture_upload_skipped();
                         return Ok(D3D_OK);
                     }
+                    std::mem::swap(&mut surf.data, &mut tex_buf);
+                    self.scratch_tex = tex_buf;
                 }
-                self.upload_surface_texture(surf_handle);
-            } else {
-                if let Some(staging_va) = surf.staging_guest_va {
-                    if !surf.data.is_empty() {
-                        mem.read_into(staging_va, &mut surf.data)?;
-                    }
-                }
-                self.upload_surface_texture(surf_handle);
             }
+            self.upload_surface_texture(surf_handle);
         }
         Ok(D3D_OK)
     }

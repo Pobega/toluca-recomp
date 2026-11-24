@@ -72,6 +72,9 @@ pub fn decode_com_thunk(va: GuestAddr) -> Option<(ComInterfaceId, u32)> {
 }
 
 pub trait GuestMemory {
+    fn bytes_slice(&self, _va: GuestAddr, _len: usize) -> Result<Option<&[u8]>, String> {
+        Ok(None)
+    }
     fn read_bytes(&self, va: GuestAddr, len: usize) -> Result<Vec<u8>, String>;
     fn read_into(&self, va: GuestAddr, buf: &mut [u8]) -> Result<(), String> {
         let data = self.read_bytes(va, buf.len())?;

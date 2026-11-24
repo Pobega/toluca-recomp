@@ -14,6 +14,13 @@ pub struct ArenaGuestMemory<'a> {
 }
 
 impl GuestMemory for ArenaGuestMemory<'_> {
+    fn bytes_slice(&self, va: GuestAddr, len: usize) -> Result<Option<&[u8]>, String> {
+        self.arena
+            .read_bytes(va, len)
+            .map(Some)
+            .map_err(|err| err.to_string())
+    }
+
     fn read_bytes(&self, va: GuestAddr, len: usize) -> Result<Vec<u8>, String> {
         self.arena
             .read_bytes(va, len)

@@ -14,10 +14,11 @@ use crate::types::{
     D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INDEX16,
     D3DFMT_INDEX32, D3DFMT_L8, D3DFMT_P8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UNKNOWN,
     D3DFMT_V8U8, D3DFMT_VERTEXDATA, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DLOCK_DISCARD,
-    D3DLOCK_READONLY,
+    D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY,
     D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
     D3DPT_TRIANGLESTRIP, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VERTEXBUFFER, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3D_OK,
+    D3DRTYPE_VERTEXBUFFER, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3D_OK,
     D3dAdapterIdentifier8, D3dCaps8, D3dDeviceCreationParameters, D3dDisplayMode,
     D3dIndexBufferDesc, D3dLight8, D3dLockedRect, D3dMaterial8, D3dPresentParameters, D3dRect,
     D3dSurfaceDesc, D3dVertexBufferDesc, D3dViewport8, E_FAIL, E_INVALIDARG, E_NOINTERFACE,
@@ -2965,20 +2966,29 @@ impl D3d8Context {
         } else {
             if let Some(va) = staging_va {
                 if data_len > 0 {
-                    let mut tex_buf = std::mem::take(&mut self.scratch_tex);
-                    tex_buf.resize(data_len, 0);
-                    if let Err(err) = mem.read_into(va, &mut tex_buf) {
+                    if let Some(guest_bytes) = mem.bytes_slice(va, data_len)? {
+                        let surf = self.surfaces.get_mut(&surf_handle).unwrap();
+                        if uploaded_once && palette_same && guest_bytes == surf.data.as_slice() {
+                            self.backend.on_texture_upload_skipped();
+                            return Ok(D3D_OK);
+                        }
+                        surf.data.copy_from_slice(guest_bytes);
+                    } else {
+                        let mut tex_buf = std::mem::take(&mut self.scratch_tex);
+                        tex_buf.resize(data_len, 0);
+                        if let Err(err) = mem.read_into(va, &mut tex_buf) {
+                            self.scratch_tex = tex_buf;
+                            return Err(err);
+                        }
+                        let surf = self.surfaces.get_mut(&surf_handle).unwrap();
+                        if uploaded_once && palette_same && tex_buf == surf.data {
+                            self.scratch_tex = tex_buf;
+                            self.backend.on_texture_upload_skipped();
+                            return Ok(D3D_OK);
+                        }
+                        std::mem::swap(&mut surf.data, &mut tex_buf);
                         self.scratch_tex = tex_buf;
-                        return Err(err);
                     }
-                    let surf = self.surfaces.get_mut(&surf_handle).unwrap();
-                    if uploaded_once && palette_same && tex_buf == surf.data {
-                        self.scratch_tex = tex_buf;
-                        self.backend.on_texture_upload_skipped();
-                        return Ok(D3D_OK);
-                    }
-                    std::mem::swap(&mut surf.data, &mut tex_buf);
-                    self.scratch_tex = tex_buf;
                 }
             }
             self.upload_surface_texture(surf_handle);
@@ -3130,14 +3140,21 @@ impl D3d8Context {
             if let Some(staging_va) = vb.staging_guest_va {
                 mem.read_into(staging_va + off, &mut vb.data[start..end])?;
             }
-            self.backend.on_vb_sub_upload(
-                handle,
-                &vb.data,
-                start,
-                &vb.data[start..end],
-                vb.fvf,
-                vb.usage,
-            );
+            let is_dynamic = (vb.usage & D3DUSAGE_DYNAMIC) != 0;
+            if is_dynamic && (flags & D3DLOCK_DISCARD) != 0 {
+                self.backend.on_vb_upload(handle, &vb.data, vb.fvf, vb.usage);
+            } else {
+                let unsynchronized = is_dynamic && (flags & D3DLOCK_NOOVERWRITE) != 0;
+                self.backend.on_vb_sub_upload(
+                    handle,
+                    &vb.data,
+                    start,
+                    &vb.data[start..end],
+                    vb.fvf,
+                    vb.usage,
+                    unsynchronized,
+                );
+            }
         }
         Ok(D3D_OK)
     }
@@ -3281,14 +3298,22 @@ impl D3d8Context {
             if let Some(staging_va) = ib.staging_guest_va {
                 mem.read_into(staging_va + off, &mut ib.data[start..end])?;
             }
-            self.backend.on_ib_sub_upload(
-                handle,
-                &ib.data,
-                start,
-                &ib.data[start..end],
-                ib.format,
-                ib.usage,
-            );
+            let is_dynamic = (ib.usage & D3DUSAGE_DYNAMIC) != 0;
+            if is_dynamic && (flags & D3DLOCK_DISCARD) != 0 {
+                self.backend
+                    .on_ib_upload(handle, &ib.data, ib.format, ib.usage);
+            } else {
+                let unsynchronized = is_dynamic && (flags & D3DLOCK_NOOVERWRITE) != 0;
+                self.backend.on_ib_sub_upload(
+                    handle,
+                    &ib.data,
+                    start,
+                    &ib.data[start..end],
+                    ib.format,
+                    ib.usage,
+                    unsynchronized,
+                );
+            }
         }
         Ok(D3D_OK)
     }

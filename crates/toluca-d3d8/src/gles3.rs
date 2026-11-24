@@ -69,8 +69,8 @@ const ASPECT_RATIO_4_3: f64 = 4.0 / 3.0;
 const ASPECT_RATIO_16_9: f64 = 16.0 / 9.0;
 const CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(3);
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
-const STREAMING_VBO_INIT_BYTES: usize = 512 * 1024;
-const STREAMING_IBO_INIT_BYTES: usize = 128 * 1024;
+const STREAMING_VBO_INIT_BYTES: usize = 128 * 1024;
+const STREAMING_IBO_INIT_BYTES: usize = 32 * 1024;
 const STREAMING_ALIGN_BYTES: usize = 16;
 const MAX_VERTEX_ATTRIBS: u32 = 16;
 
@@ -202,6 +202,8 @@ const GL_ELEMENT_ARRAY_BUFFER: GLenum = 0x8893;
 const GL_STREAM_DRAW: GLenum = 0x88E0;
 const GL_STATIC_DRAW: GLenum = 0x88E4;
 const GL_DYNAMIC_DRAW: GLenum = 0x88E8;
+const GL_MAP_WRITE_BIT: GLbitfield = 0x0002;
+const GL_MAP_UNSYNCHRONIZED_BIT: GLbitfield = 0x0020;
 
 const GL_FRAGMENT_SHADER: GLenum = 0x8B30;
 const GL_VERTEX_SHADER: GLenum = 0x8B31;
@@ -296,6 +298,9 @@ struct Gles3Functions {
     gl_bind_buffer: unsafe extern "C" fn(GLenum, GLuint),
     gl_buffer_data: unsafe extern "C" fn(GLenum, GLsizeiptr, *const c_void, GLenum),
     gl_buffer_sub_data: unsafe extern "C" fn(GLenum, GLintptr, GLsizeiptr, *const c_void),
+    gl_map_buffer_range:
+        Option<unsafe extern "C" fn(GLenum, GLintptr, GLsizeiptr, GLbitfield) -> *mut c_void>,
+    gl_unmap_buffer: Option<unsafe extern "C" fn(GLenum) -> GLboolean>,
     gl_gen_vertex_arrays: unsafe extern "C" fn(GLsizei, *mut GLuint),
     gl_delete_vertex_arrays: unsafe extern "C" fn(GLsizei, *const GLuint),
     gl_bind_vertex_array: unsafe extern "C" fn(GLuint),
@@ -436,6 +441,8 @@ impl Gles3Functions {
             gl_bind_buffer: sym!(c"glBindBuffer"),
             gl_buffer_data: sym!(c"glBufferData"),
             gl_buffer_sub_data: sym!(c"glBufferSubData"),
+            gl_map_buffer_range: opt_sym!(c"glMapBufferRange"),
+            gl_unmap_buffer: opt_sym!(c"glUnmapBuffer"),
             gl_gen_vertex_arrays: sym!(c"glGenVertexArrays"),
             gl_delete_vertex_arrays: sym!(c"glDeleteVertexArrays"),
             gl_bind_vertex_array: sym!(c"glBindVertexArray"),
@@ -654,14 +661,7 @@ impl StreamingGlBuffer {
         } else {
             aligned
         };
-        unsafe {
-            (gl.gl_buffer_sub_data)(
-                self.target,
-                write_offset as GLintptr,
-                data.len() as GLsizeiptr,
-                data.as_ptr().cast(),
-            );
-        }
+        write_buffer_range_unsync(gl, self.target, write_offset, data);
         self.offset = write_offset + data.len();
         self.used_this_frame = true;
         write_offset
@@ -2173,6 +2173,7 @@ impl RenderBackend for Gles3Backend {
         sub_data: &[u8],
         fvf: u32,
         usage: u32,
+        unsynchronized: bool,
     ) {
         if let Some(entry) = self.vbos.get_mut(&vb_handle) {
             entry.fvf = fvf;
@@ -2184,6 +2185,7 @@ impl RenderBackend for Gles3Backend {
                 offset,
                 sub_data,
                 usage,
+                unsynchronized,
             ) {
                 self.perf.vb_up += 1;
                 return;
@@ -2227,6 +2229,7 @@ impl RenderBackend for Gles3Backend {
         sub_data: &[u8],
         format: u32,
         usage: u32,
+        unsynchronized: bool,
     ) {
         if let Some(entry) = self.ibos.get_mut(&ib_handle) {
             entry.format = format;
@@ -2238,6 +2241,7 @@ impl RenderBackend for Gles3Backend {
                 offset,
                 sub_data,
                 usage,
+                unsynchronized,
             ) {
                 self.perf.ib_up += 1;
                 return;
@@ -2540,6 +2544,37 @@ pub fn compute_aspect_viewport(
     }
 }
 
+fn write_buffer_range_unsync(gl: &Gles3Functions, target: GLenum, offset: usize, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    if let (Some(map_range), Some(unmap)) = (gl.gl_map_buffer_range, gl.gl_unmap_buffer) {
+        let ptr = unsafe {
+            map_range(
+                target,
+                offset as GLintptr,
+                data.len() as GLsizeiptr,
+                GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT,
+            )
+        };
+        if !ptr.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), data.len());
+                unmap(target);
+            }
+            return;
+        }
+    }
+    unsafe {
+        (gl.gl_buffer_sub_data)(
+            target,
+            offset as GLintptr,
+            data.len() as GLsizeiptr,
+            data.as_ptr().cast(),
+        );
+    }
+}
+
 fn upload_gl_buffer(
     gl: &Gles3Functions,
     entry: &mut GlBuffer,
@@ -2552,8 +2587,10 @@ fn upload_gl_buffer(
     } else {
         GL_STATIC_DRAW
     };
-    let can_sub_data =
-        !data.is_empty() && entry.byte_len == data.len() && entry.gl_usage == gl_usage;
+    let can_sub_data = gl_usage != GL_DYNAMIC_DRAW
+        && !data.is_empty()
+        && entry.byte_len == data.len()
+        && entry.gl_usage == gl_usage;
     entry.byte_len = data.len();
     entry.gl_usage = gl_usage;
     unsafe {
@@ -2567,6 +2604,7 @@ fn upload_gl_buffer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upload_gl_buffer_sub(
     gl: &Gles3Functions,
     entry: &mut GlBuffer,
@@ -2575,6 +2613,7 @@ fn upload_gl_buffer_sub(
     offset: usize,
     sub_data: &[u8],
     usage: u32,
+    unsynchronized: bool,
 ) -> bool {
     let gl_usage = if (usage & D3DUSAGE_DYNAMIC) != 0 {
         GL_DYNAMIC_DRAW
@@ -2585,17 +2624,29 @@ fn upload_gl_buffer_sub(
         || entry.byte_len != full_len
         || entry.gl_usage != gl_usage
         || offset.saturating_add(sub_data.len()) > entry.byte_len
+        || (gl_usage == GL_DYNAMIC_DRAW
+            && !unsynchronized
+            && offset == 0
+            && sub_data.len() == full_len)
     {
         return false;
     }
     unsafe {
         (gl.gl_bind_buffer)(target, entry.id);
-        (gl.gl_buffer_sub_data)(
-            target,
-            offset as GLintptr,
-            sub_data.len() as GLsizeiptr,
-            sub_data.as_ptr().cast(),
-        );
+    }
+    if unsynchronized {
+        write_buffer_range_unsync(gl, target, offset, sub_data);
+    } else {
+        unsafe {
+            (gl.gl_buffer_sub_data)(
+                target,
+                offset as GLintptr,
+                sub_data.len() as GLsizeiptr,
+                sub_data.as_ptr().cast(),
+            );
+        }
+    }
+    unsafe {
         (gl.gl_bind_buffer)(target, 0);
     }
     true

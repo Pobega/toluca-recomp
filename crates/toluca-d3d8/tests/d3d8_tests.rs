@@ -14,7 +14,8 @@ use toluca_d3d8::types::{
     D3D_OK, D3D_SDK_VERSION, D3DADAPTER_DEFAULT, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DDEVTYPE_HAL,
     D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_INDEX16,
     D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_TEX2, D3DFVF_XYZ,
-    D3DLOCK_DISCARD, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE,
+    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
+    D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE,
     D3DRS_ZENABLE, D3DSBT_ALL, D3DTS_VIEW, D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY, D3dAdapterIdentifier8, D3dCaps8, D3dDisplayMode,
     D3dIndexBufferDesc, D3dLockedRect, D3dPresentParameters, D3dSurfaceDesc, D3dVertexBufferDesc,
     fvf_vertex_stride, surface_byte_size, surface_row_pitch, write_matrix_4x4,
@@ -812,4 +813,340 @@ fn unchanged_full_surface_unlock_skips_upload_until_bytes_or_palette_change() {
         .unwrap();
     assert_eq!(backend.full_uploads, 3);
     assert_eq!(backend.skipped_uploads, 1);
+}
+
+#[test]
+fn unlock_surface_uses_zero_copy_bytes_slice_skip_and_update() {
+    use std::any::Any;
+    use std::cell::Cell;
+    use toluca_d3d8::backend::{ActiveShaders, RenderBackend};
+    use toluca_d3d8::state::DeviceState;
+    use toluca_d3d8::texture::PreparedTextureUpload;
+    use toluca_d3d8::types::D3dRect;
+
+    struct SliceMemory {
+        inner: MockMemory,
+        slice_calls: Cell<u32>,
+        bulk_read_into_calls: Cell<u32>,
+    }
+
+    impl GuestMemory for SliceMemory {
+        fn bytes_slice(&self, va: GuestAddr, len: usize) -> Result<Option<&[u8]>, String> {
+            self.slice_calls.set(self.slice_calls.get() + 1);
+            let (buf, off) = self.inner.locate(va, len)?;
+            Ok(Some(&buf[off..off + len]))
+        }
+
+        fn read_bytes(&self, va: GuestAddr, len: usize) -> Result<Vec<u8>, String> {
+            self.inner.read_bytes(va, len)
+        }
+
+        fn read_into(&self, va: GuestAddr, buf: &mut [u8]) -> Result<(), String> {
+            if buf.len() > 4 {
+                self.bulk_read_into_calls
+                    .set(self.bulk_read_into_calls.get() + 1);
+            }
+            self.inner.read_into(va, buf)
+        }
+
+        fn write_bytes(&mut self, va: GuestAddr, data: &[u8]) -> Result<(), String> {
+            self.inner.write_bytes(va, data)
+        }
+
+        fn zero_range(&mut self, va: GuestAddr, len: usize) -> Result<(), String> {
+            self.inner.zero_range(va, len)
+        }
+
+        fn alloc(&mut self, size: usize, zeroed: bool) -> Result<GuestAddr, String> {
+            self.inner.alloc(size, zeroed)
+        }
+
+        fn free(&mut self, va: GuestAddr) -> Result<(), String> {
+            self.inner.free(va)
+        }
+    }
+
+    #[derive(Default)]
+    struct ZeroCopyTrackBackend {
+        full_uploads: u32,
+        skipped_uploads: u32,
+    }
+
+    impl RenderBackend for ZeroCopyTrackBackend {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn max_texture_size(&self) -> u32 {
+            2048
+        }
+        fn supports_s3tc(&self) -> bool {
+            false
+        }
+        fn on_device_create(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_device_reset(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_clear(&mut self, _: u32, _: u32, _: f32, _: u32, _: &[D3dRect]) {}
+        fn on_texture_upload(&mut self, _: u32, _: u32, _: &PreparedTextureUpload) {
+            self.full_uploads += 1;
+        }
+        fn on_texture_upload_skipped(&mut self) {
+            self.skipped_uploads += 1;
+        }
+        fn on_texture_destroy(&mut self, _: u32) {}
+        fn on_vb_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_vb_destroy(&mut self, _: u32) {}
+        fn on_ib_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_ib_destroy(&mut self, _: u32) {}
+        fn on_draw_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32) {}
+        fn on_draw_indexed_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32, _: u32, _: u32) {}
+        fn on_present(&mut self) {}
+    }
+
+    let mut mem = SliceMemory {
+        inner: MockMemory::new(),
+        slice_calls: Cell::new(0),
+        bulk_read_into_calls: Cell::new(0),
+    };
+    let mut ctx = D3d8Context::new(Box::new(ZeroCopyTrackBackend::default()));
+
+    let pp_va = mem.alloc(D3dPresentParameters::SIZE, true).unwrap();
+    let out_ptr = mem.alloc(4, true).unwrap();
+    let d3d8_va = ctx.create_direct3d8(&mut mem, D3D_SDK_VERSION).unwrap();
+    let pp = D3dPresentParameters {
+        back_buffer_width: 640,
+        back_buffer_height: 480,
+        back_buffer_format: D3DFMT_X8R8G8B8,
+        back_buffer_count: 1,
+        swap_effect: 1,
+        windowed: 1,
+        ..Default::default()
+    };
+    pp.write_to(&mut mem, pp_va).unwrap();
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            d3d8_va,
+            15,
+            &[0, D3DDEVTYPE_HAL, 0x0002_0000, 0x40, pp_va, out_ptr]
+        ),
+        D3D_OK
+    );
+    let dev_va = mem.read_u32(out_ptr).unwrap();
+    let lr_va = mem.alloc(8, true).unwrap();
+
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            20,
+            &[4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, out_ptr]
+        ),
+        D3D_OK
+    );
+    let tex_va = mem.read_u32(out_ptr).unwrap();
+
+    // First lock/unlock uploads once via bytes_slice without touching read_into.
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+    let lr = D3dLockedRect::read_from(&mem, lr_va).unwrap();
+    mem.write_u32(lr.p_bits, 0xAA11_2233).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+    // Second lock/unlock with unchanged bytes skips via zero-copy slice check.
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+    // Modifying a pixel copies from the guest slice and re-uploads.
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+    mem.write_u32(lr.p_bits, 0xBB44_5566).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+    assert_eq!(mem.bulk_read_into_calls.get(), 0);
+    assert_eq!(mem.slice_calls.get(), 3);
+
+    let backend = ctx
+        .backend()
+        .as_any()
+        .downcast_ref::<ZeroCopyTrackBackend>()
+        .unwrap();
+    assert_eq!(backend.full_uploads, 2);
+    assert_eq!(backend.skipped_uploads, 1);
+}
+
+#[test]
+fn lock_unlock_nooverwrite_propagates_unsynchronized_flag() {
+    use std::any::Any;
+    use toluca_d3d8::backend::{ActiveShaders, RenderBackend};
+    use toluca_d3d8::state::DeviceState;
+    use toluca_d3d8::texture::PreparedTextureUpload;
+    use toluca_d3d8::types::D3dRect;
+
+    #[derive(Default)]
+    struct UnsyncTrackBackend {
+        vb_calls: Vec<(usize, usize, u32, bool)>,
+        ib_calls: Vec<(usize, usize, u32, bool)>,
+    }
+
+    impl RenderBackend for UnsyncTrackBackend {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn max_texture_size(&self) -> u32 {
+            2048
+        }
+        fn supports_s3tc(&self) -> bool {
+            false
+        }
+        fn on_device_create(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_device_reset(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_clear(&mut self, _: u32, _: u32, _: f32, _: u32, _: &[D3dRect]) {}
+        fn on_texture_upload(&mut self, _: u32, _: u32, _: &PreparedTextureUpload) {}
+        fn on_texture_destroy(&mut self, _: u32) {}
+        fn on_vb_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_vb_sub_upload(
+            &mut self,
+            _: u32,
+            _: &[u8],
+            offset: usize,
+            sub_data: &[u8],
+            _: u32,
+            usage: u32,
+            unsynchronized: bool,
+        ) {
+            self.vb_calls.push((offset, sub_data.len(), usage, unsynchronized));
+        }
+        fn on_vb_destroy(&mut self, _: u32) {}
+        fn on_ib_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_ib_sub_upload(
+            &mut self,
+            _: u32,
+            _: &[u8],
+            offset: usize,
+            sub_data: &[u8],
+            _: u32,
+            usage: u32,
+            unsynchronized: bool,
+        ) {
+            self.ib_calls.push((offset, sub_data.len(), usage, unsynchronized));
+        }
+        fn on_ib_destroy(&mut self, _: u32) {}
+        fn on_draw_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32) {}
+        fn on_draw_indexed_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32, _: u32, _: u32) {}
+        fn on_present(&mut self) {}
+    }
+
+    let mut mem = MockMemory::new();
+    let mut ctx = D3d8Context::new(Box::new(UnsyncTrackBackend::default()));
+
+    let pp_va = mem.alloc(D3dPresentParameters::SIZE, true).unwrap();
+    let out_ptr = mem.alloc(4, true).unwrap();
+    let d3d8_va = ctx.create_direct3d8(&mut mem, D3D_SDK_VERSION).unwrap();
+    let pp = D3dPresentParameters {
+        back_buffer_width: 640,
+        back_buffer_height: 480,
+        back_buffer_format: D3DFMT_X8R8G8B8,
+        back_buffer_count: 1,
+        swap_effect: 1,
+        windowed: 1,
+        ..Default::default()
+    };
+    pp.write_to(&mut mem, pp_va).unwrap();
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            d3d8_va,
+            15,
+            &[0, D3DDEVTYPE_HAL, 0x0002_0000, 0x40, pp_va, out_ptr]
+        ),
+        D3D_OK
+    );
+    let dev_va = mem.read_u32(out_ptr).unwrap();
+
+    // Dynamic VB + static managed VB.
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            23,
+            &[128, D3DUSAGE_DYNAMIC, D3DFVF_XYZ, D3DPOOL_MANAGED, out_ptr]
+        ),
+        D3D_OK
+    );
+    let dyn_vb = mem.read_u32(out_ptr).unwrap();
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            23,
+            &[128, 0, D3DFVF_XYZ, D3DPOOL_MANAGED, out_ptr]
+        ),
+        D3D_OK
+    );
+    let static_vb = mem.read_u32(out_ptr).unwrap();
+
+    // Dynamic IB.
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            24,
+            &[64, D3DUSAGE_DYNAMIC, D3DFMT_INDEX16, D3DPOOL_MANAGED, out_ptr]
+        ),
+        D3D_OK
+    );
+    let dyn_ib = mem.read_u32(out_ptr).unwrap();
+
+    assert_eq!(
+        call(&mut ctx, &mut mem, dyn_vb, 11, &[16, 32, out_ptr, D3DLOCK_NOOVERWRITE]),
+        D3D_OK
+    );
+    assert_eq!(call(&mut ctx, &mut mem, dyn_vb, 12, &[]), D3D_OK);
+
+    assert_eq!(call(&mut ctx, &mut mem, dyn_vb, 11, &[0, 16, out_ptr, 0]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dyn_vb, 12, &[]), D3D_OK);
+
+    assert_eq!(
+        call(&mut ctx, &mut mem, static_vb, 11, &[0, 16, out_ptr, D3DLOCK_NOOVERWRITE]),
+        D3D_OK
+    );
+    assert_eq!(call(&mut ctx, &mut mem, static_vb, 12, &[]), D3D_OK);
+
+    assert_eq!(
+        call(&mut ctx, &mut mem, dyn_ib, 11, &[8, 24, out_ptr, D3DLOCK_NOOVERWRITE]),
+        D3D_OK
+    );
+    assert_eq!(call(&mut ctx, &mut mem, dyn_ib, 12, &[]), D3D_OK);
+
+    assert_eq!(call(&mut ctx, &mut mem, dyn_ib, 11, &[0, 8, out_ptr, 0]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dyn_ib, 12, &[]), D3D_OK);
+
+    let backend = ctx
+        .backend()
+        .as_any()
+        .downcast_ref::<UnsyncTrackBackend>()
+        .unwrap();
+    assert_eq!(
+        backend.vb_calls,
+        vec![
+            (16, 32, D3DUSAGE_DYNAMIC, true),
+            (0, 16, D3DUSAGE_DYNAMIC, false),
+            (0, 16, 0, false),
+        ]
+    );
+    assert_eq!(
+        backend.ib_calls,
+        vec![
+            (8, 24, D3DUSAGE_DYNAMIC, true),
+            (0, 8, D3DUSAGE_DYNAMIC, false),
+        ]
+    );
 }

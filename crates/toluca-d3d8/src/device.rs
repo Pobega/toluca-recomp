@@ -344,6 +344,10 @@ pub struct SurfaceObj {
     pub parent_texture: Option<(u32, u32)>,
     pub data: Vec<u8>,
     pub staging_guest_va: Option<GuestAddr>,
+    pub staging_page_aligned: bool,
+    pub staging_alloc_size: usize,
+    pub write_watched: bool,
+    pub consecutive_dirty_locks: u8,
     pub lock_flags: Option<u32>,
     pub staging_synced: bool,
     pub locked_rect: Option<(u32, u32, u32, u32)>,
@@ -400,6 +404,9 @@ impl Default for D3d8Context {
         Self::new_null()
     }
 }
+
+const WRITE_WATCH_MIN_BYTES: usize = 64 * 1024;
+const WRITE_WATCH_DIRTY_STREAK_LIMIT: u8 = 3;
 
 impl D3d8Context {
     pub fn new(backend: Box<dyn RenderBackend>) -> Self {
@@ -915,6 +922,10 @@ impl D3d8Context {
                 parent_texture,
                 data: vec![0u8; byte_len],
                 staging_guest_va: None,
+                staging_page_aligned: false,
+                staging_alloc_size: 0,
+                write_watched: false,
+                consecutive_dirty_locks: 0,
                 lock_flags: None,
                 staging_synced: false,
                 locked_rect: None,
@@ -2763,6 +2774,25 @@ impl D3d8Context {
         }
     }
 
+    fn maybe_arm_surface_write_watch(&mut self, mem: &mut dyn GuestMemory, surf_handle: u32) {
+        let Some(surf) = self.surfaces.get_mut(&surf_handle) else {
+            return;
+        };
+        let Some(va) = surf.staging_guest_va else {
+            return;
+        };
+        if surf.staging_page_aligned
+            && !surf.write_watched
+            && surf.staging_synced
+            && surf.consecutive_dirty_locks < WRITE_WATCH_DIRTY_STREAK_LIMIT
+            && surf.lock_flags.is_none()
+            && surf.uploaded_once
+            && mem.arm_write_watch(va, surf.staging_alloc_size)
+        {
+            surf.write_watched = true;
+        }
+    }
+
     fn destroy_surface_if_unreferenced(
         &mut self,
         mem: &mut dyn GuestMemory,
@@ -2780,7 +2810,14 @@ impl D3d8Context {
                 self.com_objects.free_object(mem, obj_va)?;
             }
             if let Some(staging_va) = surf.staging_guest_va {
-                mem.free(staging_va)?;
+                if surf.write_watched {
+                    mem.remove_write_watch(staging_va, surf.staging_alloc_size);
+                }
+                if surf.staging_page_aligned {
+                    mem.free_page_aligned(staging_va, surf.staging_alloc_size)?;
+                } else {
+                    mem.free(staging_va)?;
+                }
             }
         }
         Ok(())
@@ -2832,13 +2869,30 @@ impl D3d8Context {
         let (staging_va, fresh_staging) = match surf.staging_guest_va {
             Some(va) => (va, false),
             None => {
-                let va = mem.alloc(surf.data.len().max(4), true)?;
-                surf.staging_guest_va = Some(va);
-                (va, true)
+                let alloc_len = surf.data.len().max(4);
+                if alloc_len >= WRITE_WATCH_MIN_BYTES {
+                    let (va, alloc_size) = mem.alloc_page_aligned(alloc_len)?;
+                    surf.staging_guest_va = Some(va);
+                    surf.staging_page_aligned = true;
+                    surf.staging_alloc_size = alloc_size;
+                    (va, true)
+                } else {
+                    let va = mem.alloc(alloc_len, true)?;
+                    surf.staging_guest_va = Some(va);
+                    surf.staging_page_aligned = false;
+                    surf.staging_alloc_size = alloc_len;
+                    (va, true)
+                }
             }
         };
         let discard_full = (flags & D3DLOCK_DISCARD) != 0 && p_rect == 0;
-        if (fresh_staging || !surf.staging_synced) && !discard_full && !surf.data.is_empty() {
+        let needs_host_sync =
+            (fresh_staging || !surf.staging_synced) && !discard_full && !surf.data.is_empty();
+        if (needs_host_sync || discard_full) && surf.write_watched {
+            mem.remove_write_watch(staging_va, surf.staging_alloc_size);
+            surf.write_watched = false;
+        }
+        if needs_host_sync {
             mem.write_bytes(staging_va, &surf.data)?;
         }
         surf.staging_synced = true;
@@ -2879,7 +2933,7 @@ impl D3d8Context {
 
     fn unlock_surface(
         &mut self,
-        mem: &dyn GuestMemory,
+        mem: &mut dyn GuestMemory,
         surf_handle: u32,
     ) -> Result<HResult, String> {
         let start = unlock_perf_enabled().then(std::time::Instant::now);
@@ -2899,11 +2953,24 @@ impl D3d8Context {
 
     fn unlock_surface_inner(
         &mut self,
-        mem: &dyn GuestMemory,
+        mem: &mut dyn GuestMemory,
         surf_handle: u32,
     ) -> Result<(HResult, Option<UnlockLogInfo>), String> {
         let max_tex_size = self.backend.max_texture_size();
-        let (flags, locked_rect, dev_h, fmt, w, h, staging_va, data_len, uploaded_once, last_pal_gen) = {
+        let (
+            flags,
+            locked_rect,
+            dev_h,
+            fmt,
+            w,
+            h,
+            staging_va,
+            alloc_size,
+            write_watched,
+            data_len,
+            uploaded_once,
+            last_pal_gen,
+        ) = {
             let Some(surf) = self.surfaces.get_mut(&surf_handle) else {
                 return Ok((D3DERR_INVALIDCALL, None));
             };
@@ -2919,6 +2986,8 @@ impl D3d8Context {
                 surf.width,
                 surf.height,
                 surf.staging_guest_va,
+                surf.staging_alloc_size,
+                surf.write_watched,
                 surf.data.len(),
                 surf.uploaded_once,
                 surf.last_palette_gen,
@@ -2939,6 +3008,13 @@ impl D3d8Context {
         });
 
         if let Some((rx, ry, rw, rh)) = sub_rect {
+            if let Some(va) = staging_va {
+                if write_watched && mem.is_write_watch_dirty(va, alloc_size) == Some(true) {
+                    if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
+                        surf.write_watched = false;
+                    }
+                }
+            }
             let pitch = surface_row_pitch(fmt, w);
             let parent_tex = {
                 let surf = self.surfaces.get_mut(&surf_handle).unwrap();
@@ -2979,19 +3055,60 @@ impl D3d8Context {
                         surf.uploaded_once = true;
                         surf.last_palette_gen = cur_pal_gen;
                     }
+                    self.maybe_arm_surface_write_watch(mem, surf_handle);
                     return Ok((D3D_OK, Some(UnlockLogInfo { w, h, fmt, skipped: false })));
                 }
             }
             self.upload_surface_texture(surf_handle);
+            self.maybe_arm_surface_write_watch(mem, surf_handle);
         } else {
             if let Some(va) = staging_va {
-                if data_len > 0 {
-                    if let Some(guest_bytes) = mem.bytes_slice(va, data_len)? {
-                        let surf = self.surfaces.get_mut(&surf_handle).unwrap();
-                        if uploaded_once && palette_same && guest_bytes == surf.data.as_slice() {
+                if write_watched {
+                    match mem.is_write_watch_dirty(va, alloc_size) {
+                        Some(false) if uploaded_once && palette_same => {
+                            if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
+                                surf.consecutive_dirty_locks = 0;
+                            }
                             self.backend.on_texture_upload_skipped();
                             return Ok((D3D_OK, Some(UnlockLogInfo { w, h, fmt, skipped: true })));
                         }
+                        Some(true) => {
+                            let release_slot =
+                                if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
+                                    surf.write_watched = false;
+                                    surf.consecutive_dirty_locks =
+                                        surf.consecutive_dirty_locks.saturating_add(1);
+                                    surf.consecutive_dirty_locks >= WRITE_WATCH_DIRTY_STREAK_LIMIT
+                                } else {
+                                    false
+                                };
+                            if release_slot {
+                                mem.remove_write_watch(va, alloc_size);
+                            }
+                        }
+                        Some(false) | None => {}
+                    }
+                }
+                if data_len > 0 {
+                    if let Some(guest_bytes) = mem.bytes_slice(va, data_len)? {
+                        if uploaded_once && palette_same {
+                            let is_unchanged = {
+                                let surf = self.surfaces.get(&surf_handle).unwrap();
+                                guest_bytes == surf.data.as_slice()
+                            };
+                            if is_unchanged {
+                                if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
+                                    surf.consecutive_dirty_locks = 0;
+                                }
+                                self.maybe_arm_surface_write_watch(mem, surf_handle);
+                                self.backend.on_texture_upload_skipped();
+                                return Ok((
+                                    D3D_OK,
+                                    Some(UnlockLogInfo { w, h, fmt, skipped: true }),
+                                ));
+                            }
+                        }
+                        let surf = self.surfaces.get_mut(&surf_handle).unwrap();
                         surf.data.copy_from_slice(guest_bytes);
                     } else {
                         let mut tex_buf = std::mem::take(&mut self.scratch_tex);
@@ -3000,18 +3117,32 @@ impl D3d8Context {
                             self.scratch_tex = tex_buf;
                             return Err(err);
                         }
-                        let surf = self.surfaces.get_mut(&surf_handle).unwrap();
-                        if uploaded_once && palette_same && tex_buf == surf.data {
-                            self.scratch_tex = tex_buf;
-                            self.backend.on_texture_upload_skipped();
-                            return Ok((D3D_OK, Some(UnlockLogInfo { w, h, fmt, skipped: true })));
+                        if uploaded_once && palette_same {
+                            let is_unchanged = {
+                                let surf = self.surfaces.get(&surf_handle).unwrap();
+                                tex_buf == surf.data
+                            };
+                            if is_unchanged {
+                                self.scratch_tex = tex_buf;
+                                if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
+                                    surf.consecutive_dirty_locks = 0;
+                                }
+                                self.maybe_arm_surface_write_watch(mem, surf_handle);
+                                self.backend.on_texture_upload_skipped();
+                                return Ok((
+                                    D3D_OK,
+                                    Some(UnlockLogInfo { w, h, fmt, skipped: true }),
+                                ));
+                            }
                         }
+                        let surf = self.surfaces.get_mut(&surf_handle).unwrap();
                         std::mem::swap(&mut surf.data, &mut tex_buf);
                         self.scratch_tex = tex_buf;
                     }
                 }
             }
             self.upload_surface_texture(surf_handle);
+            self.maybe_arm_surface_write_watch(mem, surf_handle);
         }
         Ok((D3D_OK, Some(UnlockLogInfo { w, h, fmt, skipped: false })))
     }

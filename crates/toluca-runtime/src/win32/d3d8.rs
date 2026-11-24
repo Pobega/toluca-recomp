@@ -1,16 +1,20 @@
 use toluca_core::GuestAddr;
 use toluca_core::cpu::{ExitReason, GuestCpuState};
+use toluca_core::memory::GUEST_PAGE_SIZE;
 use toluca_d3d8::{ComInterfaceId, D3d8Context, Gles3Backend, GuestMemory};
 
 use crate::arena::GuestArena;
 use crate::callconv::{peek_arg_u32, return_stdcall};
-use crate::heap::GuestHeap;
+use crate::heap::{
+    GuestHeap, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualMemoryManager,
+};
 use crate::runtime::{ImportRegistry, RuntimeContext, RuntimeError, TrapInfo};
-use crate::win32::{ERROR_NOT_ENOUGH_MEMORY, ERROR_SUCCESS};
+use crate::win32::{ERROR_NOT_ENOUGH_MEMORY, ERROR_SUCCESS, write_watch};
 
 pub struct ArenaGuestMemory<'a> {
     pub arena: &'a mut GuestArena,
     pub heap: &'a mut GuestHeap,
+    pub vmem: &'a mut VirtualMemoryManager,
 }
 
 impl GuestMemory for ArenaGuestMemory<'_> {
@@ -70,6 +74,53 @@ impl GuestMemory for ArenaGuestMemory<'_> {
             .free(self.arena, va)
             .map_err(|err| err.to_string())
     }
+
+    fn alloc_page_aligned(&mut self, size: usize) -> Result<(GuestAddr, usize), String> {
+        let page_align = self.arena.host_page_size().max(GUEST_PAGE_SIZE as usize);
+        let aligned = size.max(page_align).next_multiple_of(page_align);
+        let va = self
+            .vmem
+            .virtual_alloc(
+                self.arena,
+                None,
+                aligned,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .map_err(|err| err.to_string())?;
+        Ok((va, aligned))
+    }
+
+    fn free_page_aligned(&mut self, va: GuestAddr, alloc_size: usize) -> Result<(), String> {
+        self.remove_write_watch(va, alloc_size);
+        self.vmem
+            .virtual_free(self.arena, va, 0, MEM_RELEASE)
+            .map_err(|err| err.to_string())
+    }
+
+    fn arm_write_watch(&mut self, va: GuestAddr, alloc_size: usize) -> bool {
+        let Ok(slice) = self.arena.read_bytes(va, alloc_size) else {
+            return false;
+        };
+        let ptr = slice.as_ptr().cast_mut();
+        write_watch::arm(ptr, alloc_size)
+    }
+
+    fn is_write_watch_dirty(&self, va: GuestAddr, alloc_size: usize) -> Option<bool> {
+        if self.arena.read_bytes(va, alloc_size).is_err() {
+            return None;
+        }
+        let ptr = unsafe { self.arena.base_ptr().add(va as usize) };
+        write_watch::is_dirty(ptr, alloc_size)
+    }
+
+    fn remove_write_watch(&mut self, va: GuestAddr, alloc_size: usize) {
+        if alloc_size == 0 || self.arena.read_bytes(va, alloc_size).is_err() {
+            return;
+        }
+        let ptr = unsafe { self.arena.base_ptr().add(va as usize) };
+        write_watch::remove(ptr, alloc_size);
+    }
 }
 
 pub fn register_imports(registry: &mut ImportRegistry) {
@@ -128,6 +179,7 @@ fn direct3d_create_8(
     let mut mem = ArenaGuestMemory {
         arena: ctx.arena,
         heap: ctx.heap,
+        vmem: ctx.vmem,
     };
     let obj_va = match ctx.win32.d3d8.create_direct3d8(&mut mem, sdk_version) {
         Ok(va) => {
@@ -175,6 +227,7 @@ pub fn dispatch_com_call(
         let mut mem = ArenaGuestMemory {
             arena: ctx.arena,
             heap: ctx.heap,
+            vmem: ctx.vmem,
         };
         ctx.win32.d3d8.dispatch_com(&mut mem, iface, method_idx, &args)
     };

@@ -105,6 +105,20 @@ pub trait GuestMemory {
     fn zero_range(&mut self, va: GuestAddr, len: usize) -> Result<(), String>;
     fn alloc(&mut self, size: usize, zeroed: bool) -> Result<GuestAddr, String>;
     fn free(&mut self, va: GuestAddr) -> Result<(), String>;
+    fn alloc_page_aligned(&mut self, size: usize) -> Result<(GuestAddr, usize), String> {
+        let va = self.alloc(size, true)?;
+        Ok((va, size))
+    }
+    fn free_page_aligned(&mut self, va: GuestAddr, _alloc_size: usize) -> Result<(), String> {
+        self.free(va)
+    }
+    fn arm_write_watch(&mut self, _va: GuestAddr, _alloc_size: usize) -> bool {
+        false
+    }
+    fn is_write_watch_dirty(&self, _va: GuestAddr, _alloc_size: usize) -> Option<bool> {
+        None
+    }
+    fn remove_write_watch(&mut self, _va: GuestAddr, _alloc_size: usize) {}
 }
 
 #[derive(Default)]

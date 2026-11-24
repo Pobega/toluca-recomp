@@ -8,6 +8,7 @@ pub mod msvcrt;
 pub mod path;
 pub mod sdl2;
 pub mod user32;
+pub mod write_watch;
 
 pub use dinput8::ScriptedKeyEvent;
 

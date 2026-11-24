@@ -105,6 +105,73 @@ impl TargetArch {
     }
 }
 
+/// Flushes data and instruction caches for `[ptr, ptr + len)` on AArch64.
+///
+/// # Safety
+/// If `len > 0` and `ptr` is non-null, `[ptr, ptr + len)` must point to valid
+/// readable virtual memory mapped into the current address space.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn flush_icache(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {ctr}, ctr_el0",
+            ctr = out(reg) ctr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    let dline = 4usize << ((ctr >> 16) & 0xF);
+    let iline = 4usize << (ctr & 0xF);
+    let start = ptr as usize;
+    let end = start.saturating_add(len);
+
+    let mut addr = start & !(dline - 1);
+    while addr < end {
+        unsafe {
+            core::arch::asm!(
+                "dc cvau, {addr}",
+                addr = in(reg) addr,
+                options(nostack, preserves_flags),
+            );
+        }
+        addr = addr.saturating_add(dline);
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+
+    let mut addr = start & !(iline - 1);
+    while addr < end {
+        unsafe {
+            core::arch::asm!(
+                "ic ivau, {addr}",
+                addr = in(reg) addr,
+                options(nostack, preserves_flags),
+            );
+        }
+        addr = addr.saturating_add(iline);
+    }
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// No-op instruction cache flush on architectures with coherent I-caches.
+///
+/// # Safety
+/// Same contract as the AArch64 implementation.
+#[cfg(not(target_arch = "aarch64"))]
+pub unsafe fn flush_icache(_ptr: *const u8, _len: usize) {}
+
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SectionKind {
@@ -1425,5 +1492,20 @@ mod tests {
                 target_va: 0x0040_1000
             })
         ));
+    }
+
+    #[test]
+    fn flush_icache_handles_null_empty_and_buffer() {
+        let buf = [0u8; 64];
+        unsafe {
+            flush_icache(core::ptr::null(), 0);
+            flush_icache(core::ptr::null(), 64);
+            flush_icache(buf.as_ptr(), 0);
+            flush_icache(buf.as_ptr(), buf.len());
+        }
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(TargetArch::current(), Some(TargetArch::AArch64));
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(TargetArch::current(), Some(TargetArch::X86_64));
     }
 }

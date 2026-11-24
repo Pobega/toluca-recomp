@@ -173,3 +173,21 @@ fn print_usage(args: &[String]) {
         "  {bin} compile <path-to-exe> -o <output.bin> [--arch x86_64|aarch64] [--strict]"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_arch_matches_host_target_and_parses_cli_aliases() {
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(TargetArch::current(), Some(TargetArch::AArch64));
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(TargetArch::current(), Some(TargetArch::X86_64));
+
+        assert_eq!(parse_arch("aarch64"), Some(TargetArch::AArch64));
+        assert_eq!(parse_arch("arm64"), Some(TargetArch::AArch64));
+        assert_eq!(parse_arch("x86_64"), Some(TargetArch::X86_64));
+        assert_eq!(parse_arch("unknown"), None);
+    }
+}

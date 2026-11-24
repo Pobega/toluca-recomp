@@ -974,6 +974,21 @@ extern "C" fn sigsegv_diagnostic_handler(
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    if !ucontext.is_null() {
+        let uc = ucontext.cast::<libc::ucontext_t>();
+        let pc = unsafe { (*uc).uc_mcontext.pc as usize };
+        pos = push_bytes(&mut out, pos, b" pc=0x");
+        pos = push_hex_usize(&mut out, pos, pc);
+        if code_base != 0 && pc >= code_base && pc < code_end {
+            pos = push_bytes(&mut out, pos, b" code_off=0x");
+            pos = push_hex_usize(&mut out, pos, pc - code_base);
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = (ucontext, code_base, code_end);
+
     let cpu_addr = CPU_STATE_ADDR.load(Ordering::Relaxed);
     if cpu_addr != 0 {
         let eip = unsafe { (*(cpu_addr as *const GuestCpuState)).eip };

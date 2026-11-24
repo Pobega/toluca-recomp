@@ -650,6 +650,7 @@ mod tests {
                 core::ptr::copy_nonoverlapping(code.as_ptr(), ptr.cast::<u8>(), code.len());
                 let rc = libc::mprotect(ptr, len, libc::PROT_READ | libc::PROT_EXEC);
                 assert_eq!(rc, 0, "mprotect RX failed");
+                toluca_core::aot::flush_icache(ptr.cast::<u8>(), code.len());
             }
             Self {
                 ptr: ptr.cast::<u8>(),

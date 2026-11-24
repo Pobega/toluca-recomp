@@ -5,6 +5,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use toluca_core::GuestAddr;
+pub use toluca_core::aot::flush_icache;
 use toluca_core::aot::{AOT_CODE_ALIGNMENT, AotError, AotManifest, TargetArch};
 use toluca_core::bridge::RecompiledFn;
 use toluca_core::pe::PeImage;
@@ -128,7 +129,12 @@ impl AotCodeImage {
             return Err(LoaderError::MmapFailed(errno));
         }
 
-        let code_base = NonNull::new(ptr.cast::<u8>());
+        let code_ptr = ptr.cast::<u8>();
+        unsafe {
+            flush_icache(code_ptr, code_len);
+        }
+
+        let code_base = NonNull::new(code_ptr);
         Ok(Self {
             manifest,
             code_base,

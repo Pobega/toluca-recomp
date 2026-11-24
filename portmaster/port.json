@@ -9,7 +9,7 @@
   "attr": {
     "title": "Toluca",
     "porter": [
-      "toluca-portmaster contributors"
+      "toluca-recomp contributors"
     ],
     "desc": "Clean-room static recompiler and native Linux/GLES 3.0 runtime for Silent Hill 2 (PC). Requires your own unprotected vanilla North American v1.0 sh2pc.exe and data/ directory.",
     "desc_md": "Clean-room static recompiler and native Linux/OpenGL ES 3.0 runtime for *Silent Hill 2* (PC).\n\nOn first launch, `patchscript` verifies your legal `sh2pc.exe` and translates it directly on-device into a native ARM64 AOT code cache (`cache/toluca_code.bin`). No copyrighted game files or assets are distributed.",

@@ -36,5 +36,5 @@ settings:
 
 4. Clean-Room Notice
 --------------------
-toluca-portmaster is an independent, clean-room MIT-licensed reimplementation.
+toluca-recomp is an independent, clean-room MIT-licensed reimplementation.
 No copyrighted Konami binaries or game assets are included or distributed.

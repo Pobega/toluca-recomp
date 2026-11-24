@@ -1,4 +1,4 @@
-# toluca-portmaster
+# toluca-recomp
 
 A clean-room, open-source static recompiler and native Linux/OpenGL ES 3.0 runtime for running the PC version of *Silent Hill 2* on [PortMaster](https://portmaster.games/) ARM64 Linux handhelds (1 GB RAM class devices such as Anbernic RG35XX/H700, RK3566, and RK3326) as well as Linux x86-64 desktops.
 

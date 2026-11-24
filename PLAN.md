@@ -1,4 +1,4 @@
-# toluca-portmaster — Architecture & Development Plan
+# toluca-recomp — Architecture & Development Plan
 
 ## 1. Core Constraints & Principles
 

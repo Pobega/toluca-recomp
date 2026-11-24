@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GAMEDIR="${GAMEDIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+RECOMP_BIN="${RECOMP_BIN:-${GAMEDIR}/bin/toluca-recomp}"
+CACHE_DIR="${GAMEDIR}/cache"
+OUT_CACHE="${CACHE_DIR}/toluca_code.bin"
+SHA_STAMP="${CACHE_DIR}/sh2pc.sha1"
+MAX_RSS_KIB=102400
+
+if [[ ! -x "${RECOMP_BIN}" ]]; then
+    echo "Error: toluca-recomp binary not found or not executable at '${RECOMP_BIN}'." >&2
+    exit 1
+fi
+
+EXE_PATH=""
+for candidate in \
+    "${GAMEDIR}/gamedata/sh2pc.exe" \
+    "${GAMEDIR}/gamedata/Silent Hill 2/sh2pc.exe"; do
+    if [[ -f "${candidate}" ]]; then
+        EXE_PATH="${candidate}"
+        break
+    fi
+done
+
+if [[ -z "${EXE_PATH}" ]]; then
+    echo "Error: sh2pc.exe not found!" >&2
+    echo "Please copy your unprotected vanilla North American v1.0 sh2pc.exe and data/ folder to:" >&2
+    echo "  ${GAMEDIR}/gamedata/" >&2
+    exit 1
+fi
+
+GAME_DATA_DIR="$(dirname "${EXE_PATH}")"
+if [[ ! -d "${GAME_DATA_DIR}/data" && ! -d "${GAME_DATA_DIR}/DATA" && ! -d "${GAME_DATA_DIR}/Data" ]]; then
+    echo "Error: 'data/' directory not found next to ${EXE_PATH}." >&2
+    echo "Please copy both sh2pc.exe and the data/ directory into ${GAME_DATA_DIR}/." >&2
+    exit 1
+fi
+
+echo "Verifying PE32 executable: ${EXE_PATH}"
+if ! "${RECOMP_BIN}" verify "${EXE_PATH}"; then
+    echo "Error: verification failed for '${EXE_PATH}'." >&2
+    echo "SafeDisc-encrypted, corrupted, or unsupported binaries cannot be recompiled." >&2
+    echo "Please supply an unprotected vanilla North American v1.0 sh2pc.exe." >&2
+    exit 1
+fi
+
+mkdir -p "${CACHE_DIR}"
+TMP_CACHE="$(mktemp "${CACHE_DIR}/.toluca_code.bin.XXXXXX")"
+COMPILE_LOG="$(mktemp "${CACHE_DIR}/.toluca_recomp.log.XXXXXX")"
+cleanup() {
+    rm -f "${TMP_CACHE}" "${COMPILE_LOG}"
+}
+trap cleanup EXIT
+
+echo "Compiling ${EXE_PATH} -> ${OUT_CACHE}..."
+"${RECOMP_BIN}" compile "${EXE_PATH}" -o "${TMP_CACHE}" 2>&1 | tee "${COMPILE_LOG}"
+
+peak_rss_kib="$(awk '/^Peak RSS:/ { print $3; exit }' "${COMPILE_LOG}" || true)"
+if [[ -n "${peak_rss_kib}" && "${peak_rss_kib}" =~ ^[0-9]+$ ]]; then
+    peak_mib="$(awk -v k="${peak_rss_kib}" 'BEGIN { printf "%.2f", k / 1024.0 }')"
+    if (( peak_rss_kib <= MAX_RSS_KIB )); then
+        echo "Peak RSS ${peak_rss_kib} KiB (${peak_mib} MiB) is within the 100 MiB budget."
+    else
+        echo "Warning: Peak RSS ${peak_rss_kib} KiB (${peak_mib} MiB) exceeded the 100 MiB budget." >&2
+    fi
+else
+    echo "Note: Peak RSS metric was not reported by toluca-recomp."
+fi
+
+mv -f "${TMP_CACHE}" "${OUT_CACHE}"
+
+if command -v sha1sum >/dev/null 2>&1; then
+    sha1sum "${EXE_PATH}" | awk '{ print $1 }' > "${SHA_STAMP}"
+else
+    "${RECOMP_BIN}" verify "${EXE_PATH}" | awk '/^SHA-1:/ { print $2; exit }' > "${SHA_STAMP}"
+fi
+
+echo "AOT cache ready: ${OUT_CACHE}"

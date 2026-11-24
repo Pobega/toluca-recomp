@@ -217,13 +217,25 @@ fn create_window_ex_a(
         "toluca-runtime".to_owned()
     };
 
+    let sdl_width = ctx
+        .win32
+        .config
+        .display_width
+        .map_or(width, |w| w.max(1).min(i32::MAX as u32) as i32);
+    let sdl_height = ctx
+        .win32
+        .config
+        .display_height
+        .map_or(height, |h| h.max(1).min(i32::MAX as u32) as i32);
+    let fullscreen = ctx.win32.config.fullscreen;
+
     let hwnd = ctx.win32.window_mgr.alloc_hwnd();
     let sdl_window = ctx
         .win32
         .window_mgr
         .sdl
         .as_mut()
-        .and_then(|sdl| sdl.create_window(&title, width, height));
+        .and_then(|sdl| sdl.create_window_with_options(&title, sdl_width, sdl_height, fullscreen));
 
     ctx.win32.window_mgr.windows.insert(
         hwnd,

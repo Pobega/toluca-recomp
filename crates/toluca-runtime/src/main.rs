@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use toluca_core::cpu::ExitReason;
-use toluca_d3d8::Gles3Backend;
+use toluca_d3d8::{AspectMode, Gles3Backend};
 use toluca_runtime::win32::dinput8::parse_script_keys;
 use toluca_runtime::{
     ImportRegistry, Runtime, ScriptedKeyEvent, TrapInfo, Win32Config, register_all_win32,
@@ -19,6 +19,10 @@ struct CliArgs {
     headless: bool,
     trace_imports: bool,
     trace_d3d8: bool,
+    fullscreen: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+    aspect_mode: AspectMode,
 }
 
 fn main() -> ExitCode {
@@ -27,6 +31,14 @@ fn main() -> ExitCode {
         print_usage(&raw_args);
         return ExitCode::FAILURE;
     };
+
+    let (display_width, display_height) = resolve_display_dimensions(
+        opts.fullscreen,
+        opts.width,
+        opts.height,
+        std::env::var("DISPLAY_WIDTH").ok().as_deref(),
+        std::env::var("DISPLAY_HEIGHT").ok().as_deref(),
+    );
 
     let game_root = opts.game_dir.unwrap_or_else(|| {
         opts.exe_path
@@ -57,6 +69,10 @@ fn main() -> ExitCode {
         command_line: exe_name.clone(),
         exe_name,
         script_keys: opts.script_keys,
+        fullscreen: opts.fullscreen,
+        display_width,
+        display_height,
+        aspect_mode: opts.aspect_mode,
     };
 
     let mut registry = ImportRegistry::new();
@@ -174,6 +190,22 @@ fn write_ppm_rgba8(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io
     std::fs::write(path, out)
 }
 
+fn parse_positive_u32(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok().filter(|&v| v > 0)
+}
+
+fn resolve_display_dimensions(
+    fullscreen: bool,
+    cli_width: Option<u32>,
+    cli_height: Option<u32>,
+    env_width: Option<&str>,
+    env_height: Option<&str>,
+) -> (Option<u32>, Option<u32>) {
+    let width = cli_width.or_else(|| fullscreen.then(|| env_width.and_then(parse_positive_u32)).flatten());
+    let height = cli_height.or_else(|| fullscreen.then(|| env_height.and_then(parse_positive_u32)).flatten());
+    (width, height)
+}
+
 fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut game_dir: Option<PathBuf> = None;
@@ -184,6 +216,10 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut headless = false;
     let mut trace_imports = false;
     let mut trace_d3d8 = false;
+    let mut fullscreen = false;
+    let mut width: Option<u32> = None;
+    let mut height: Option<u32> = None;
+    let mut aspect_mode = AspectMode::Ratio4x3;
 
     let mut idx = 1usize;
     while idx < args.len() {
@@ -192,6 +228,26 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
             "--headless" => headless = true,
             "--trace-imports" => trace_imports = true,
             "--trace-d3d8" => trace_d3d8 = true,
+            "--fullscreen" => fullscreen = true,
+            "--width" => {
+                idx += 1;
+                let val = args.get(idx)?;
+                width = Some(parse_positive_u32(val)?);
+            }
+            "--height" => {
+                idx += 1;
+                let val = args.get(idx)?;
+                height = Some(parse_positive_u32(val)?);
+            }
+            "--aspect" => {
+                idx += 1;
+                let val = args.get(idx)?;
+                let Some(parsed) = AspectMode::parse(val) else {
+                    eprintln!("Invalid aspect mode '{val}' (expected 4:3, 16:9, or stretch)");
+                    return None;
+                };
+                aspect_mode = parsed;
+            }
             "--game-dir" => {
                 idx += 1;
                 let val = args.get(idx)?;
@@ -247,6 +303,10 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         headless,
         trace_imports,
         trace_d3d8,
+        fullscreen,
+        width,
+        height,
+        aspect_mode,
     })
 }
 
@@ -254,6 +314,62 @@ fn print_usage(args: &[String]) {
     let bin = args.first().map(String::as_str).unwrap_or("toluca-runtime");
     eprintln!("Usage:");
     eprintln!(
-        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--script-keys <SPEC>] [--headless] [--trace-imports] [--trace-d3d8]"
+        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--script-keys <SPEC>] [--fullscreen] [--width <W>] [--height <H>] [--aspect <4:3|16:9|stretch>] [--headless] [--trace-imports] [--trace-d3d8]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn to_args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn parse_args_supports_display_and_aspect_flags() {
+        let args = to_args(&[
+            "toluca-runtime",
+            "sh2pc.exe",
+            "toluca.aot",
+            "--fullscreen",
+            "--width",
+            "1280",
+            "--height",
+            "720",
+            "--aspect",
+            "stretch",
+        ]);
+        let parsed = parse_args(&args).unwrap();
+        assert!(parsed.fullscreen);
+        assert_eq!(parsed.width, Some(1280));
+        assert_eq!(parsed.height, Some(720));
+        assert_eq!(parsed.aspect_mode, AspectMode::Stretch);
+
+        let default_args = to_args(&["toluca-runtime", "sh2pc.exe", "toluca.aot"]);
+        let parsed_default = parse_args(&default_args).unwrap();
+        assert!(!parsed_default.fullscreen);
+        assert_eq!(parsed_default.width, None);
+        assert_eq!(parsed_default.height, None);
+        assert_eq!(parsed_default.aspect_mode, AspectMode::Ratio4x3);
+
+        let bad_aspect = to_args(&["toluca-runtime", "sh2pc.exe", "toluca.aot", "--aspect", "21:9"]);
+        assert!(parse_args(&bad_aspect).is_none());
+    }
+
+    #[test]
+    fn resolve_display_dimensions_respects_env_on_fullscreen() {
+        assert_eq!(
+            resolve_display_dimensions(true, None, None, Some("1280"), Some("720")),
+            (Some(1280), Some(720))
+        );
+        assert_eq!(
+            resolve_display_dimensions(true, Some(640), None, Some("1280"), Some("720")),
+            (Some(640), Some(720))
+        );
+        assert_eq!(
+            resolve_display_dimensions(false, None, None, Some("1280"), Some("720")),
+            (None, None)
+        );
+    }
 }

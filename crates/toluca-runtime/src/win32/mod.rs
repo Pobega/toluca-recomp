@@ -76,6 +76,10 @@ pub struct Win32Config {
     pub command_line: String,
     pub exe_name: String,
     pub script_keys: Vec<ScriptedKeyEvent>,
+    pub fullscreen: bool,
+    pub display_width: Option<u32>,
+    pub display_height: Option<u32>,
+    pub aspect_mode: toluca_d3d8::AspectMode,
 }
 
 impl Default for Win32Config {
@@ -90,6 +94,10 @@ impl Default for Win32Config {
             command_line: "sh2pc.exe".to_owned(),
             exe_name: "sh2pc.exe".to_owned(),
             script_keys: Vec::new(),
+            fullscreen: false,
+            display_width: None,
+            display_height: None,
+            aspect_mode: toluca_d3d8::AspectMode::Ratio4x3,
         }
     }
 }

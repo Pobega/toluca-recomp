@@ -11,6 +11,7 @@ pub const SDL_AUDIO_DEFAULT_FREQ: i32 = 44_100;
 pub const SDL_AUDIO_DEFAULT_CHANNELS: u8 = 2;
 pub const SDL_AUDIO_DEFAULT_SAMPLES: u16 = 1024;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000;
+const SDL_WINDOW_FULLSCREEN_DESKTOP: u32 = 0x0000_1001;
 const SDL_WINDOW_OPENGL: u32 = 0x0000_0002;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
 
@@ -309,12 +310,15 @@ type SdlGlDeleteContextFn = unsafe extern "C" fn(context: *mut c_void);
 type SdlGlMakeCurrentFn = unsafe extern "C" fn(window: *mut c_void, context: *mut c_void) -> i32;
 type SdlGlSwapWindowFn = unsafe extern "C" fn(window: *mut c_void);
 type SdlGlGetDrawableSizeFn = unsafe extern "C" fn(window: *mut c_void, w: *mut i32, h: *mut i32);
+type SdlGetWindowSizeFn = unsafe extern "C" fn(window: *mut c_void, w: *mut i32, h: *mut i32);
 type SdlGlSetSwapIntervalFn = unsafe extern "C" fn(interval: i32) -> i32;
 
 struct SdlPresentTarget {
     window: *mut c_void,
     swap_window_fn: SdlGlSwapWindowFn,
     drawable_size_fn: Option<SdlGlGetDrawableSizeFn>,
+    window_size_fn: Option<SdlGetWindowSizeFn>,
+    fallback_size: (u32, u32),
 }
 
 unsafe impl Send for SdlPresentTarget {}
@@ -327,8 +331,19 @@ impl PresentTarget for SdlPresentTarget {
             unsafe {
                 f(self.window, &mut w, &mut h);
             }
+            if w > 0 && h > 0 {
+                return (w as u32, h as u32);
+            }
         }
-        (w.max(0) as u32, h.max(0) as u32)
+        if let Some(f) = self.window_size_fn {
+            unsafe {
+                f(self.window, &mut w, &mut h);
+            }
+            if w > 0 && h > 0 {
+                return (w as u32, h as u32);
+            }
+        }
+        self.fallback_size
     }
 
     fn swap_buffers(&mut self) {
@@ -375,9 +390,11 @@ pub struct Sdl2WindowBackend {
     gl_swap_window_fn: Option<SdlGlSwapWindowFn>,
     gl_get_proc_addr_fn: Option<GlGetProcAddrFn>,
     gl_drawable_size_fn: Option<SdlGlGetDrawableSizeFn>,
+    get_window_size_fn: Option<SdlGetWindowSizeFn>,
     gl_set_swap_interval_fn: Option<SdlGlSetSwapIntervalFn>,
     gl_contexts: Vec<*mut c_void>,
     windows: Vec<*mut c_void>,
+    window_sizes: std::collections::HashMap<usize, (u32, u32)>,
     audio_inited: bool,
     gamecontroller_inited: bool,
     active_controller: Option<*mut c_void>,
@@ -519,12 +536,14 @@ impl Sdl2WindowBackend {
                 lib_handle,
                 c"SDL_GL_GetDrawableSize",
             ),
+            get_window_size_fn: load_sym::<SdlGetWindowSizeFn>(lib_handle, c"SDL_GetWindowSize"),
             gl_set_swap_interval_fn: load_sym::<SdlGlSetSwapIntervalFn>(
                 lib_handle,
                 c"SDL_GL_SetSwapInterval",
             ),
             gl_contexts: Vec::new(),
             windows: Vec::new(),
+            window_sizes: std::collections::HashMap::new(),
             audio_inited: false,
             gamecontroller_inited,
             active_controller: None,
@@ -709,31 +728,55 @@ impl Sdl2WindowBackend {
             }
         }
         self.gl_contexts.push(ctx);
+        let fallback_size = self
+            .window_sizes
+            .get(&(window as usize))
+            .copied()
+            .unwrap_or((0, 0));
         let target: Box<dyn PresentTarget> = Box::new(SdlPresentTarget {
             window,
             swap_window_fn: swap_window,
             drawable_size_fn: self.gl_drawable_size_fn,
+            window_size_fn: self.get_window_size_fn,
+            fallback_size,
         });
         Some((get_proc, target))
     }
 
     pub fn create_window(&mut self, title: &str, width: i32, height: i32) -> Option<*mut c_void> {
+        self.create_window_with_options(title, width, height, false)
+    }
+
+    pub fn create_window_with_options(
+        &mut self,
+        title: &str,
+        width: i32,
+        height: i32,
+        fullscreen: bool,
+    ) -> Option<*mut c_void> {
         self.configure_gles3_attributes();
         let c_title = CString::new(title).unwrap_or_else(|_| CString::new("toluca-runtime").unwrap());
+        let w = width.max(1);
+        let h = height.max(1);
+        let mut flags = SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL;
+        if fullscreen {
+            flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+        }
         let ptr = unsafe {
             (self.create_window_fn)(
                 c_title.as_ptr(),
                 SDL_WINDOWPOS_CENTERED,
                 SDL_WINDOWPOS_CENTERED,
-                width.max(1),
-                height.max(1),
-                SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL,
+                w,
+                h,
+                flags,
             )
         };
         if ptr.is_null() {
             None
         } else {
             self.windows.push(ptr);
+            self.window_sizes.insert(ptr as usize, (w as u32, h as u32));
             Some(ptr)
         }
     }
@@ -749,6 +792,7 @@ impl Sdl2WindowBackend {
         if let Some(pos) = self.windows.iter().position(|&w| w == ptr) {
             self.windows.swap_remove(pos);
         }
+        self.window_sizes.remove(&(ptr as usize));
         unsafe {
             (self.destroy_window_fn)(ptr);
         }

@@ -57,6 +57,29 @@ impl PresentTarget for NoopPresentTarget {
     fn swap_buffers(&mut self) {}
 }
 
+const ASPECT_EPSILON: f64 = 1e-4;
+const ASPECT_RATIO_4_3: f64 = 4.0 / 3.0;
+const ASPECT_RATIO_16_9: f64 = 16.0 / 9.0;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum AspectMode {
+    #[default]
+    Ratio4x3,
+    Ratio16x9,
+    Stretch,
+}
+
+impl AspectMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "4:3" | "4x3" => Some(Self::Ratio4x3),
+            "16:9" | "16x9" => Some(Self::Ratio16x9),
+            "stretch" | "fill" => Some(Self::Stretch),
+            _ => None,
+        }
+    }
+}
+
 type GLenum = u32;
 type GLuint = u32;
 type GLint = i32;
@@ -497,6 +520,7 @@ pub struct Gles3Backend {
     programs: HashMap<ShaderRecipe, CompiledProgram>,
     recipe_cache: ShaderRecipeCache,
     recipe_cache_path: Option<PathBuf>,
+    aspect_mode: AspectMode,
     pub draw_calls: u64,
     pub present_calls: u64,
 }
@@ -547,6 +571,7 @@ impl Gles3Backend {
             programs: HashMap::new(),
             recipe_cache: ShaderRecipeCache::new(),
             recipe_cache_path: recipe_cache_path.clone(),
+            aspect_mode: AspectMode::default(),
             draw_calls: 0,
             present_calls: 0,
         };
@@ -558,6 +583,14 @@ impl Gles3Backend {
         }
 
         Ok(backend)
+    }
+
+    pub fn set_aspect_mode(&mut self, mode: AspectMode) {
+        self.aspect_mode = mode;
+    }
+
+    pub fn aspect_mode(&self) -> AspectMode {
+        self.aspect_mode
     }
 
     pub fn load_recipe_cache(&mut self, path: &Path) -> Result<usize, String> {
@@ -1352,11 +1385,19 @@ impl RenderBackend for Gles3Backend {
         }
 
         let (win_w, win_h) = self.present_target.drawable_size();
-        let target_w = win_w.max(self.fbo_width).max(1);
-        let target_h = win_h.max(self.fbo_height).max(1);
+        let (target_w, target_h) = if win_w > 0 && win_h > 0 {
+            (win_w, win_h)
+        } else {
+            (self.fbo_width.max(1), self.fbo_height.max(1))
+        };
 
-        let (vp_x, vp_y, vp_w, vp_h) =
-            fit_aspect_viewport(self.fbo_width, self.fbo_height, target_w, target_h);
+        let (vp_x, vp_y, vp_w, vp_h) = compute_aspect_viewport(
+            self.fbo_width,
+            self.fbo_height,
+            target_w,
+            target_h,
+            self.aspect_mode,
+        );
 
         unsafe {
             (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, 0);
@@ -1390,22 +1431,32 @@ impl RenderBackend for Gles3Backend {
     }
 }
 
-fn fit_aspect_viewport(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (GLint, GLint, GLsizei, GLsizei) {
+pub fn compute_aspect_viewport(
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    mode: AspectMode,
+) -> (GLint, GLint, GLsizei, GLsizei) {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return (0, 0, dst_w as GLsizei, dst_h as GLsizei);
     }
-    let src_aspect = f64::from(src_w) / f64::from(src_h);
+    let target_aspect = match mode {
+        AspectMode::Stretch => return (0, 0, dst_w as GLsizei, dst_h as GLsizei),
+        AspectMode::Ratio4x3 => ASPECT_RATIO_4_3,
+        AspectMode::Ratio16x9 => ASPECT_RATIO_16_9,
+    };
     let dst_aspect = f64::from(dst_w) / f64::from(dst_h);
-    if (src_aspect - dst_aspect).abs() < 1e-4 {
+    if (target_aspect - dst_aspect).abs() < ASPECT_EPSILON {
         (0, 0, dst_w as GLsizei, dst_h as GLsizei)
-    } else if dst_aspect > src_aspect {
+    } else if dst_aspect > target_aspect {
         let vp_h = dst_h as GLsizei;
-        let vp_w = ((f64::from(dst_h) * src_aspect).round() as GLsizei).max(1);
+        let vp_w = ((f64::from(dst_h) * target_aspect).round() as GLsizei).max(1);
         let vp_x = ((dst_w as GLsizei) - vp_w) / 2;
         (vp_x, 0, vp_w, vp_h)
     } else {
         let vp_w = dst_w as GLsizei;
-        let vp_h = ((f64::from(dst_w) / src_aspect).round() as GLsizei).max(1);
+        let vp_h = ((f64::from(dst_w) / target_aspect).round() as GLsizei).max(1);
         let vp_y = ((dst_h as GLsizei) - vp_h) / 2;
         (0, vp_y, vp_w, vp_h)
     }
@@ -2121,5 +2172,35 @@ mod tests {
         assert!(fs_glsl.contains("texture(u_tex0, v_tex0.xy)"));
         assert!(fs_glsl.contains("!(current.a > u_alpha_ref)"));
         assert!(fs_glsl.contains("v_diffuse"));
+    }
+
+    #[test]
+    fn compute_aspect_viewport_covers_handheld_displays() {
+        use super::{AspectMode, compute_aspect_viewport};
+
+        assert_eq!(
+            compute_aspect_viewport(640, 480, 640, 480, AspectMode::Ratio4x3),
+            (0, 0, 640, 480)
+        );
+        assert_eq!(
+            compute_aspect_viewport(640, 480, 1280, 720, AspectMode::Ratio4x3),
+            (160, 0, 960, 720)
+        );
+        assert_eq!(
+            compute_aspect_viewport(640, 480, 1280, 720, AspectMode::Stretch),
+            (0, 0, 1280, 720)
+        );
+        assert_eq!(
+            compute_aspect_viewport(640, 480, 720, 720, AspectMode::Ratio4x3),
+            (0, 90, 720, 540)
+        );
+        assert_eq!(
+            compute_aspect_viewport(640, 480, 1280, 720, AspectMode::Ratio16x9),
+            (0, 0, 1280, 720)
+        );
+        assert_eq!(AspectMode::parse("4:3"), Some(AspectMode::Ratio4x3));
+        assert_eq!(AspectMode::parse("16:9"), Some(AspectMode::Ratio16x9));
+        assert_eq!(AspectMode::parse("stretch"), Some(AspectMode::Stretch));
+        assert_eq!(AspectMode::parse("invalid"), None);
     }
 }

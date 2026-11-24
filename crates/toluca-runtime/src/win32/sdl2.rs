@@ -284,6 +284,7 @@ type SdlCloseAudioDeviceFn = unsafe extern "C" fn(dev: u32);
 pub struct Sdl2AudioDevice {
     device_id: u32,
     obtained_freq: u32,
+    obtained_samples: u32,
     close_fn: SdlCloseAudioDeviceFn,
     userdata: *mut c_void,
     drop_userdata: unsafe fn(*mut c_void),
@@ -298,6 +299,10 @@ impl Sdl2AudioDevice {
 
     pub fn obtained_freq(&self) -> u32 {
         self.obtained_freq
+    }
+
+    pub fn obtained_samples(&self) -> u32 {
+        self.obtained_samples
     }
 }
 
@@ -1052,6 +1057,22 @@ impl Sdl2WindowBackend {
         } else {
             SDL_AUDIO_DEFAULT_FREQ as u32
         };
+        let obtained_samples = if obtained.samples > 0 {
+            u32::from(obtained.samples)
+        } else {
+            u32::from(SDL_AUDIO_DEFAULT_SAMPLES)
+        };
+        let obtained_ch = if obtained.channels > 0 {
+            obtained.channels
+        } else {
+            SDL_AUDIO_DEFAULT_CHANNELS
+        };
+        if std::env::var_os("TOLUCA_PERF").is_some_and(|v| !v.is_empty() && v != "0") {
+            eprintln!(
+                "[toluca-audio] opened freq={} samples={} ch={}",
+                obtained_freq, obtained_samples, obtained_ch
+            );
+        }
 
         unsafe {
             pause_fn(dev_id, 0);
@@ -1068,6 +1089,7 @@ impl Sdl2WindowBackend {
         Some(Sdl2AudioDevice {
             device_id: dev_id,
             obtained_freq,
+            obtained_samples,
             close_fn,
             userdata: boxed,
             drop_userdata: drop_boxed::<T>,

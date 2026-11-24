@@ -171,6 +171,7 @@ impl DsoundBufferData {
 }
 
 const SOFT_LIMIT_KNEE: f32 = 0.85;
+const DEFAULT_OUTPUT_BUFFER_FRAMES: u32 = 2048;
 
 pub struct DsoundMixer {
     pub buffers: HashMap<usize, DsoundBufferData>,
@@ -181,6 +182,7 @@ pub struct DsoundMixer {
     aux_resample_frac: f64,
     pub aux_played_frames: u64,
     pub output_sample_rate: u32,
+    output_buffer_frames: u32,
     mix_accum: Vec<f32>,
     pub hardware_clocked: bool,
     pub last_advance: Instant,
@@ -203,10 +205,15 @@ impl DsoundMixer {
             aux_resample_frac: 0.0,
             aux_played_frames: 0,
             output_sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
+            output_buffer_frames: DEFAULT_OUTPUT_BUFFER_FRAMES,
             mix_accum: Vec::new(),
             hardware_clocked: false,
             last_advance: Instant::now(),
         }
+    }
+
+    pub fn output_buffer_frames(&self) -> u32 {
+        self.output_buffer_frames
     }
 
     pub fn clear_aux_pcm(&mut self) {
@@ -588,6 +595,7 @@ impl DsoundState {
             if let Ok(mut guard) = self.mixer.lock() {
                 guard.hardware_clocked = true;
                 guard.output_sample_rate = dev.obtained_freq();
+                guard.output_buffer_frames = dev.obtained_samples();
             }
             self.audio_device = Some(dev);
         }

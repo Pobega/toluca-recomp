@@ -1034,6 +1034,13 @@ fn select_audio_track(
     (0, Some(header.audio_tracks[0]))
 }
 
+fn bink_perf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TOLUCA_PERF").is_some_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let name_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
     let flags = peek_arg_u32(cpu, ctx.arena, 1)?;
@@ -1051,6 +1058,20 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
 
     let (audio_ordinal, selected_audio_track) =
         select_audio_track(&header, &ctx.win32.bink.requested_sound_tracks, flags);
+    if bink_perf_enabled() {
+        let track_rate = selected_audio_track.map_or(0, |t| t.sample_rate);
+        let track_ch = selected_audio_track.map_or(0, |t| t.channels);
+        eprintln!(
+            "[toluca-bink] open file={} {}x{} fps={}/{} track_rate={} ch={}",
+            win_path,
+            header.width,
+            header.height,
+            header.fps_num,
+            header.fps_den,
+            track_rate,
+            track_ch
+        );
+    }
     let decoder = if let Some(api) = ctx.win32.bink.ensure_ffmpeg() {
         FfmpegDecoder::open(api, &host_path, audio_ordinal)
     } else {
@@ -1189,9 +1210,12 @@ fn should_wait_for_frame(
         if let Ok(mixer) = mixer_mutex.lock() {
             let played = mixer.aux_played_frames();
             if mixer.hardware_clocked && played > inst.start_audio_frames {
+                const ALSA_PERIODS_AHEAD: u64 = 2;
+                let latency_frames = u64::from(mixer.output_buffer_frames()) * ALSA_PERIODS_AHEAD;
+                let audible_frames =
+                    (played - inst.start_audio_frames).saturating_sub(latency_frames);
                 let rate = u128::from(mixer.output_sample_rate().max(1));
-                let elapsed_ns =
-                    u128::from(played - inst.start_audio_frames) * 1_000_000_000 / rate;
+                let elapsed_ns = u128::from(audible_frames) * 1_000_000_000 / rate;
                 let target_ns = inst.header.frame_duration().as_nanos()
                     * u128::from(inst.frame_num.saturating_sub(1));
                 return elapsed_ns < target_ns;

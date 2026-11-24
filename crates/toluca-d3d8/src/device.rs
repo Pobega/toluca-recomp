@@ -2882,13 +2882,33 @@ impl D3d8Context {
         mem: &dyn GuestMemory,
         surf_handle: u32,
     ) -> Result<HResult, String> {
+        let start = unlock_perf_enabled().then(std::time::Instant::now);
+        let (hr, log_info) = self.unlock_surface_inner(mem, surf_handle)?;
+        if let (Some(t0), Some(info)) = (start, log_info) {
+            const SLOW_UNLOCK_SURFACE_MS: f64 = 50.0;
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if ms >= SLOW_UNLOCK_SURFACE_MS {
+                eprintln!(
+                    "[toluca-perf-slow] unlock_surface {}x{} fmt=0x{:x} skip={} ms={:.1}",
+                    info.w, info.h, info.fmt, info.skipped, ms
+                );
+            }
+        }
+        Ok(hr)
+    }
+
+    fn unlock_surface_inner(
+        &mut self,
+        mem: &dyn GuestMemory,
+        surf_handle: u32,
+    ) -> Result<(HResult, Option<UnlockLogInfo>), String> {
         let max_tex_size = self.backend.max_texture_size();
         let (flags, locked_rect, dev_h, fmt, w, h, staging_va, data_len, uploaded_once, last_pal_gen) = {
             let Some(surf) = self.surfaces.get_mut(&surf_handle) else {
-                return Ok(D3DERR_INVALIDCALL);
+                return Ok((D3DERR_INVALIDCALL, None));
             };
             let Some(flags) = surf.lock_flags.take() else {
-                return Ok(D3DERR_INVALIDCALL);
+                return Ok((D3DERR_INVALIDCALL, None));
             };
             let locked_rect = surf.locked_rect.take();
             (
@@ -2905,7 +2925,7 @@ impl D3d8Context {
             )
         };
         if (flags & D3DLOCK_READONLY) != 0 {
-            return Ok(D3D_OK);
+            return Ok((D3D_OK, None));
         }
 
         let cur_pal_gen = self.surface_palette_gen(dev_h);
@@ -2959,7 +2979,7 @@ impl D3d8Context {
                         surf.uploaded_once = true;
                         surf.last_palette_gen = cur_pal_gen;
                     }
-                    return Ok(D3D_OK);
+                    return Ok((D3D_OK, Some(UnlockLogInfo { w, h, fmt, skipped: false })));
                 }
             }
             self.upload_surface_texture(surf_handle);
@@ -2970,7 +2990,7 @@ impl D3d8Context {
                         let surf = self.surfaces.get_mut(&surf_handle).unwrap();
                         if uploaded_once && palette_same && guest_bytes == surf.data.as_slice() {
                             self.backend.on_texture_upload_skipped();
-                            return Ok(D3D_OK);
+                            return Ok((D3D_OK, Some(UnlockLogInfo { w, h, fmt, skipped: true })));
                         }
                         surf.data.copy_from_slice(guest_bytes);
                     } else {
@@ -2984,7 +3004,7 @@ impl D3d8Context {
                         if uploaded_once && palette_same && tex_buf == surf.data {
                             self.scratch_tex = tex_buf;
                             self.backend.on_texture_upload_skipped();
-                            return Ok(D3D_OK);
+                            return Ok((D3D_OK, Some(UnlockLogInfo { w, h, fmt, skipped: true })));
                         }
                         std::mem::swap(&mut surf.data, &mut tex_buf);
                         self.scratch_tex = tex_buf;
@@ -2993,7 +3013,7 @@ impl D3d8Context {
             }
             self.upload_surface_texture(surf_handle);
         }
-        Ok(D3D_OK)
+        Ok((D3D_OK, Some(UnlockLogInfo { w, h, fmt, skipped: false })))
     }
 
     fn dispatch_vertex_buffer(
@@ -3334,6 +3354,20 @@ impl D3d8Context {
         mem.write_u32(pp_dev, dev.guest_obj)?;
         Ok(D3D_OK)
     }
+}
+
+struct UnlockLogInfo {
+    w: u32,
+    h: u32,
+    fmt: u32,
+    skipped: bool,
+}
+
+fn unlock_perf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TOLUCA_PERF").is_some_and(|v| !v.is_empty() && v != "0")
+    })
 }
 
 fn sync_buffer_staging_on_lock(

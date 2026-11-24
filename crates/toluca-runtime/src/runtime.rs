@@ -1355,19 +1355,33 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
         flags.push(Arc::clone(&done));
     }
     std::thread::spawn(move || {
-        {
+        #[cfg(target_os = "linux")]
+        let os_tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+        #[cfg(not(target_os = "linux"))]
+        let os_tid: libc::pid_t = 0;
+
+        let thread_priority = {
             let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(crate::win32::Win32Handle::Thread { host_tid, .. }) =
+                guard.win32.get_handle_mut(spawn.handle)
+            {
+                *host_tid = Some(os_tid);
+            }
             loop {
                 if shared.shutdown.load(Ordering::Acquire) {
                     done.store(true, Ordering::Release);
                     return;
                 }
-                let suspended = matches!(
-                    guard.win32.get_handle(spawn.handle),
-                    Some(crate::win32::Win32Handle::Thread { suspended: true, .. })
-                );
+                let (suspended, prio) = match guard.win32.get_handle(spawn.handle) {
+                    Some(crate::win32::Win32Handle::Thread {
+                        suspended,
+                        priority,
+                        ..
+                    }) => (*suspended, *priority),
+                    _ => (false, 0),
+                };
                 if !suspended {
-                    break;
+                    break prio;
                 }
                 let (next_guard, _) = shared
                     .sync_cv
@@ -1375,7 +1389,8 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
                     .unwrap_or_else(|e| e.into_inner());
                 guard = next_guard;
             }
-        }
+        };
+        crate::win32::apply_host_thread_priority(os_tid, thread_priority);
 
         if let Some(entry_fn) = shared.code.resolve_va(spawn.start_va) {
             let mut cpu = GuestCpuState::new(shared.arena_base as *mut u8, std::ptr::null());

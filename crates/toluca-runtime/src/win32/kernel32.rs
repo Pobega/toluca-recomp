@@ -260,6 +260,9 @@ fn create_file_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
 
     match opts.open(&host_path) {
         Ok(file) => {
+            if matches!(disposition, CREATE_NEW | CREATE_ALWAYS | OPEN_ALWAYS) {
+                super::path::invalidate_dir_cache(&host_path);
+            }
             *ctx.last_error = if existed && (disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS) {
                 ERROR_ALREADY_EXISTS
             } else {
@@ -499,6 +502,7 @@ fn delete_file_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
     let host_path = ctx.win32.resolve_path(&win_path);
     match std::fs::remove_file(&host_path) {
         Ok(()) => {
+            super::path::invalidate_dir_cache(&host_path);
             *ctx.last_error = ERROR_SUCCESS;
             return_stdcall(cpu, ctx.arena, 1, 1)?;
         }
@@ -519,6 +523,7 @@ fn create_directory_a(
     let host_path = ctx.win32.resolve_path(&win_path);
     match std::fs::create_dir(&host_path) {
         Ok(()) => {
+            super::path::invalidate_dir_cache(&host_path);
             *ctx.last_error = ERROR_SUCCESS;
             return_stdcall(cpu, ctx.arena, 2, 1)?;
         }
@@ -2222,6 +2227,7 @@ fn remove_directory_a(
     let path = ctx.win32.resolve_path(&ctx.arena.read_cstr(path_ptr, MAX_PATH_LEN)?);
     match std::fs::remove_dir(&path) {
         Ok(()) => {
+            super::path::invalidate_dir_cache(&path);
             *ctx.last_error = ERROR_SUCCESS;
             return_stdcall(cpu, ctx.arena, 1, 1)?;
         }
@@ -2274,6 +2280,8 @@ pub(crate) fn alloc_and_queue_guest_thread(
         exit_code: STILL_ACTIVE,
         finished: false,
         suspended,
+        priority: 0,
+        host_tid: None,
     });
     ctx.arena.write_u32(teb_va, 0xFFFF_FFFF)?;
     ctx.arena.write_u32(teb_va + 4, stack_top)?;
@@ -2349,7 +2357,42 @@ fn set_thread_priority(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 2, 1)?;
+    let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let prio = peek_arg_i32(cpu, ctx.arena, 1)?;
+
+    if handle == CURRENT_THREAD_HANDLE {
+        let active_h = u32::try_from(ctx.active_host_tid).ok();
+        if let Some(Win32Handle::Thread { priority, .. }) =
+            active_h.and_then(|h| ctx.win32.get_handle_mut(h))
+        {
+            *priority = prio;
+        } else {
+            ctx.win32.main_thread_priority = prio;
+        }
+        super::apply_host_thread_priority(0, prio);
+        *ctx.last_error = ERROR_SUCCESS;
+        return_stdcall(cpu, ctx.arena, 2, 1)?;
+        return Ok(());
+    }
+
+    let ok = if let Some(Win32Handle::Thread {
+        priority, host_tid, ..
+    }) = ctx.win32.get_handle_mut(handle)
+    {
+        *priority = prio;
+        if let Some(os_tid) = *host_tid {
+            super::apply_host_thread_priority(os_tid, prio);
+        }
+        true
+    } else {
+        false
+    };
+    *ctx.last_error = if ok {
+        ERROR_SUCCESS
+    } else {
+        ERROR_INVALID_HANDLE
+    };
+    return_stdcall(cpu, ctx.arena, 2, u32::from(ok))?;
     Ok(())
 }
 
@@ -2357,7 +2400,23 @@ fn get_thread_priority(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let prio = if handle == CURRENT_THREAD_HANDLE {
+        let active_h = u32::try_from(ctx.active_host_tid).ok();
+        if let Some(Win32Handle::Thread { priority, .. }) =
+            active_h.and_then(|h| ctx.win32.get_handle(h))
+        {
+            *priority
+        } else {
+            ctx.win32.main_thread_priority
+        }
+    } else if let Some(Win32Handle::Thread { priority, .. }) = ctx.win32.get_handle(handle) {
+        *priority
+    } else {
+        *ctx.last_error = ERROR_INVALID_HANDLE;
+        0x7FFF_FFFFu32 as i32
+    };
+    return_stdcall(cpu, ctx.arena, 1, prio as u32)?;
     Ok(())
 }
 
@@ -2644,5 +2703,100 @@ mod tests {
         );
         assert_eq!(miss, INVALID_HANDLE_VALUE);
         assert_eq!(last_error, ERROR_FILE_NOT_FOUND);
+    }
+
+    #[test]
+    fn set_thread_priority_and_get_thread_priority_round_trip() {
+        let root = TempDir::new("prio");
+        let mut arena = GuestArena::new().unwrap();
+        arena.init_thread_environment(DEFAULT_IMAGE_BASE).unwrap();
+        let mut heap = GuestHeap::new();
+        let mut win32 = Win32State::new(Win32Config {
+            game_root: root.path.clone(),
+            headless: true,
+            ..Win32Config::default()
+        });
+        let mut last_error = 0u32;
+
+        // Pseudo-handle (GetCurrentThread = 0xFFFF_FFFE) defaults to 0 and keeps 0 cleanly.
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                get_thread_priority,
+                &[CURRENT_THREAD_HANDLE],
+            ),
+            0
+        );
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                set_thread_priority,
+                &[CURRENT_THREAD_HANDLE, 0],
+            ),
+            1
+        );
+
+        let tid_ptr = heap.alloc(&mut arena, 4, true).unwrap();
+        let thandle = run_k32_call(
+            &mut arena,
+            &mut heap,
+            &mut win32,
+            &mut last_error,
+            create_thread,
+            &[0, 0, 0x0040_1000, 0, CREATE_SUSPENDED, tid_ptr],
+        );
+        assert_ne!(thandle, 0);
+
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                set_thread_priority,
+                &[thandle, -15i32 as u32],
+            ),
+            1
+        );
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                get_thread_priority,
+                &[thandle],
+            ) as i32,
+            -15
+        );
+
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                set_thread_priority,
+                &[thandle, 2],
+            ),
+            1
+        );
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                get_thread_priority,
+                &[thandle],
+            ) as i32,
+            2
+        );
     }
 }

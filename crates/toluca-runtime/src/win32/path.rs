@@ -1,4 +1,25 @@
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+
+type DirCaseCache = HashMap<PathBuf, HashMap<String, OsString>>;
+static DIR_CASE_CACHE: OnceLock<RwLock<DirCaseCache>> = OnceLock::new();
+
+fn dir_case_cache() -> &'static RwLock<DirCaseCache> {
+    DIR_CASE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn invalidate_dir_cache(path: &Path) {
+    let Some(cache) = DIR_CASE_CACHE.get() else {
+        return;
+    };
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    guard.remove(path);
+    if let Some(parent) = path.parent() {
+        guard.remove(parent);
+    }
+}
 
 pub fn resolve_win32_path(game_root: &Path, win_path: &str) -> PathBuf {
     let trimmed = strip_windows_prefixes(win_path);
@@ -114,17 +135,28 @@ fn strip_windows_prefixes(raw: &str) -> &str {
     without_drive.trim_start_matches(['\\', '/'])
 }
 
-fn find_entry_ci(dir: &Path, target: &str) -> Option<std::ffi::OsString> {
+fn find_entry_ci(dir: &Path, target: &str) -> Option<OsString> {
+    let target_lower = target.to_ascii_lowercase();
+    let cache = dir_case_cache();
+    {
+        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entries) = guard.get(dir) {
+            return entries.get(&target_lower).cloned();
+        }
+    }
+
     let entries = std::fs::read_dir(dir).ok()?;
+    let mut map = HashMap::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         if let Some(name_str) = name.to_str() {
-            if name_str.eq_ignore_ascii_case(target) {
-                return Some(name);
-            }
+            map.insert(name_str.to_ascii_lowercase(), name);
         }
     }
-    None
+    let found = map.get(&target_lower).cloned();
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    guard.insert(dir.to_path_buf(), map);
+    found
 }
 
 #[cfg(test)]
@@ -189,5 +221,26 @@ mod tests {
         assert!(wildcard_match_ci("*data*.*", "my_DATA_01.txt"));
         assert!(wildcard_match_ci("*", "anything.dat"));
         assert!(!wildcard_match_ci("foo*.txt", "bar.txt"));
+    }
+
+    #[test]
+    fn dir_case_cache_hits_and_invalidates_on_create() {
+        let root = TempDir::new("cache_inv");
+        let sub = root.path.join("Data").join("Save");
+        std::fs::create_dir_all(&sub).unwrap();
+        let first = sub.join("Slot01.BIN");
+        std::fs::write(&first, b"1").unwrap();
+
+        // Mixed-case resolve populates the directory cache.
+        assert_eq!(resolve_win32_path(&root.path, r"data\save\slot01.bin"), first);
+
+        // Creating a new mixed-case file wouldn't be found via stale cache until invalidated.
+        let second = sub.join("Slot02.BIN");
+        std::fs::write(&second, b"2").unwrap();
+        invalidate_dir_cache(&second);
+        assert_eq!(
+            resolve_win32_path(&root.path, r"data\save\slot02.bin"),
+            second
+        );
     }
 }

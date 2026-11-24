@@ -941,8 +941,12 @@ fn c_fopen(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), 
         }
     };
 
+    let created_or_written = matches!(mode.bytes().next(), Some(b'w' | b'a'));
     let fp = match opts.open(&host_path) {
         Ok(file) => {
+            if created_or_written {
+                super::path::invalidate_dir_cache(&host_path);
+            }
             let iobuf_va = ctx.heap.alloc(ctx.arena, MSVCRT_IOBUF_SIZE, true)?;
             ctx.arena.write_u32(iobuf_va + MSVCRT_IOBUF_FLAG_OFF, base_flag)?;
             ctx.win32

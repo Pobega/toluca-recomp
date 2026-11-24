@@ -139,6 +139,8 @@ pub enum Win32Handle {
         exit_code: u32,
         finished: bool,
         suspended: bool,
+        priority: i32,
+        host_tid: Option<libc::pid_t>,
     },
     Module {
         name: String,
@@ -146,6 +148,39 @@ pub enum Win32Handle {
     Heap {
         id: u32,
     },
+}
+
+pub fn apply_host_thread_priority(os_tid: libc::pid_t, win32_priority: i32) {
+    #[cfg(target_os = "linux")]
+    {
+        if win32_priority <= -15 {
+            let param = libc::sched_param { sched_priority: 0 };
+            let rc = unsafe { libc::sched_setscheduler(os_tid, libc::SCHED_IDLE, &param) };
+            if rc != 0 {
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, os_tid as libc::id_t, 19);
+                }
+            }
+            return;
+        }
+        let param = libc::sched_param { sched_priority: 0 };
+        unsafe {
+            libc::sched_setscheduler(os_tid, libc::SCHED_OTHER, &param);
+        }
+        let nice = match win32_priority {
+            -14..=-2 => 15,
+            -1 => 5,
+            0 => 0,
+            _ => -5,
+        };
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, os_tid as libc::id_t, nice);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (os_tid, win32_priority);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -452,6 +487,7 @@ pub struct Win32State {
     pub pending_threads: Vec<PendingThreadSpawn>,
     pub pending_timers: Vec<PendingTimerSpawn>,
     pub notify_sync: bool,
+    pub main_thread_priority: i32,
 }
 
 unsafe impl Send for Win32State {}
@@ -501,6 +537,7 @@ impl Win32State {
             pending_threads: Vec::new(),
             pending_timers: Vec::new(),
             notify_sync: false,
+            main_thread_priority: 0,
         }
     }
 

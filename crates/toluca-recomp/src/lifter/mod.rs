@@ -968,10 +968,24 @@ mod tests {
             .copy_from_slice(&comp_callee.code);
 
         for rel in &comp_entry.relocs {
-            if rel.target_va == callee_va && rel.kind == RelocKind::X86_64Rel32 {
-                let off = rel.code_offset as usize;
-                let disp = (callee_off as i64 - off as i64 + rel.addend as i64) as i32;
-                combined_buf[off..off + 4].copy_from_slice(&disp.to_le_bytes());
+            if rel.target_va != callee_va {
+                continue;
+            }
+            let off = rel.code_offset as usize;
+            match rel.kind {
+                RelocKind::X86_64Rel32 => {
+                    let disp = (callee_off as i64 - off as i64 + rel.addend as i64) as i32;
+                    combined_buf[off..off + 4].copy_from_slice(&disp.to_le_bytes());
+                }
+                RelocKind::AArch64Call26 => {
+                    let existing =
+                        u32::from_le_bytes(combined_buf[off..off + 4].try_into().unwrap());
+                    let delta = callee_off as i64 - off as i64 + rel.addend as i64;
+                    let imm26 = ((delta >> 2) as u32) & 0x03FF_FFFF;
+                    let updated = (existing & 0xFC00_0000) | imm26;
+                    combined_buf[off..off + 4].copy_from_slice(&updated.to_le_bytes());
+                }
+                RelocKind::GotSlot32 => {}
             }
         }
 

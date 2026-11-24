@@ -3,8 +3,13 @@ use std::path::Path;
 
 use toluca_d3d8::{GlGetProcAddrFn, PresentTarget};
 
+const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_INIT_GAMECONTROLLER: u32 = 0x0000_2000;
+pub const SDL_AUDIO_S16LSB: u16 = 0x8010;
+pub const SDL_AUDIO_DEFAULT_FREQ: i32 = 44_100;
+pub const SDL_AUDIO_DEFAULT_CHANNELS: u8 = 2;
+pub const SDL_AUDIO_DEFAULT_SAMPLES: u16 = 1024;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000;
 const SDL_WINDOW_OPENGL: u32 = 0x0000_0002;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
@@ -247,6 +252,58 @@ type SdlRwFromFileFn =
     unsafe extern "C" fn(file: *const c_char, mode: *const c_char) -> *mut c_void;
 
 type SdlGlSetAttributeFn = unsafe extern "C" fn(attr: i32, value: i32) -> i32;
+pub type SdlAudioCallback =
+    unsafe extern "C" fn(userdata: *mut c_void, stream: *mut u8, len: i32);
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SdlAudioSpec {
+    pub freq: i32,
+    pub format: u16,
+    pub channels: u8,
+    pub silence: u8,
+    pub samples: u16,
+    pub padding: u16,
+    pub size: u32,
+    pub callback: Option<SdlAudioCallback>,
+    pub userdata: *mut c_void,
+}
+
+type SdlOpenAudioDeviceFn = unsafe extern "C" fn(
+    device: *const c_char,
+    iscapture: i32,
+    desired: *const SdlAudioSpec,
+    obtained: *mut SdlAudioSpec,
+    allowed_changes: i32,
+) -> u32;
+type SdlPauseAudioDeviceFn = unsafe extern "C" fn(dev: u32, pause_on: i32);
+type SdlCloseAudioDeviceFn = unsafe extern "C" fn(dev: u32);
+
+pub struct Sdl2AudioDevice {
+    device_id: u32,
+    close_fn: SdlCloseAudioDeviceFn,
+    userdata: *mut c_void,
+    drop_userdata: unsafe fn(*mut c_void),
+}
+
+unsafe impl Send for Sdl2AudioDevice {}
+
+impl Sdl2AudioDevice {
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+}
+
+impl Drop for Sdl2AudioDevice {
+    fn drop(&mut self) {
+        // Close SDL audio device first so the callback cannot touch freed userdata.
+        unsafe {
+            (self.close_fn)(self.device_id);
+            (self.drop_userdata)(self.userdata);
+        }
+    }
+}
+
 type SdlGlCreateContextFn = unsafe extern "C" fn(window: *mut c_void) -> *mut c_void;
 type SdlGlDeleteContextFn = unsafe extern "C" fn(context: *mut c_void);
 type SdlGlMakeCurrentFn = unsafe extern "C" fn(window: *mut c_void, context: *mut c_void) -> i32;
@@ -308,6 +365,9 @@ pub struct Sdl2WindowBackend {
     gc_add_mappings_from_file_fn: Option<SdlGameControllerAddMappingsFromFileFn>,
     gc_add_mappings_from_rw_fn: Option<SdlGameControllerAddMappingsFromRwFn>,
     rw_from_file_fn: Option<SdlRwFromFileFn>,
+    open_audio_device_fn: Option<SdlOpenAudioDeviceFn>,
+    pause_audio_device_fn: Option<SdlPauseAudioDeviceFn>,
+    close_audio_device_fn: Option<SdlCloseAudioDeviceFn>,
     gl_set_attr_fn: Option<SdlGlSetAttributeFn>,
     gl_create_context_fn: Option<SdlGlCreateContextFn>,
     gl_delete_context_fn: Option<SdlGlDeleteContextFn>,
@@ -318,6 +378,7 @@ pub struct Sdl2WindowBackend {
     gl_set_swap_interval_fn: Option<SdlGlSetSwapIntervalFn>,
     gl_contexts: Vec<*mut c_void>,
     windows: Vec<*mut c_void>,
+    audio_inited: bool,
     gamecontroller_inited: bool,
     active_controller: Option<*mut c_void>,
     key_scancodes: [bool; SDL_SCANCODE_COUNT],
@@ -430,6 +491,18 @@ impl Sdl2WindowBackend {
                 c"SDL_GameControllerAddMappingsFromRW",
             ),
             rw_from_file_fn: load_sym::<SdlRwFromFileFn>(lib_handle, c"SDL_RWFromFile"),
+            open_audio_device_fn: load_sym::<SdlOpenAudioDeviceFn>(
+                lib_handle,
+                c"SDL_OpenAudioDevice",
+            ),
+            pause_audio_device_fn: load_sym::<SdlPauseAudioDeviceFn>(
+                lib_handle,
+                c"SDL_PauseAudioDevice",
+            ),
+            close_audio_device_fn: load_sym::<SdlCloseAudioDeviceFn>(
+                lib_handle,
+                c"SDL_CloseAudioDevice",
+            ),
             gl_set_attr_fn: load_sym::<SdlGlSetAttributeFn>(lib_handle, c"SDL_GL_SetAttribute"),
             gl_create_context_fn: load_sym::<SdlGlCreateContextFn>(
                 lib_handle,
@@ -452,6 +525,7 @@ impl Sdl2WindowBackend {
             ),
             gl_contexts: Vec::new(),
             windows: Vec::new(),
+            audio_inited: false,
             gamecontroller_inited,
             active_controller: None,
             key_scancodes: [false; SDL_SCANCODE_COUNT],
@@ -864,6 +938,64 @@ impl Sdl2WindowBackend {
         };
         unsafe { rumble_fn(ctrl, low_freq, high_freq, duration_ms) == 0 }
     }
+
+    pub fn open_audio_device<T>(
+        &mut self,
+        callback: SdlAudioCallback,
+        userdata: T,
+    ) -> Option<Sdl2AudioDevice> {
+        let open_fn = self.open_audio_device_fn?;
+        let pause_fn = self.pause_audio_device_fn?;
+        let close_fn = self.close_audio_device_fn?;
+
+        if !self.audio_inited {
+            let init_sub = self.init_subsystem_fn?;
+            if unsafe { init_sub(SDL_INIT_AUDIO) } != 0 {
+                return None;
+            }
+            self.audio_inited = true;
+        }
+
+        let boxed = Box::into_raw(Box::new(userdata)).cast::<c_void>();
+        let desired = SdlAudioSpec {
+            freq: SDL_AUDIO_DEFAULT_FREQ,
+            format: SDL_AUDIO_S16LSB,
+            channels: SDL_AUDIO_DEFAULT_CHANNELS,
+            silence: 0,
+            samples: SDL_AUDIO_DEFAULT_SAMPLES,
+            padding: 0,
+            size: 0,
+            callback: Some(callback),
+            userdata: boxed,
+        };
+        let mut obtained = unsafe { std::mem::zeroed::<SdlAudioSpec>() };
+        let dev_id = unsafe { open_fn(std::ptr::null(), 0, &desired, &mut obtained, 0) };
+        if dev_id == 0 {
+            unsafe {
+                drop(Box::from_raw(boxed.cast::<T>()));
+            }
+            return None;
+        }
+
+        unsafe {
+            pause_fn(dev_id, 0);
+        }
+
+        unsafe fn drop_boxed<U>(ptr: *mut c_void) {
+            if !ptr.is_null() {
+                unsafe {
+                    drop(Box::from_raw(ptr.cast::<U>()));
+                }
+            }
+        }
+
+        Some(Sdl2AudioDevice {
+            device_id: dev_id,
+            close_fn,
+            userdata: boxed,
+            drop_userdata: drop_boxed::<T>,
+        })
+    }
 }
 
 pub fn dpad_to_pov(up: bool, down: bool, left: bool, right: bool) -> u32 {
@@ -904,6 +1036,9 @@ impl Drop for Sdl2WindowBackend {
             }
         }
         unsafe {
+            if self.audio_inited {
+                (self.quit_subsystem)(SDL_INIT_AUDIO);
+            }
             if self.gamecontroller_inited {
                 (self.quit_subsystem)(SDL_INIT_GAMECONTROLLER);
             }

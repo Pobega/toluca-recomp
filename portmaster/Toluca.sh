@@ -29,6 +29,8 @@ if [ -f "$GAMEDIR/toluca.conf" ]; then
   source "$GAMEDIR/toluca.conf"
 fi
 
+chmod +x "$GAMEDIR/bin/toluca-recomp" "$GAMEDIR/bin/toluca-runtime" "$GAMEDIR/tools/patchscript" 2>/dev/null || true
+
 EXE_PATH=""
 for candidate in \
   "$GAMEDIR/gamedata/sh2pc.exe" \
@@ -94,15 +96,27 @@ ASPECT="${TOLUCA_ASPECT:-4:3}"
 # shellcheck disable=SC2154
 export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 
-if [ -n "${DEVICE_ARCH:-}" ] && [ -d "$GAMEDIR/libs.${DEVICE_ARCH}" ]; then
-  export LD_LIBRARY_PATH="$GAMEDIR/libs.${DEVICE_ARCH}:${LD_LIBRARY_PATH:-}"
+ARCH_DIR="${DEVICE_ARCH:-aarch64}"
+if [ -d "$GAMEDIR/libs.${ARCH_DIR}" ]; then
+  export LD_LIBRARY_PATH="$GAMEDIR/libs.${ARCH_DIR}:${LD_LIBRARY_PATH:-}"
+fi
+
+EXTRA_ARGS=()
+GPTOKEYB_CMD="${GPTOKEYB2:-${GPTOKEYB:-}}"
+if [ "${TOLUCA_NATIVE_GAMEPAD:-0}" != "1" ] && [ -f "$GAMEDIR/toluca.gptk" ] && [ -n "$GPTOKEYB_CMD" ]; then
+  # shellcheck disable=SC2086
+  $GPTOKEYB_CMD "toluca-runtime" -c "$GAMEDIR/toluca.gptk" > /dev/null 2>&1 &
+  EXTRA_ARGS+=(--no-gamepad)
+elif [ -n "$GPTOKEYB_CMD" ]; then
+  # shellcheck disable=SC2086
+  $GPTOKEYB_CMD "toluca-runtime" > /dev/null 2>&1 &
 fi
 
 pm_platform_helper "$GAMEDIR/bin/toluca-runtime"
 
-EXTRA_ARGS=()
 if [ -n "${TOLUCA_EXTRA_ARGS:-}" ]; then
-  read -r -a EXTRA_ARGS <<< "$TOLUCA_EXTRA_ARGS"
+  read -r -a USER_EXTRA_ARGS <<< "$TOLUCA_EXTRA_ARGS"
+  EXTRA_ARGS+=("${USER_EXTRA_ARGS[@]}")
 fi
 
 "$GAMEDIR/bin/toluca-runtime" \

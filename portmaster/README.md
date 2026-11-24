@@ -3,9 +3,22 @@
 This directory holds the clean-room PortMaster release assets for *Silent Hill 2*:
 
 - `Toluca.sh` — Handheld launch script (triggers `tools/patchscript` on first run or when `sh2pc.exe` changes, then launches `bin/toluca-runtime`).
+- `toluca.gptk` — Default `gptokeyb2` controller-to-keyboard mapping for handheld play.
 - `tools/patchscript` — On-device patching script that verifies `sh2pc.exe` and compiles `cache/toluca_code.bin` under a 100 MiB peak RSS budget.
 - `port.json` — PortMaster v3 metadata manifest.
 - `gamedata/README.txt` — User instructions for placing vanilla NA v1.0 `sh2pc.exe` and `data/`.
+
+## Controls (`toluca.gptk`)
+
+By default, `Toluca.sh` runs `gptokeyb2` with `toluca.gptk` and `--no-gamepad` so all menus and gameplay work consistently on stickless and dual-stick handhelds:
+
+- **D-Pad / Left Stick:** Move / Navigate menus (`Arrow keys`)
+- **A / B:** Action / Confirm (`Space`), Cancel / Skip (`Esc`)
+- **X / Y:** Run (`Left Shift`), Map (`M`)
+- **L1 / R1:** Strafe Left / Right (`A` / `D`)
+- **L2 / R2:** Ready Weapon (`S`), Flashlight (`F`)
+- **Start / Select:** Pause (`P`), Inventory (`I`)
+- **L3 / R3 / Right Stick:** Quick Health (`H`), Search View (`L`), Rotate Camera (`Q` / `E`)
 
 ## Supported Handheld Displays
 
@@ -20,10 +33,11 @@ This directory holds the clean-room PortMaster release assets for *Silent Hill 2
 Place an optional `toluca.conf` file in `ports/toluca/` to customize settings:
 
 ```bash
-TOLUCA_ASPECT="4:3"   # 4:3 | 16:9 | stretch
-TOLUCA_WIDTH="1280"   # override display width
-TOLUCA_HEIGHT="720"   # override display height
-TOLUCA_EXTRA_ARGS=""  # extra toluca-runtime CLI flags
+TOLUCA_ASPECT="4:3"       # 4:3 | 16:9 | stretch
+TOLUCA_WIDTH="1280"       # override display width
+TOLUCA_HEIGHT="720"       # override display height
+TOLUCA_NATIVE_GAMEPAD="1" # bypass toluca.gptk and use native SDL2 DirectInput gamepad
+TOLUCA_EXTRA_ARGS=""      # extra toluca-runtime CLI flags
 ```
 
 ## Clean-Room Notice

@@ -22,7 +22,7 @@ test:
 	$(TOOLBOX_RUN) cargo test --workspace
 
 package:
-	@if [ ! -f "$(DIST_BIN_DIR)/toluca-recomp" ] || [ ! -f "$(DIST_BIN_DIR)/toluca-runtime" ]; then \
+	@if [ ! -f "$(DIST_BIN_DIR)/toluca-recomp" ] || [ ! -f "$(DIST_BIN_DIR)/toluca-runtime" ] || [ ! -f "$(DIST_BIN_DIR)/libs/libavcodec.so.61" ]; then \
 		bash scripts/build-aarch64.sh; \
 	fi
 	bash scripts/package-portmaster.sh
@@ -30,7 +30,7 @@ package:
 # Push release files to a NextUI device over ADB without clobbering gamedata/ or toluca.conf.
 # Clears cached AOT/shader artifacts so PortMaster's patcher cleanly recompiles on next launch.
 push:
-	@if [ ! -f "$(DIST_BIN_DIR)/toluca-recomp" ] || [ ! -f "$(DIST_BIN_DIR)/toluca-runtime" ]; then \
+	@if [ ! -f "$(DIST_BIN_DIR)/toluca-recomp" ] || [ ! -f "$(DIST_BIN_DIR)/toluca-runtime" ] || [ ! -f "$(DIST_BIN_DIR)/libs/libavcodec.so.61" ]; then \
 		bash scripts/build-aarch64.sh; \
 	fi
 	@$(ADB) get-state >/dev/null
@@ -38,14 +38,17 @@ push:
 	$(ADB) push "portmaster/Toluca.sh" "$(NEXTUI_PORTS_DIR)/Toluca.sh"
 	$(ADB) push "portmaster/Toluca.sh" "$(NEXTUI_DOTPORTS_DIR)/Toluca.sh"
 	@echo "==> Preparing $(NEXTUI_GAMEDIR)/ directories (preserving gamedata/ and toluca.conf)..."
-	$(ADB) shell 'mkdir -p "$(NEXTUI_GAMEDIR)/bin" "$(NEXTUI_GAMEDIR)/tools" "$(NEXTUI_GAMEDIR)/gamedata" "$(NEXTUI_GAMEDIR)/cache"'
+	$(ADB) shell 'mkdir -p "$(NEXTUI_GAMEDIR)/bin" "$(NEXTUI_GAMEDIR)/tools" "$(NEXTUI_GAMEDIR)/gamedata" "$(NEXTUI_GAMEDIR)/cache" "$(NEXTUI_GAMEDIR)/libs.aarch64" "$(NEXTUI_GAMEDIR)/licenses"'
 	@echo "==> Pushing release files to $(NEXTUI_GAMEDIR)/..."
 	$(ADB) push \
 		"portmaster/README.md" \
 		"portmaster/port.json" \
+		"portmaster/toluca.gptk" \
 		"$(NEXTUI_GAMEDIR)/"
 	$(ADB) push "portmaster/gamedata/README.txt" "$(NEXTUI_GAMEDIR)/gamedata/README.txt"
 	$(ADB) push "portmaster/tools/patchscript" "$(NEXTUI_GAMEDIR)/tools/patchscript"
+	$(ADB) push portmaster/licenses/* "$(NEXTUI_GAMEDIR)/licenses/"
+	$(ADB) push $(DIST_BIN_DIR)/libs/libav*.so.* "$(NEXTUI_GAMEDIR)/libs.aarch64/"
 	$(ADB) push \
 		"$(DIST_BIN_DIR)/toluca-recomp" \
 		"$(DIST_BIN_DIR)/toluca-runtime" \
@@ -57,7 +60,7 @@ push:
 # Fast dev deploy: pushes updated launcher and aarch64 binaries while preserving gamedata/,
 # toluca.conf, and the already-compiled cache/toluca_code.bin (skips on-device recompilation).
 push-fast:
-	@if [ ! -f "$(DIST_BIN_DIR)/toluca-recomp" ] || [ ! -f "$(DIST_BIN_DIR)/toluca-runtime" ]; then \
+	@if [ ! -f "$(DIST_BIN_DIR)/toluca-recomp" ] || [ ! -f "$(DIST_BIN_DIR)/toluca-runtime" ] || [ ! -f "$(DIST_BIN_DIR)/libs/libavcodec.so.61" ]; then \
 		bash scripts/build-aarch64.sh; \
 	fi
 	@$(ADB) get-state >/dev/null
@@ -65,8 +68,11 @@ push-fast:
 	$(ADB) push "portmaster/Toluca.sh" "$(NEXTUI_PORTS_DIR)/Toluca.sh"
 	$(ADB) push "portmaster/Toluca.sh" "$(NEXTUI_DOTPORTS_DIR)/Toluca.sh"
 	@echo "==> Pushing updated binaries and scripts to $(NEXTUI_GAMEDIR)/ (preserving gamedata/ and cache/)..."
-	$(ADB) shell 'mkdir -p "$(NEXTUI_GAMEDIR)/bin" "$(NEXTUI_GAMEDIR)/tools" "$(NEXTUI_GAMEDIR)/gamedata" "$(NEXTUI_GAMEDIR)/cache"'
+	$(ADB) shell 'mkdir -p "$(NEXTUI_GAMEDIR)/bin" "$(NEXTUI_GAMEDIR)/tools" "$(NEXTUI_GAMEDIR)/gamedata" "$(NEXTUI_GAMEDIR)/cache" "$(NEXTUI_GAMEDIR)/libs.aarch64" "$(NEXTUI_GAMEDIR)/licenses"'
+	$(ADB) push "portmaster/toluca.gptk" "$(NEXTUI_GAMEDIR)/toluca.gptk"
 	$(ADB) push "portmaster/tools/patchscript" "$(NEXTUI_GAMEDIR)/tools/patchscript"
+	$(ADB) push portmaster/licenses/* "$(NEXTUI_GAMEDIR)/licenses/"
+	$(ADB) push $(DIST_BIN_DIR)/libs/libav*.so.* "$(NEXTUI_GAMEDIR)/libs.aarch64/"
 	$(ADB) push \
 		"$(DIST_BIN_DIR)/toluca-recomp" \
 		"$(DIST_BIN_DIR)/toluca-runtime" \

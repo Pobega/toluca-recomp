@@ -9,15 +9,21 @@ OUT_ZIP="${REPO_ROOT}/dist/toluca-portmaster.zip"
 
 for required in \
     "${PM_DIR}/Toluca.sh" \
+    "${PM_DIR}/toluca.gptk" \
     "${PM_DIR}/port.json" \
     "${PM_DIR}/README.md" \
     "${PM_DIR}/gamedata/README.txt" \
     "${PM_DIR}/tools/patchscript" \
+    "${PM_DIR}/licenses/LICENSE.FFmpeg.txt" \
+    "${PM_DIR}/licenses/LICENSE.toluca.txt" \
     "${BIN_DIR}/toluca-recomp" \
-    "${BIN_DIR}/toluca-runtime"; do
+    "${BIN_DIR}/toluca-runtime" \
+    "${BIN_DIR}/libs/libavutil.so.59" \
+    "${BIN_DIR}/libs/libavcodec.so.61" \
+    "${BIN_DIR}/libs/libavformat.so.61"; do
     if [[ ! -f "${required}" ]]; then
         echo "Error: missing required artifact '${required}'." >&2
-        echo "Run ./scripts/build-aarch64.sh first if dist/aarch64/ binaries are missing." >&2
+        echo "Run ./scripts/build-aarch64.sh first if dist/aarch64/ artifacts are missing." >&2
         exit 1
     fi
 done
@@ -38,21 +44,31 @@ cleanup() {
 trap cleanup EXIT
 
 PORT_ROOT="${STAGE_DIR}/toluca"
-mkdir -p "${PORT_ROOT}/bin" "${PORT_ROOT}/cache" "${PORT_ROOT}/gamedata" "${PORT_ROOT}/tools"
+mkdir -p \
+    "${PORT_ROOT}/bin" \
+    "${PORT_ROOT}/cache" \
+    "${PORT_ROOT}/gamedata" \
+    "${PORT_ROOT}/libs.aarch64" \
+    "${PORT_ROOT}/licenses" \
+    "${PORT_ROOT}/tools"
 
 cp "${PM_DIR}/Toluca.sh" "${STAGE_DIR}/Toluca.sh"
+cp "${PM_DIR}/toluca.gptk" "${PORT_ROOT}/toluca.gptk"
 cp "${PM_DIR}/port.json" "${PORT_ROOT}/port.json"
 cp "${PM_DIR}/README.md" "${PORT_ROOT}/README.md"
 cp "${PM_DIR}/gamedata/README.txt" "${PORT_ROOT}/gamedata/README.txt"
 cp "${PM_DIR}/tools/patchscript" "${PORT_ROOT}/tools/patchscript"
+cp "${PM_DIR}/licenses/"* "${PORT_ROOT}/licenses/"
 cp "${BIN_DIR}/toluca-recomp" "${PORT_ROOT}/bin/toluca-recomp"
 cp "${BIN_DIR}/toluca-runtime" "${PORT_ROOT}/bin/toluca-runtime"
+cp "${BIN_DIR}/libs/"libav*.so.* "${PORT_ROOT}/libs.aarch64/"
 
 chmod 0755 \
     "${STAGE_DIR}/Toluca.sh" \
     "${PORT_ROOT}/tools/patchscript" \
     "${PORT_ROOT}/bin/toluca-recomp" \
-    "${PORT_ROOT}/bin/toluca-runtime"
+    "${PORT_ROOT}/bin/toluca-runtime" \
+    "${PORT_ROOT}/libs.aarch64/"libav*.so.*
 
 mkdir -p "$(dirname "${OUT_ZIP}")"
 rm -f "${OUT_ZIP}"

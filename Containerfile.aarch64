@@ -15,6 +15,8 @@ RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/de
         curl \
         gcc \
         libc6-dev \
+        make \
+        xz-utils \
         gcc-aarch64-linux-gnu \
         libc6-dev-arm64-cross \
         binutils-aarch64-linux-gnu \
@@ -26,5 +28,80 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain 1.91.1 --profile minimal --no-modify-path \
     && rustup target add aarch64-unknown-linux-gnu \
     && chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}"
+
+ARG FFMPEG_VERSION=7.1.1
+ARG FFMPEG_SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
+
+RUN mkdir -p /tmp/ffmpeg-build \
+    && cd /tmp/ffmpeg-build \
+    && curl --proto '=https' --tlsv1.2 -fsSL -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
+    && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
+    && tar -xf ffmpeg.tar.xz \
+    && cd "ffmpeg-${FFMPEG_VERSION}" \
+    && ./configure \
+        --prefix=/opt/toluca-ffmpeg-aarch64 \
+        --enable-cross-compile \
+        --cross-prefix=aarch64-linux-gnu- \
+        --arch=aarch64 \
+        --target-os=linux \
+        --enable-shared \
+        --disable-static \
+        --disable-programs \
+        --disable-doc \
+        --disable-everything \
+        --disable-avdevice \
+        --disable-swscale \
+        --disable-swresample \
+        --disable-avfilter \
+        --disable-network \
+        --disable-autodetect \
+        --enable-demuxer=bink \
+        --enable-decoder=bink,binkaudio_dct,binkaudio_rdft \
+        --enable-protocol=file \
+        --disable-debug \
+        --enable-small \
+    && make -j"$(nproc)" \
+    && make install \
+    && cp COPYING.LGPLv2.1 /opt/toluca-ffmpeg-aarch64/LICENSE.FFmpeg.txt \
+    && chmod -R a+rX /opt/toluca-ffmpeg-aarch64 \
+    && rm -rf /tmp/ffmpeg-build
+
+RUN cat <<'EOF' > /tmp/check_offsets.c
+#include <stddef.h>
+#include <stdio.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavcodec/packet.h>
+#include <libavutil/frame.h>
+
+#define CHECK(label, expr, expected) do { \
+    size_t actual = (expr); \
+    printf("%s=%zu (expected %zu)\n", (label), actual, (size_t)(expected)); \
+    if (actual != (size_t)(expected)) { \
+        fprintf(stderr, "MISMATCH: %s=%zu != %zu\n", (label), actual, (size_t)(expected)); \
+        fail = 1; \
+    } \
+} while (0)
+
+int main(void) {
+    int fail = 0;
+    CHECK("AVFMT_NB_STREAMS_OFF", offsetof(AVFormatContext, nb_streams), 44);
+    CHECK("AVFMT_STREAMS_OFF", offsetof(AVFormatContext, streams), 48);
+    CHECK("AVSTREAM_CODECPAR_OFF", offsetof(AVStream, codecpar), 16);
+    CHECK("AVCODECPAR_TYPE_OFF", offsetof(AVCodecParameters, codec_type), 0);
+    CHECK("AVCODECPAR_ID_OFF", offsetof(AVCodecParameters, codec_id), 4);
+    CHECK("AVPKT_STREAM_IDX_OFF", offsetof(AVPacket, stream_index), 36);
+    CHECK("AVFRAME_DATA_OFF", offsetof(AVFrame, data), 0);
+    CHECK("AVFRAME_LINESIZE_OFF", offsetof(AVFrame, linesize), 64);
+    CHECK("AVFRAME_WIDTH_OFF", offsetof(AVFrame, width), 104);
+    CHECK("AVFRAME_HEIGHT_OFF", offsetof(AVFrame, height), 108);
+    CHECK("AVFRAME_NB_SAMPLES_OFF", offsetof(AVFrame, nb_samples), 112);
+    CHECK("AVFRAME_FORMAT_OFF", offsetof(AVFrame, format), 116);
+    return fail;
+}
+EOF
+RUN aarch64-linux-gnu-gcc -I/opt/toluca-ffmpeg-aarch64/include /tmp/check_offsets.c -o /tmp/check_offsets \
+    && qemu-aarch64-static -L /usr/aarch64-linux-gnu /tmp/check_offsets \
+    && rm -f /tmp/check_offsets.c /tmp/check_offsets
 
 WORKDIR /work

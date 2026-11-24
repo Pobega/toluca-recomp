@@ -72,9 +72,12 @@ fi
 mv -f "${TMP_CACHE}" "${OUT_CACHE}"
 
 if command -v sha1sum >/dev/null 2>&1; then
-    sha1sum "${EXE_PATH}" | awk '{ print $1 }' > "${SHA_STAMP}"
+    EXE_SHA1="$(sha1sum "${EXE_PATH}" | awk '{ print $1 }')"
+    RECOMP_SHA1="$(sha1sum "${RECOMP_BIN}" | awk '{ print $1 }')"
 else
-    "${RECOMP_BIN}" verify "${EXE_PATH}" | awk '/^SHA-1:/ { print $2; exit }' > "${SHA_STAMP}"
+    EXE_SHA1="$("${RECOMP_BIN}" verify "${EXE_PATH}" | awk '/^SHA-1:/ { print $2; exit }')"
+    RECOMP_SHA1="$(cksum "${RECOMP_BIN}" 2>/dev/null | awk '{ print $1 "-" $2 }' || echo "unknown")"
 fi
+printf '%s:%s\n' "${EXE_SHA1}" "${RECOMP_SHA1}" > "${SHA_STAMP}"
 
 echo "AOT cache ready: ${OUT_CACHE}"

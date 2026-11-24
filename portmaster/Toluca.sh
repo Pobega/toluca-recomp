@@ -57,11 +57,18 @@ fi
 
 CACHE_BIN="$GAMEDIR/cache/toluca_code.bin"
 SHA_STAMP="$GAMEDIR/cache/sh2pc.sha1"
+RECOMP_BIN="$GAMEDIR/bin/toluca-recomp"
 
 if command -v sha1sum >/dev/null 2>&1; then
-  CURRENT_SHA1="$(sha1sum "$EXE_PATH" | awk '{ print $1 }')"
+  EXE_SHA1="$(sha1sum "$EXE_PATH" | awk '{ print $1 }')"
+  RECOMP_SHA1="$(sha1sum "$RECOMP_BIN" | awk '{ print $1 }')"
 else
-  CURRENT_SHA1="$("$GAMEDIR/bin/toluca-recomp" verify "$EXE_PATH" | awk '/^SHA-1:/ { print $2; exit }')"
+  EXE_SHA1="$("$RECOMP_BIN" verify "$EXE_PATH" | awk '/^SHA-1:/ { print $2; exit }')"
+  RECOMP_SHA1="$(cksum "$RECOMP_BIN" 2>/dev/null | awk '{ print $1 "-" $2 }' || echo "unknown")"
+fi
+CURRENT_SHA1=""
+if [ -n "$EXE_SHA1" ]; then
+  CURRENT_SHA1="${EXE_SHA1}:${RECOMP_SHA1}"
 fi
 
 SAVED_SHA1=""
@@ -120,6 +127,19 @@ pm_platform_helper "$GAMEDIR/bin/toluca-runtime"
 if [ -n "${TOLUCA_EXTRA_ARGS:-}" ]; then
   read -r -a USER_EXTRA_ARGS <<< "$TOLUCA_EXTRA_ARGS"
   EXTRA_ARGS+=("${USER_EXTRA_ARGS[@]}")
+fi
+
+if [ "${TOLUCA_KEEP_SAFE_MODE:-0}" != "1" ]; then
+  for cfg in "$GAME_DATA_DIR"/*; do
+    [ -f "$cfg" ] || continue
+    case "${cfg##*/}" in
+      [Ss][Ee][Tt][Tt][Ii][Nn][Gg][Ss].[Ii][Nn][Ii])
+        if grep -q '^SET DX_CONFIG_SAFE_MODE 1' "$cfg" 2>/dev/null; then
+          sed -i 's/^SET DX_CONFIG_SAFE_MODE 1\([[:space:]]*\)$/SET DX_CONFIG_SAFE_MODE 0\1/' "$cfg"
+        fi
+        ;;
+    esac
+  done
 fi
 
 "$GAMEDIR/bin/toluca-runtime" \

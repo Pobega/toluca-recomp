@@ -13,7 +13,8 @@ use crate::types::{
     D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32,
     D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INDEX16,
     D3DFMT_INDEX32, D3DFMT_L8, D3DFMT_P8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UNKNOWN,
-    D3DFMT_V8U8, D3DFMT_VERTEXDATA, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DLOCK_READONLY,
+    D3DFMT_V8U8, D3DFMT_VERTEXDATA, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DLOCK_DISCARD,
+    D3DLOCK_READONLY,
     D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
     D3DPT_TRIANGLESTRIP, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
     D3DRTYPE_VERTEXBUFFER, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3D_OK,
@@ -2919,15 +2920,14 @@ impl D3d8Context {
             return Ok(D3DERR_INVALIDCALL);
         }
 
-        let staging_va = match vb.staging_guest_va {
-            Some(va) => va,
-            None => {
-                let va = mem.alloc(vb.length as usize, true)?;
-                vb.staging_guest_va = Some(va);
-                va
-            }
-        };
-        mem.write_bytes(staging_va, &vb.data)?;
+        let staging_va = sync_buffer_staging_on_lock(
+            mem,
+            &mut vb.staging_guest_va,
+            &vb.data,
+            offset,
+            lock_len,
+            flags,
+        )?;
         vb.lock_range = Some((offset, lock_len, flags));
         mem.write_u32(ppb_data, staging_va + offset)?;
         Ok(D3D_OK)
@@ -3069,15 +3069,14 @@ impl D3d8Context {
             return Ok(D3DERR_INVALIDCALL);
         }
 
-        let staging_va = match ib.staging_guest_va {
-            Some(va) => va,
-            None => {
-                let va = mem.alloc(ib.length as usize, true)?;
-                ib.staging_guest_va = Some(va);
-                va
-            }
-        };
-        mem.write_bytes(staging_va, &ib.data)?;
+        let staging_va = sync_buffer_staging_on_lock(
+            mem,
+            &mut ib.staging_guest_va,
+            &ib.data,
+            offset,
+            lock_len,
+            flags,
+        )?;
         ib.lock_range = Some((offset, lock_len, flags));
         mem.write_u32(ppb_data, staging_va + offset)?;
         Ok(D3D_OK)
@@ -3118,6 +3117,38 @@ impl D3d8Context {
         mem.write_u32(pp_dev, dev.guest_obj)?;
         Ok(D3D_OK)
     }
+}
+
+fn sync_buffer_staging_on_lock(
+    mem: &mut dyn GuestMemory,
+    staging_slot: &mut Option<GuestAddr>,
+    data: &[u8],
+    offset: u32,
+    lock_len: u32,
+    flags: u32,
+) -> Result<GuestAddr, String> {
+    let mut first_alloc = false;
+    let staging_va = match *staging_slot {
+        Some(va) => va,
+        None => {
+            first_alloc = true;
+            let va = mem.alloc(data.len(), true)?;
+            *staging_slot = Some(va);
+            va
+        }
+    };
+    if (flags & D3DLOCK_DISCARD) == 0 {
+        if first_alloc {
+            mem.write_bytes(staging_va, data)?;
+        } else {
+            let start = offset as usize;
+            let end = start.saturating_add(lock_len as usize).min(data.len());
+            if start < end {
+                mem.write_bytes(staging_va + offset, &data[start..end])?;
+            }
+        }
+    }
+    Ok(staging_va)
 }
 
 fn standard_display_modes() -> Vec<D3dDisplayMode> {

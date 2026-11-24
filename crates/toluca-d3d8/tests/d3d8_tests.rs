@@ -14,8 +14,8 @@ use toluca_d3d8::types::{
     D3D_OK, D3D_SDK_VERSION, D3DADAPTER_DEFAULT, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DDEVTYPE_HAL,
     D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_INDEX16,
     D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_TEX2, D3DFVF_XYZ,
-    D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE, D3DRS_ZENABLE,
-    D3DSBT_ALL, D3DTS_VIEW, D3DUSAGE_WRITEONLY, D3dAdapterIdentifier8, D3dCaps8, D3dDisplayMode,
+    D3DLOCK_DISCARD, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE,
+    D3DRS_ZENABLE, D3DSBT_ALL, D3DTS_VIEW, D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY, D3dAdapterIdentifier8, D3dCaps8, D3dDisplayMode,
     D3dIndexBufferDesc, D3dLockedRect, D3dPresentParameters, D3dSurfaceDesc, D3dVertexBufferDesc,
     fvf_vertex_stride, surface_byte_size, surface_row_pitch, write_matrix_4x4,
 };
@@ -181,7 +181,7 @@ fn com_thunk_roundtrip_all_interfaces() {
 
 fn call(
     ctx: &mut D3d8Context,
-    mem: &mut MockMemory,
+    mem: &mut impl GuestMemory,
     obj_va: GuestAddr,
     method_idx: u32,
     extra_args: &[u32],
@@ -432,4 +432,120 @@ fn end_to_end_d3d8_render_sequence() {
     let _ = IDIRECT3DVERTEXBUFFER8_METHOD_COUNT;
     let _ = IDIRECT3DINDEXBUFFER8_METHOD_COUNT;
     assert!(mem.live_allocations() <= 7);
+}
+
+struct CountingMemory {
+    inner: MockMemory,
+    write_calls: Vec<(GuestAddr, usize)>,
+}
+
+impl GuestMemory for CountingMemory {
+    fn read_bytes(&self, va: GuestAddr, len: usize) -> Result<Vec<u8>, String> {
+        self.inner.read_bytes(va, len)
+    }
+
+    fn write_bytes(&mut self, va: GuestAddr, data: &[u8]) -> Result<(), String> {
+        self.write_calls.push((va, data.len()));
+        self.inner.write_bytes(va, data)
+    }
+
+    fn zero_range(&mut self, va: GuestAddr, len: usize) -> Result<(), String> {
+        self.inner.zero_range(va, len)
+    }
+
+    fn alloc(&mut self, size: usize, zeroed: bool) -> Result<GuestAddr, String> {
+        self.inner.alloc(size, zeroed)
+    }
+
+    fn free(&mut self, va: GuestAddr) -> Result<(), String> {
+        self.inner.free(va)
+    }
+}
+
+#[test]
+fn vb_and_ib_partial_lock_and_discard_sync_only_requested_range() {
+    let mut mem = CountingMemory {
+        inner: MockMemory::new(),
+        write_calls: Vec::new(),
+    };
+    let mut ctx = D3d8Context::new_null();
+
+    let pp_va = mem.alloc(D3dPresentParameters::SIZE, true).unwrap();
+    let out_ptr = mem.alloc(4, true).unwrap();
+    let d3d8_va = ctx.create_direct3d8(&mut mem, D3D_SDK_VERSION).unwrap();
+    let pp = D3dPresentParameters {
+        back_buffer_width: 640,
+        back_buffer_height: 480,
+        back_buffer_format: D3DFMT_X8R8G8B8,
+        back_buffer_count: 1,
+        swap_effect: 1,
+        windowed: 1,
+        enable_auto_depth_stencil: 1,
+        auto_depth_stencil_format: D3DFMT_D24S8,
+        ..Default::default()
+    };
+    pp.write_to(&mut mem, pp_va).unwrap();
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            d3d8_va,
+            15,
+            &[0, D3DDEVTYPE_HAL, 0x0002_0000, 0x40, pp_va, out_ptr]
+        ),
+        D3D_OK
+    );
+    let dev_va = mem.read_u32(out_ptr).unwrap();
+
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            23,
+            &[
+                1024,
+                D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                D3DFVF_XYZ,
+                D3DPOOL_MANAGED,
+                out_ptr,
+            ]
+        ),
+        D3D_OK
+    );
+    let vb_va = mem.read_u32(out_ptr).unwrap();
+
+    // First lock with D3DLOCK_DISCARD skips copying 1024 zero bytes into staging.
+    mem.write_calls.clear();
+    assert_eq!(
+        call(&mut ctx, &mut mem, vb_va, 11, &[0, 16, out_ptr, D3DLOCK_DISCARD]),
+        D3D_OK
+    );
+    assert_eq!(mem.write_calls, vec![(out_ptr, 4)]);
+    let ptr0 = mem.read_u32(out_ptr).unwrap();
+    mem.write_u32(ptr0, 0x1122_3344).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, vb_va, 12, &[]), D3D_OK);
+
+    // Subsequent partial lock syncs only [offset..offset+lock_len] (32 bytes), not 1024 bytes.
+    mem.write_calls.clear();
+    assert_eq!(
+        call(&mut ctx, &mut mem, vb_va, 11, &[64, 32, out_ptr, 0]),
+        D3D_OK
+    );
+    assert_eq!(mem.write_calls, vec![(ptr0 + 64, 32), (out_ptr, 4)]);
+    let ptr64 = mem.read_u32(out_ptr).unwrap();
+    assert_eq!(ptr64, ptr0 + 64);
+    mem.write_u32(ptr64, 0x5566_7788).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, vb_va, 12, &[]), D3D_OK);
+
+    // First slice remains intact in staging and backend upload buffer.
+    assert_eq!(mem.read_u32(ptr0).unwrap(), 0x1122_3344);
+    assert_eq!(
+        ctx.backend()
+            .as_any()
+            .downcast_ref::<NullBackend>()
+            .unwrap()
+            .vb_uploads,
+        2
+    );
 }

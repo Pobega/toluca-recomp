@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::shader_ffp::{FfpShaderKey, MAX_FFP_LIGHTS, MAX_FFP_STAGES, TextureStageKey};
 
 pub const SHADER_CACHE_MAGIC: &[u8; 4] = b"TLCP";
-pub const SHADER_CACHE_VERSION: u32 = 1;
+pub const SHADER_CACHE_VERSION: u32 = 2;
 
 const TAG_FFP: u8 = 0;
 const TAG_PROGRAMMABLE: u8 = 1;
@@ -22,6 +22,8 @@ pub enum ShaderRecipe {
         ps_tokens: Vec<u32>,
         alpha_test_func: u8,
         fog_mode: u8,
+        ffp_stages: [TextureStageKey; MAX_FFP_STAGES],
+        specular_enabled: bool,
     },
 }
 
@@ -75,6 +77,8 @@ impl ShaderRecipeCache {
                     ps_tokens,
                     alpha_test_func,
                     fog_mode,
+                    ffp_stages,
+                    specular_enabled,
                 } => {
                     buf.push(TAG_PROGRAMMABLE);
                     encode_u32_vec(&mut buf, decl_tokens);
@@ -82,6 +86,8 @@ impl ShaderRecipeCache {
                     encode_u32_vec(&mut buf, ps_tokens);
                     buf.push(*alpha_test_func);
                     buf.push(*fog_mode);
+                    encode_stages(&mut buf, ffp_stages);
+                    buf.push(u8::from(*specular_enabled));
                 }
             }
         }
@@ -126,12 +132,16 @@ impl ShaderRecipeCache {
                     let ps_tokens = decode_u32_vec(&mut cursor)?;
                     let alpha_test_func = cursor.read_u8()?;
                     let fog_mode = cursor.read_u8()?;
+                    let ffp_stages = decode_stages(&mut cursor)?;
+                    let specular_enabled = cursor.read_bool()?;
                     ShaderRecipe::Programmable {
                         decl_tokens,
                         vs_tokens,
                         ps_tokens,
                         alpha_test_func,
                         fog_mode,
+                        ffp_stages,
+                        specular_enabled,
                     }
                 }
                 other => return Err(format!("unknown shader recipe tag {other}")),
@@ -156,6 +166,38 @@ impl ShaderRecipeCache {
             fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
         Self::deserialize(&bytes)
     }
+}
+
+fn encode_stages(buf: &mut Vec<u8>, stages: &[TextureStageKey; MAX_FFP_STAGES]) {
+    for stage in stages {
+        buf.push(stage.color_op);
+        buf.push(stage.color_arg1);
+        buf.push(stage.color_arg2);
+        buf.push(stage.alpha_op);
+        buf.push(stage.alpha_arg1);
+        buf.push(stage.alpha_arg2);
+        buf.push(stage.texcoord_index);
+        buf.push(u8::from(stage.tex_bound));
+        buf.push(stage.tex_transform_dim);
+    }
+}
+
+fn decode_stages(cur: &mut ByteCursor<'_>) -> Result<[TextureStageKey; MAX_FFP_STAGES], String> {
+    let mut stages = [TextureStageKey::default(); MAX_FFP_STAGES];
+    for stage in &mut stages {
+        *stage = TextureStageKey {
+            color_op: cur.read_u8()?,
+            color_arg1: cur.read_u8()?,
+            color_arg2: cur.read_u8()?,
+            alpha_op: cur.read_u8()?,
+            alpha_arg1: cur.read_u8()?,
+            alpha_arg2: cur.read_u8()?,
+            texcoord_index: cur.read_u8()?,
+            tex_bound: cur.read_bool()?,
+            tex_transform_dim: cur.read_u8()?,
+        };
+    }
+    Ok(stages)
 }
 
 fn fnv1a_64(data: &[u8]) -> u64 {

@@ -64,6 +64,7 @@ type GLsizei = i32;
 type GLboolean = u8;
 type GLfloat = f32;
 type GLbitfield = u32;
+type GLintptr = isize;
 type GLsizeiptr = isize;
 
 const GL_FALSE: GLboolean = 0;
@@ -249,6 +250,7 @@ struct Gles3Functions {
     gl_delete_buffers: unsafe extern "C" fn(GLsizei, *const GLuint),
     gl_bind_buffer: unsafe extern "C" fn(GLenum, GLuint),
     gl_buffer_data: unsafe extern "C" fn(GLenum, GLsizeiptr, *const c_void, GLenum),
+    gl_buffer_sub_data: unsafe extern "C" fn(GLenum, GLintptr, GLsizeiptr, *const c_void),
     gl_gen_vertex_arrays: unsafe extern "C" fn(GLsizei, *mut GLuint),
     gl_delete_vertex_arrays: unsafe extern "C" fn(GLsizei, *const GLuint),
     gl_bind_vertex_array: unsafe extern "C" fn(GLuint),
@@ -359,6 +361,7 @@ impl Gles3Functions {
             gl_delete_buffers: sym!(c"glDeleteBuffers"),
             gl_bind_buffer: sym!(c"glBindBuffer"),
             gl_buffer_data: sym!(c"glBufferData"),
+            gl_buffer_sub_data: sym!(c"glBufferSubData"),
             gl_gen_vertex_arrays: sym!(c"glGenVertexArrays"),
             gl_delete_vertex_arrays: sym!(c"glDeleteVertexArrays"),
             gl_bind_vertex_array: sym!(c"glBindVertexArray"),
@@ -439,6 +442,7 @@ struct GlBuffer {
     data: Vec<u8>,
     fvf: u32,
     format: u32,
+    gl_usage: GLenum,
 }
 
 struct CompiledProgram {
@@ -718,12 +722,19 @@ impl Gles3Backend {
     ) -> Option<ShaderRecipe> {
         let ffp_key = FfpShaderKey::from_state(state);
         let recipe = if shaders.vs_tokens.is_some() || shaders.ps_tokens.is_some() {
+            let (ffp_stages, specular_enabled) = if shaders.ps_tokens.is_none() {
+                (ffp_key.stages, ffp_key.specular_enabled)
+            } else {
+                ([crate::shader_ffp::TextureStageKey::default(); MAX_FFP_STAGES], false)
+            };
             ShaderRecipe::Programmable {
                 decl_tokens: shaders.vs_decl_tokens.unwrap_or(&[]).to_vec(),
                 vs_tokens: shaders.vs_tokens.unwrap_or(&[]).to_vec(),
                 ps_tokens: shaders.ps_tokens.unwrap_or(&[]).to_vec(),
                 alpha_test_func: ffp_key.alpha_test_func,
                 fog_mode: ffp_key.fog_mode,
+                ffp_stages,
+                specular_enabled,
             }
         } else {
             ShaderRecipe::Ffp(ffp_key)
@@ -1118,26 +1129,11 @@ impl RenderBackend for Gles3Backend {
                 data: Vec::new(),
                 fvf,
                 format: 0,
+                gl_usage: 0,
             }
         });
         entry.fvf = fvf;
-        entry.data.clear();
-        entry.data.extend_from_slice(data);
-        let gl_usage = if (usage & D3DUSAGE_DYNAMIC) != 0 {
-            GL_DYNAMIC_DRAW
-        } else {
-            GL_STATIC_DRAW
-        };
-        unsafe {
-            (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, entry.id);
-            (self.gl.gl_buffer_data)(
-                GL_ARRAY_BUFFER,
-                data.len() as GLsizeiptr,
-                data.as_ptr().cast(),
-                gl_usage,
-            );
-            (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, 0);
-        }
+        upload_gl_buffer(&self.gl, entry, GL_ARRAY_BUFFER, data, usage);
     }
 
     fn on_vb_destroy(&mut self, vb_handle: u32) {
@@ -1159,26 +1155,11 @@ impl RenderBackend for Gles3Backend {
                 data: Vec::new(),
                 fvf: 0,
                 format,
+                gl_usage: 0,
             }
         });
         entry.format = format;
-        entry.data.clear();
-        entry.data.extend_from_slice(data);
-        let gl_usage = if (usage & D3DUSAGE_DYNAMIC) != 0 {
-            GL_DYNAMIC_DRAW
-        } else {
-            GL_STATIC_DRAW
-        };
-        unsafe {
-            (self.gl.gl_bind_buffer)(GL_ELEMENT_ARRAY_BUFFER, entry.id);
-            (self.gl.gl_buffer_data)(
-                GL_ELEMENT_ARRAY_BUFFER,
-                data.len() as GLsizeiptr,
-                data.as_ptr().cast(),
-                gl_usage,
-            );
-            (self.gl.gl_bind_buffer)(GL_ELEMENT_ARRAY_BUFFER, 0);
-        }
+        upload_gl_buffer(&self.gl, entry, GL_ELEMENT_ARRAY_BUFFER, data, usage);
     }
 
     fn on_ib_destroy(&mut self, ib_handle: u32) {
@@ -1430,6 +1411,34 @@ fn fit_aspect_viewport(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (GLint
     }
 }
 
+fn upload_gl_buffer(
+    gl: &Gles3Functions,
+    entry: &mut GlBuffer,
+    target: GLenum,
+    data: &[u8],
+    usage: u32,
+) {
+    let gl_usage = if (usage & D3DUSAGE_DYNAMIC) != 0 {
+        GL_DYNAMIC_DRAW
+    } else {
+        GL_STATIC_DRAW
+    };
+    let can_sub_data =
+        !data.is_empty() && entry.data.len() == data.len() && entry.gl_usage == gl_usage;
+    entry.data.clear();
+    entry.data.extend_from_slice(data);
+    entry.gl_usage = gl_usage;
+    unsafe {
+        (gl.gl_bind_buffer)(target, entry.id);
+        if can_sub_data {
+            (gl.gl_buffer_sub_data)(target, 0, data.len() as GLsizeiptr, data.as_ptr().cast());
+        } else {
+            (gl.gl_buffer_data)(target, data.len() as GLsizeiptr, data.as_ptr().cast(), gl_usage);
+        }
+        (gl.gl_bind_buffer)(target, 0);
+    }
+}
+
 fn build_glsl_for_recipe(recipe: &ShaderRecipe) -> Result<(String, String), String> {
     match recipe {
         ShaderRecipe::Ffp(key) => {
@@ -1442,6 +1451,8 @@ fn build_glsl_for_recipe(recipe: &ShaderRecipe) -> Result<(String, String), Stri
             ps_tokens,
             alpha_test_func,
             fog_mode,
+            ffp_stages,
+            specular_enabled,
         } => {
             let decl = if decl_tokens.is_empty() {
                 Vec::new()
@@ -1465,12 +1476,13 @@ fn build_glsl_for_recipe(recipe: &ShaderRecipe) -> Result<(String, String), Stri
                 }
                 translate_ps_1_x(ps_tokens, *alpha_test_func, *fog_mode)?
             } else {
-                let mut ffp = FfpShaderKey {
+                let ffp = FfpShaderKey {
                     alpha_test_func: *alpha_test_func,
                     fog_mode: *fog_mode,
+                    specular_enabled: *specular_enabled,
+                    stages: *ffp_stages,
                     ..Default::default()
                 };
-                ffp.stages[0].tex_bound = true;
                 if !vs_tokens.is_empty() {
                     vs_glsl = adapt_asm_vs_to_ffp_inputs(&vs_glsl);
                 }
@@ -2056,5 +2068,58 @@ fn map_min_filter(min_filter: u32, mip_filter: u32, has_mips: bool) -> GLenum {
         (true, D3DTEXF_POINT) => GL_LINEAR_MIPMAP_NEAREST,
         (false, _) => GL_NEAREST_MIPMAP_LINEAR,
         (true, _) => GL_LINEAR_MIPMAP_LINEAR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_glsl_for_recipe;
+    use crate::shader_cache::ShaderRecipe;
+    use crate::shader_ffp::{MAX_FFP_STAGES, TextureStageKey};
+
+    #[test]
+    fn programmable_vs_with_empty_ps_preserves_ffp_stages() {
+        let mut ffp_stages = [TextureStageKey::default(); MAX_FFP_STAGES];
+        ffp_stages[0] = TextureStageKey {
+            color_op: 4,
+            color_arg1: 0,
+            color_arg2: 2,
+            alpha_op: 2,
+            alpha_arg1: 2,
+            alpha_arg2: 1,
+            texcoord_index: 0,
+            tex_bound: true,
+            tex_transform_dim: 0,
+        };
+        ffp_stages[1].color_op = 1;
+
+        let recipe = ShaderRecipe::Programmable {
+            decl_tokens: vec![0x2000_0000, 0x4002_0000, 0x4001_0007, 0xFFFF_FFFF],
+            vs_tokens: vec![
+                0xFFFE_0101,
+                1,
+                0xC00F_0000,
+                0x90E4_0000,
+                1,
+                0xD00F_0000,
+                0x90E4_0000,
+                1,
+                0xE003_0000,
+                0x90E4_0007,
+                0xFFFF,
+            ],
+            ps_tokens: Vec::new(),
+            alpha_test_func: 5,
+            fog_mode: 0,
+            ffp_stages,
+            specular_enabled: false,
+        };
+
+        let (vs_glsl, fs_glsl) = build_glsl_for_recipe(&recipe).unwrap();
+        assert!(vs_glsl.contains("out vec4 v_diffuse;"));
+        assert!(vs_glsl.contains("out vec4 v_tex0;"));
+        assert!(fs_glsl.contains("texture(u_tex0, v_tex0.xy)"));
+        assert!(fs_glsl.contains("!(current.a > u_alpha_ref)"));
+        assert!(fs_glsl.contains("v_diffuse"));
     }
 }

@@ -3,7 +3,7 @@ use toluca_d3d8::shader_asm::{
     VertexDeclElement, parse_vertex_declaration, translate_ps_1_x, translate_vs_1_x,
 };
 use toluca_d3d8::shader_cache::{ShaderRecipe, ShaderRecipeCache};
-use toluca_d3d8::shader_ffp::{FfpShaderKey, generate_ffp_shaders};
+use toluca_d3d8::shader_ffp::{FfpShaderKey, MAX_FFP_STAGES, TextureStageKey, generate_ffp_shaders};
 use toluca_d3d8::state::{DeviceState, LightSlot};
 use toluca_d3d8::types::{
     D3DCMP_GREATER, D3DFOG_LINEAR, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_TEX1, D3DFVF_TEX2,
@@ -292,12 +292,35 @@ fn shader_recipe_cache_roundtrip_dedup_and_corruption() {
         ps_tokens: vec![0xFFFF_0101, SHADER_END_TOKEN],
         alpha_test_func: D3DCMP_GREATER as u8,
         fog_mode: D3DFOG_LINEAR as u8,
+        ffp_stages: [TextureStageKey::default(); MAX_FFP_STAGES],
+        specular_enabled: false,
     }));
-    assert_eq!(cache.len(), 2);
+    let mut custom_stages = [TextureStageKey::default(); MAX_FFP_STAGES];
+    custom_stages[0] = TextureStageKey {
+        color_op: 4,
+        color_arg1: 0,
+        color_arg2: 2,
+        alpha_op: 2,
+        alpha_arg1: 2,
+        alpha_arg2: 1,
+        texcoord_index: 0,
+        tex_bound: true,
+        tex_transform_dim: 0,
+    };
+    assert!(cache.insert(ShaderRecipe::Programmable {
+        decl_tokens: vec![vsd_stream(0), vsd_reg(0, D3DVSDT_FLOAT3), D3DVSD_END],
+        vs_tokens: vec![0xFFFE_0101, SHADER_END_TOKEN],
+        ps_tokens: Vec::new(),
+        alpha_test_func: D3DCMP_GREATER as u8,
+        fog_mode: D3DFOG_LINEAR as u8,
+        ffp_stages: custom_stages,
+        specular_enabled: true,
+    }));
+    assert_eq!(cache.len(), 3);
 
     let bytes = cache.serialize();
     let decoded = ShaderRecipeCache::deserialize(&bytes).unwrap();
-    assert_eq!(decoded.len(), 2);
+    assert_eq!(decoded.len(), 3);
     assert_eq!(decoded.recipes(), cache.recipes());
 
     let mut bad_magic = bytes.clone();
@@ -311,4 +334,44 @@ fn shader_recipe_cache_roundtrip_dedup_and_corruption() {
     let mut bad_payload = bytes.clone();
     bad_payload[15] ^= 0xFF;
     assert!(ShaderRecipeCache::deserialize(&bad_payload).is_err());
+}
+
+#[test]
+fn translate_vs_1_1_mad_ofog_x_writes_scalar_fog() {
+    let decl_tokens = [vsd_stream(0), vsd_reg(0, D3DVSDT_FLOAT3), D3DVSD_END];
+    let decl = parse_vertex_declaration(&decl_tokens).unwrap();
+
+    const OP_MOV: u32 = 1;
+    const OP_MAD: u32 = 4;
+    const REG_TEMP: u32 = 0;
+    const REG_INPUT: u32 = 1;
+    const REG_CONST: u32 = 2;
+    const REG_RASTOUT: u32 = 4;
+    const RAST_POS: u32 = 0;
+    const RAST_FOG: u32 = 1;
+    const SWZ_XYZW: u32 = 0xE4;
+    const SWZ_XXXX: u32 = 0x00;
+    const SWZ_YYYY: u32 = 0x55;
+
+    let tokens = [
+        0xFFFE_0101,
+        OP_MOV,
+        enc_dst(REG_RASTOUT, RAST_POS, 0xF, false, 0),
+        enc_src(REG_INPUT, 0, SWZ_XYZW, 0, false),
+        OP_MOV,
+        enc_dst(REG_TEMP, 0, 0x1, false, 0),
+        enc_src(REG_INPUT, 0, SWZ_XYZW, 0, false),
+        OP_MAD,
+        enc_dst(REG_RASTOUT, RAST_FOG, 0x1, false, 0),
+        enc_src(REG_CONST, 23, SWZ_YYYY, 0, false),
+        enc_src(REG_TEMP, 0, SWZ_XXXX, 0, false),
+        enc_src(REG_CONST, 23, SWZ_XXXX, 0, false),
+        SHADER_END_TOKEN,
+    ];
+
+    let glsl = translate_vs_1_x(&tokens, &decl).unwrap();
+    assert!(glsl.contains("out float v_oFog;"));
+    assert!(glsl.contains("vec4 oFog = vec4(1.0);"));
+    assert!(glsl.contains("oFog.x = (("));
+    assert!(glsl.contains("v_oFog = oFog.x;"));
 }

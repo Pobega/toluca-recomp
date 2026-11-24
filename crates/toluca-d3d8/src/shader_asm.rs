@@ -371,8 +371,8 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
     for t in 0..8 {
         writeln!(glsl, "    vec4 oT{t} = vec4(0.0, 0.0, 0.0, 1.0);").unwrap();
     }
-    writeln!(glsl, "    float oFog = 1.0;").unwrap();
-    writeln!(glsl, "    float oPts = 1.0;").unwrap();
+    writeln!(glsl, "    vec4 oFog = vec4(1.0);").unwrap();
+    writeln!(glsl, "    vec4 oPts = vec4(1.0);").unwrap();
 
     let mut idx = 1usize;
     while idx < tokens.len() {
@@ -396,38 +396,31 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
         let dst_p = decode_param(dst_tok);
         let dst_name = vs_dst_name(dst_p)?;
 
-        if dst_p.reg_type == REG_RASTOUT && dst_p.reg_num > 0 {
-            let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs src0")?)?;
-            idx += 1;
-            let field = if dst_p.reg_num == 1 { "oFog" } else { "oPts" };
-            writeln!(glsl, "    {field} = ({s0}).x;").unwrap();
-            continue;
-        }
-
-        if dst_p.reg_type == REG_ADDR_OR_TEX {
-            let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs src0")?)?;
-            idx += 1;
-            writeln!(glsl, "    a0.x = int(floor(({s0}).x + 0.5));").unwrap();
-            continue;
-        }
+        let emit_vs_dst = |out: &mut String, expr: &str| {
+            if dst_p.reg_type == REG_ADDR_OR_TEX {
+                writeln!(out, "    a0.x = int(floor(({expr}).x + 0.5));").unwrap();
+            } else {
+                emit_masked_assign(out, &dst_name, dst_p, expr, false);
+            }
+        };
 
         match opcode {
             D3DSIO_MOV => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs mov")?)?;
                 idx += 1;
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &s0, false);
+                emit_vs_dst(&mut glsl, &s0);
             }
             D3DSIO_RCP => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs rcp")?)?;
                 idx += 1;
                 let expr = format!("vec4((({s0}).x != 0.0) ? (1.0 / ({s0}).x) : 1e30)");
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &expr, false);
+                emit_vs_dst(&mut glsl, &expr);
             }
             D3DSIO_RSQ => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs rsq")?)?;
                 idx += 1;
                 let expr = format!("vec4(inversesqrt(max(abs(({s0}).x), 1e-12)))");
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &expr, false);
+                emit_vs_dst(&mut glsl, &expr);
             }
             D3DSIO_EXP | D3DSIO_EXPP => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs exp")?)?;
@@ -435,7 +428,7 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
                 let expr = format!(
                     "vec4(exp2(floor(({s0}).x)), fract(({s0}).x), exp2(({s0}).x), 1.0)"
                 );
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &expr, false);
+                emit_vs_dst(&mut glsl, &expr);
             }
             D3DSIO_LOG | D3DSIO_LOGP => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs log")?)?;
@@ -443,7 +436,7 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
                 let expr = format!(
                     "vec4(floor(log2(max(abs(({s0}).x), 1e-12))), max(abs(({s0}).x), 1e-12) / exp2(floor(log2(max(abs(({s0}).x), 1e-12)))), log2(max(abs(({s0}).x), 1e-12)), 1.0)"
                 );
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &expr, false);
+                emit_vs_dst(&mut glsl, &expr);
             }
             D3DSIO_LIT => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs lit")?)?;
@@ -451,12 +444,12 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
                 let expr = format!(
                     "vec4(1.0, max(({s0}).x, 0.0), ((({s0}).x > 0.0 && ({s0}).y > 0.0) ? pow(({s0}).y, clamp(({s0}).w, -128.0, 128.0)) : 0.0), 1.0)"
                 );
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &expr, false);
+                emit_vs_dst(&mut glsl, &expr);
             }
             D3DSIO_FRC => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs frc")?)?;
                 idx += 1;
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &format!("fract({s0})"), false);
+                emit_vs_dst(&mut glsl, &format!("fract({s0})"));
             }
             D3DSIO_ADD | D3DSIO_SUB | D3DSIO_MUL | D3DSIO_DP3 | D3DSIO_DP4 | D3DSIO_MIN
             | D3DSIO_MAX | D3DSIO_SLT | D3DSIO_SGE | D3DSIO_DST => {
@@ -476,20 +469,14 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
                     D3DSIO_DST => format!("vec4(1.0, ({s0}).y * ({s1}).y, ({s0}).z, ({s1}).w)"),
                     _ => unreachable!(),
                 };
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &expr, false);
+                emit_vs_dst(&mut glsl, &expr);
             }
             D3DSIO_MAD => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs mad s0")?)?;
                 let s1 = vs_src_expr(*tokens.get(idx + 1).ok_or("truncated vs mad s1")?)?;
                 let s2 = vs_src_expr(*tokens.get(idx + 2).ok_or("truncated vs mad s2")?)?;
                 idx += 3;
-                emit_masked_assign(
-                    &mut glsl,
-                    &dst_name,
-                    dst_p,
-                    &format!("({s0} * {s1} + {s2})"),
-                    false,
-                );
+                emit_vs_dst(&mut glsl, &format!("({s0} * {s1} + {s2})"));
             }
             D3DSIO_M4X4 | D3DSIO_M4X3 | D3DSIO_M3X4 | D3DSIO_M3X3 | D3DSIO_M3X2 => {
                 let s0 = vs_src_expr(*tokens.get(idx).ok_or("truncated vs mat s0")?)?;
@@ -516,7 +503,7 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
                     parts.push("1.0".to_owned());
                 }
                 let expr = format!("vec4({}, {}, {}, {})", parts[0], parts[1], parts[2], parts[3]);
-                emit_masked_assign(&mut glsl, &dst_name, dst_p, &expr, false);
+                emit_vs_dst(&mut glsl, &expr);
             }
             other => return Err(format!("unsupported vs_1_1 opcode {other}")),
         }
@@ -530,7 +517,7 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
     for t in 0..4 {
         writeln!(glsl, "    v_oT{t} = oT{t};").unwrap();
     }
-    writeln!(glsl, "    v_oFog = oFog;").unwrap();
+    writeln!(glsl, "    v_oFog = oFog.x;").unwrap();
     writeln!(glsl, "}}").unwrap();
     Ok(glsl)
 }

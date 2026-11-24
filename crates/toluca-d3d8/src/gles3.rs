@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::backend::{ActiveShaders, RenderBackend};
 use crate::device::vertex_count_for_primitives;
@@ -9,10 +12,10 @@ use crate::shader_asm::{
     D3DVSDT_SHORT2, D3DVSDT_SHORT4, D3DVSDT_UBYTE4, VertexDeclElement, translate_ps_1_x,
     translate_vs_1_x,
 };
-use crate::shader_cache::{ShaderRecipe, ShaderRecipeCache};
+use crate::shader_cache::{CachedProgramBinary, ShaderRecipe, ShaderRecipeCache};
 use crate::shader_ffp::{
     ATTR_DIFFUSE, ATTR_NORMAL, ATTR_POS, ATTR_SPECULAR, ATTR_TEX0, FfpShaderKey, MAX_FFP_LIGHTS,
-    MAX_FFP_STAGES, generate_ffp_shaders,
+    MAX_FFP_STAGES, TextureStageKey, generate_ffp_shaders,
 };
 use crate::state::DeviceState;
 use crate::texture::PreparedTextureUpload;
@@ -60,6 +63,7 @@ impl PresentTarget for NoopPresentTarget {
 const ASPECT_EPSILON: f64 = 1e-4;
 const ASPECT_RATIO_4_3: f64 = 4.0 / 3.0;
 const ASPECT_RATIO_16_9: f64 = 16.0 / 9.0;
+const CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum AspectMode {
@@ -179,6 +183,8 @@ const GL_TEXTURE_BASE_LEVEL: GLenum = 0x813C;
 const GL_TEXTURE_MAX_LEVEL: GLenum = 0x813D;
 
 const GL_TEXTURE0: GLenum = 0x84C0;
+const GL_RENDERER: GLenum = 0x1F01;
+const GL_VERSION: GLenum = 0x1F02;
 const GL_NUM_EXTENSIONS: GLenum = 0x821D;
 const GL_EXTENSIONS: GLenum = 0x1F03;
 
@@ -192,6 +198,8 @@ const GL_VERTEX_SHADER: GLenum = 0x8B31;
 const GL_COMPILE_STATUS: GLenum = 0x8B81;
 const GL_LINK_STATUS: GLenum = 0x8B82;
 const GL_INFO_LOG_LENGTH: GLenum = 0x8B84;
+const GL_PROGRAM_BINARY_RETRIEVABLE_HINT: GLenum = 0x8257;
+const GL_PROGRAM_BINARY_LENGTH: GLenum = 0x8741;
 
 const GL_FRAMEBUFFER: GLenum = 0x8D40;
 const GL_RENDERBUFFER: GLenum = 0x8D41;
@@ -263,6 +271,10 @@ struct Gles3Functions {
     gl_get_program_info_log: unsafe extern "C" fn(GLuint, GLsizei, *mut GLsizei, *mut c_char),
     gl_delete_program: unsafe extern "C" fn(GLuint),
     gl_use_program: unsafe extern "C" fn(GLuint),
+    gl_program_parameteri: Option<unsafe extern "C" fn(GLuint, GLenum, GLint)>,
+    gl_get_program_binary:
+        Option<unsafe extern "C" fn(GLuint, GLsizei, *mut GLsizei, *mut GLenum, *mut c_void)>,
+    gl_program_binary: Option<unsafe extern "C" fn(GLuint, GLenum, *const c_void, GLsizei)>,
     gl_get_uniform_location: unsafe extern "C" fn(GLuint, *const c_char) -> GLint,
     gl_uniform1i: unsafe extern "C" fn(GLint, GLint),
     gl_uniform1f: unsafe extern "C" fn(GLint, GLfloat),
@@ -298,8 +310,30 @@ struct Gles3Functions {
         GLenum,
         *const c_void,
     ),
+    gl_tex_sub_image2d: unsafe extern "C" fn(
+        GLenum,
+        GLint,
+        GLint,
+        GLint,
+        GLsizei,
+        GLsizei,
+        GLenum,
+        GLenum,
+        *const c_void,
+    ),
     gl_compressed_tex_image2d:
         unsafe extern "C" fn(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, *const c_void),
+    gl_compressed_tex_sub_image2d: unsafe extern "C" fn(
+        GLenum,
+        GLint,
+        GLint,
+        GLint,
+        GLsizei,
+        GLsizei,
+        GLenum,
+        GLsizei,
+        *const c_void,
+    ),
     gl_tex_parameteri: unsafe extern "C" fn(GLenum, GLenum, GLint),
     gl_gen_framebuffers: unsafe extern "C" fn(GLsizei, *mut GLuint),
     gl_delete_framebuffers: unsafe extern "C" fn(GLsizei, *const GLuint),
@@ -333,15 +367,19 @@ impl Gles3Functions {
                 unsafe { std::mem::transmute_copy(&ptr) }
             }};
         }
-        let gl_get_stringi = resolve_gl_proc(get_proc, lib_gles, c"glGetStringi")
-            .map(|ptr| unsafe { std::mem::transmute_copy(&ptr) });
+        macro_rules! opt_sym {
+            ($name:expr) => {{
+                resolve_gl_proc(get_proc, lib_gles, $name)
+                    .map(|ptr| unsafe { std::mem::transmute_copy(&ptr) })
+            }};
+        }
 
         Ok(Self {
             lib_gles,
             gl_get_error: sym!(c"glGetError"),
             gl_get_integerv: sym!(c"glGetIntegerv"),
             gl_get_string: sym!(c"glGetString"),
-            gl_get_stringi,
+            gl_get_stringi: opt_sym!(c"glGetStringi"),
             gl_enable: sym!(c"glEnable"),
             gl_disable: sym!(c"glDisable"),
             gl_viewport: sym!(c"glViewport"),
@@ -374,6 +412,9 @@ impl Gles3Functions {
             gl_get_program_info_log: sym!(c"glGetProgramInfoLog"),
             gl_delete_program: sym!(c"glDeleteProgram"),
             gl_use_program: sym!(c"glUseProgram"),
+            gl_program_parameteri: opt_sym!(c"glProgramParameteri"),
+            gl_get_program_binary: opt_sym!(c"glGetProgramBinary"),
+            gl_program_binary: opt_sym!(c"glProgramBinary"),
             gl_get_uniform_location: sym!(c"glGetUniformLocation"),
             gl_uniform1i: sym!(c"glUniform1i"),
             gl_uniform1f: sym!(c"glUniform1f"),
@@ -398,7 +439,9 @@ impl Gles3Functions {
             gl_active_texture: sym!(c"glActiveTexture"),
             gl_bind_texture: sym!(c"glBindTexture"),
             gl_tex_image2d: sym!(c"glTexImage2D"),
+            gl_tex_sub_image2d: sym!(c"glTexSubImage2D"),
             gl_compressed_tex_image2d: sym!(c"glCompressedTexImage2D"),
+            gl_compressed_tex_sub_image2d: sym!(c"glCompressedTexSubImage2D"),
             gl_tex_parameteri: sym!(c"glTexParameteri"),
             gl_gen_framebuffers: sym!(c"glGenFramebuffers"),
             gl_delete_framebuffers: sym!(c"glDeleteFramebuffers"),
@@ -458,6 +501,11 @@ fn resolve_gl_proc(
 struct GlTexture {
     id: GLuint,
     max_level: u32,
+    levels: HashMap<u32, (u32, u32, GLenum)>,
+    wrap_s: GLenum,
+    wrap_t: GLenum,
+    mag_filter: GLenum,
+    min_filter: GLenum,
 }
 
 struct GlBuffer {
@@ -468,10 +516,82 @@ struct GlBuffer {
     gl_usage: GLenum,
 }
 
+struct GlStateCache {
+    current_program: Option<GLuint>,
+    active_tex_unit: Option<u32>,
+    bound_textures: [Option<GLuint>; MAX_FFP_STAGES],
+}
+
+impl Default for GlStateCache {
+    fn default() -> Self {
+        Self {
+            current_program: None,
+            active_tex_unit: None,
+            bound_textures: [None; MAX_FFP_STAGES],
+        }
+    }
+}
+
+impl GlStateCache {
+    fn invalidate_all(&mut self) {
+        *self = Self::default();
+    }
+
+    fn use_program(&mut self, gl: &Gles3Functions, program: GLuint) {
+        if self.current_program != Some(program) {
+            unsafe {
+                (gl.gl_use_program)(program);
+            }
+            self.current_program = Some(program);
+        }
+    }
+
+    fn set_active_texture(&mut self, gl: &Gles3Functions, stage: u32) {
+        if self.active_tex_unit != Some(stage) {
+            unsafe {
+                (gl.gl_active_texture)(GL_TEXTURE0 + stage);
+            }
+            self.active_tex_unit = Some(stage);
+        }
+    }
+
+    fn bind_texture(&mut self, gl: &Gles3Functions, stage: u32, tex_id: GLuint) {
+        let idx = stage as usize;
+        if self.bound_textures[idx] == Some(tex_id) {
+            return;
+        }
+        self.set_active_texture(gl, stage);
+        unsafe {
+            (gl.gl_bind_texture)(GL_TEXTURE_2D, tex_id);
+        }
+        self.bound_textures[idx] = Some(tex_id);
+    }
+
+    fn bind_texture_active(&mut self, gl: &Gles3Functions, stage: u32, tex_id: GLuint) {
+        self.set_active_texture(gl, stage);
+        let idx = stage as usize;
+        if self.bound_textures[idx] != Some(tex_id) {
+            unsafe {
+                (gl.gl_bind_texture)(GL_TEXTURE_2D, tex_id);
+            }
+            self.bound_textures[idx] = Some(tex_id);
+        }
+    }
+
+    fn invalidate_texture(&mut self, tex_id: GLuint) {
+        for slot in &mut self.bound_textures {
+            if *slot == Some(tex_id) {
+                *slot = None;
+            }
+        }
+    }
+}
+
 struct CompiledProgram {
     program: GLuint,
     u_world: GLint,
     u_view: GLint,
+    u_inv_view: GLint,
     u_proj: GLint,
     u_tex_mats: [GLint; MAX_FFP_STAGES],
     u_viewport: GLint,
@@ -498,9 +618,15 @@ struct CompiledProgram {
     u_pc: GLint,
 }
 
+struct ProgramEntry {
+    recipe: ShaderRecipe,
+    compiled: CompiledProgram,
+}
+
 pub struct Gles3Backend {
     gl: Gles3Functions,
     present_target: Box<dyn PresentTarget>,
+    driver_id: String,
     max_tex_size: u32,
     s3tc_supported: bool,
     fbo: GLuint,
@@ -517,9 +643,16 @@ pub struct Gles3Backend {
     textures: HashMap<u32, GlTexture>,
     vbos: HashMap<u32, GlBuffer>,
     ibos: HashMap<u32, GlBuffer>,
-    programs: HashMap<ShaderRecipe, CompiledProgram>,
+    programs: Vec<ProgramEntry>,
+    program_buckets: HashMap<u64, Vec<usize>>,
+    state_cache: GlStateCache,
+    last_view: Option<[f32; 16]>,
+    last_inv_view: [f32; 16],
     recipe_cache: ShaderRecipeCache,
     recipe_cache_path: Option<PathBuf>,
+    cache_dirty: bool,
+    last_cache_change: Instant,
+    last_cache_save: Instant,
     aspect_mode: AspectMode,
     pub draw_calls: u64,
     pub present_calls: u64,
@@ -532,10 +665,11 @@ impl Gles3Backend {
         recipe_cache_path: Option<PathBuf>,
     ) -> Result<Self, String> {
         let gl = Gles3Functions::load(get_proc)?;
+        let driver_id = query_driver_id(&gl);
         let max_tex_size = query_max_texture_size(&gl);
         let s3tc_supported = query_s3tc_support(&gl);
 
-        let present_program = compile_and_link_program(&gl, PRESENT_VS_GLSL, PRESENT_FS_GLSL)?;
+        let present_program = compile_and_link_program(&gl, PRESENT_VS_GLSL, PRESENT_FS_GLSL, false)?;
         let present_tex_loc = get_uniform_loc(&gl, present_program, "u_tex0");
 
         let mut present_vao = 0;
@@ -549,9 +683,14 @@ impl Gles3Backend {
             (gl.gl_gen_buffers)(1, &mut up_ibo);
         }
 
+        let now = Instant::now();
+        let mut recipe_cache = ShaderRecipeCache::new();
+        recipe_cache.set_driver_id(driver_id.clone());
+
         let mut backend = Self {
             gl,
             present_target,
+            driver_id,
             max_tex_size,
             s3tc_supported,
             fbo: 0,
@@ -568,9 +707,16 @@ impl Gles3Backend {
             textures: HashMap::new(),
             vbos: HashMap::new(),
             ibos: HashMap::new(),
-            programs: HashMap::new(),
-            recipe_cache: ShaderRecipeCache::new(),
+            programs: Vec::new(),
+            program_buckets: HashMap::new(),
+            state_cache: GlStateCache::default(),
+            last_view: None,
+            last_inv_view: IDENTITY_4X4,
+            recipe_cache,
             recipe_cache_path: recipe_cache_path.clone(),
+            cache_dirty: false,
+            last_cache_change: now,
+            last_cache_save: now,
             aspect_mode: AspectMode::default(),
             draw_calls: 0,
             present_calls: 0,
@@ -594,19 +740,47 @@ impl Gles3Backend {
     }
 
     pub fn load_recipe_cache(&mut self, path: &Path) -> Result<usize, String> {
-        let loaded = ShaderRecipeCache::load_from_file(path)?;
+        let mut loaded = ShaderRecipeCache::load_from_file(path)?;
+        let driver_matched = loaded.validate_driver_id(&self.driver_id);
+        self.recipe_cache = loaded;
+        if !driver_matched {
+            self.cache_dirty = true;
+            self.last_cache_change = Instant::now();
+        }
         let mut compiled = 0usize;
-        for recipe in loaded.recipes() {
-            if self.ensure_program_compiled(recipe).is_ok() {
+        let total = self.recipe_cache.len();
+        for idx in 0..total {
+            let recipe = self.recipe_cache.recipes()[idx].clone();
+            let cached_bin = self.recipe_cache.binary_at(idx).cloned();
+            if self
+                .compile_and_register_program(recipe, cached_bin.as_ref())
+                .is_ok()
+            {
                 compiled += 1;
             }
         }
-        self.recipe_cache = loaded;
         Ok(compiled)
     }
 
     pub fn save_recipe_cache(&self, path: &Path) -> Result<(), String> {
         self.recipe_cache.save_to_file(path)
+    }
+
+    fn flush_recipe_cache_if_needed(&mut self) {
+        if !self.cache_dirty {
+            return;
+        }
+        let Some(path) = self.recipe_cache_path.as_deref() else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(self.last_cache_change) >= CACHE_FLUSH_INTERVAL
+            && now.duration_since(self.last_cache_save) >= CACHE_FLUSH_INTERVAL
+            && self.recipe_cache.save_to_file(path).is_ok()
+        {
+            self.cache_dirty = false;
+            self.last_cache_save = now;
+        }
     }
 
     pub fn readback_rgba8(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -652,7 +826,9 @@ impl Gles3Backend {
         let mut depth_rbo = 0;
         unsafe {
             (self.gl.gl_gen_textures)(1, &mut color_tex);
-            (self.gl.gl_bind_texture)(GL_TEXTURE_2D, color_tex);
+        }
+        self.state_cache.bind_texture_active(&self.gl, 0, color_tex);
+        unsafe {
             (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as GLint);
             (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as GLint);
             (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as GLint);
@@ -668,8 +844,9 @@ impl Gles3Backend {
                 GL_UNSIGNED_BYTE,
                 std::ptr::null(),
             );
-            (self.gl.gl_bind_texture)(GL_TEXTURE_2D, 0);
-
+        }
+        self.state_cache.bind_texture(&self.gl, 0, 0);
+        unsafe {
             (self.gl.gl_gen_renderbuffers)(1, &mut depth_rbo);
             (self.gl.gl_bind_renderbuffer)(GL_RENDERBUFFER, depth_rbo);
             (self.gl.gl_renderbuffer_storage)(
@@ -717,6 +894,7 @@ impl Gles3Backend {
                 self.fbo = 0;
             }
             if self.fbo_color_tex != 0 {
+                self.state_cache.invalidate_texture(self.fbo_color_tex);
                 (self.gl.gl_delete_textures)(1, &self.fbo_color_tex);
                 self.fbo_color_tex = 0;
             }
@@ -727,67 +905,198 @@ impl Gles3Backend {
         }
     }
 
-    fn ensure_program_compiled(&mut self, recipe: &ShaderRecipe) -> Result<(), String> {
-        if self.programs.contains_key(recipe) {
-            return Ok(());
+    fn find_program_ffp(&self, hash: u64, key: &FfpShaderKey) -> Option<usize> {
+        let bucket = self.program_buckets.get(&hash)?;
+        bucket.iter().copied().find(|&idx| {
+            matches!(&self.programs[idx].recipe, ShaderRecipe::Ffp(k) if k == key)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_program_prog(
+        &self,
+        hash: u64,
+        decl_tokens: &[u32],
+        vs_tokens: &[u32],
+        ps_tokens: &[u32],
+        alpha_test_func: u8,
+        fog_mode: u8,
+        ffp_stages: &[TextureStageKey; MAX_FFP_STAGES],
+        specular_enabled: bool,
+    ) -> Option<usize> {
+        let bucket = self.program_buckets.get(&hash)?;
+        bucket.iter().copied().find(|&idx| {
+            matches!(
+                &self.programs[idx].recipe,
+                ShaderRecipe::Programmable {
+                    decl_tokens: d,
+                    vs_tokens: v,
+                    ps_tokens: p,
+                    alpha_test_func: a,
+                    fog_mode: f,
+                    ffp_stages: s,
+                    specular_enabled: sp,
+                } if d.as_slice() == decl_tokens
+                    && v.as_slice() == vs_tokens
+                    && p.as_slice() == ps_tokens
+                    && *a == alpha_test_func
+                    && *f == fog_mode
+                    && s == ffp_stages
+                    && *sp == specular_enabled
+            )
+        })
+    }
+
+    fn compile_and_register_program(
+        &mut self,
+        recipe: ShaderRecipe,
+        cached_bin: Option<&CachedProgramBinary>,
+    ) -> Result<usize, String> {
+        let hash = hash_recipe(&recipe);
+        if let Some(bucket) = self.program_buckets.get(&hash) {
+            if let Some(&existing) = bucket.iter().find(|&&i| self.programs[i].recipe == recipe) {
+                return Ok(existing);
+            }
         }
 
-        let (vs_glsl, fs_glsl) = build_glsl_for_recipe(recipe)?;
-        let program = compile_and_link_program(&self.gl, &vs_glsl, &fs_glsl)?;
+        let mut program_from_bin = None;
+        if let Some(bin) = cached_bin {
+            program_from_bin = load_program_from_binary(&self.gl, bin);
+        }
+
+        let (program, newly_compiled) = if let Some(prog) = program_from_bin {
+            (prog, false)
+        } else {
+            let (vs_glsl, fs_glsl) = build_glsl_for_recipe(&recipe)?;
+            let prog = compile_and_link_program(&self.gl, &vs_glsl, &fs_glsl, true)?;
+            (prog, true)
+        };
+
         let compiled = CompiledProgram::from_program(&self.gl, program);
+        self.state_cache.use_program(&self.gl, program);
         unsafe {
-            (self.gl.gl_use_program)(program);
             for (stage, &loc) in compiled.u_tex.iter().enumerate() {
                 if loc >= 0 {
                     (self.gl.gl_uniform1i)(loc, stage as GLint);
                 }
             }
         }
-        self.programs.insert(recipe.clone(), compiled);
-        self.recipe_cache.insert(recipe.clone());
-        Ok(())
+
+        let is_new_recipe = self.recipe_cache.insert(recipe.clone());
+        if newly_compiled {
+            if let Some(bin) = capture_program_binary(&self.gl, program) {
+                self.recipe_cache.set_binary(&recipe, bin);
+            }
+            self.cache_dirty = true;
+            self.last_cache_change = Instant::now();
+        } else if is_new_recipe {
+            self.cache_dirty = true;
+            self.last_cache_change = Instant::now();
+        }
+
+        let idx = self.programs.len();
+        self.programs.push(ProgramEntry { recipe, compiled });
+        self.program_buckets.entry(hash).or_default().push(idx);
+        Ok(idx)
     }
 
     fn bind_pipeline_and_uniforms(
         &mut self,
         state: &DeviceState,
         shaders: &ActiveShaders<'_>,
-    ) -> Option<ShaderRecipe> {
+    ) -> Option<usize> {
         let ffp_key = FfpShaderKey::from_state(state);
-        let recipe = if shaders.vs_tokens.is_some() || shaders.ps_tokens.is_some() {
+        let prog_idx = if shaders.vs_tokens.is_some() || shaders.ps_tokens.is_some() {
+            let decl_tokens = shaders.vs_decl_tokens.unwrap_or(&[]);
+            let vs_tokens = shaders.vs_tokens.unwrap_or(&[]);
+            let ps_tokens = shaders.ps_tokens.unwrap_or(&[]);
             let (ffp_stages, specular_enabled) = if shaders.ps_tokens.is_none() {
                 (ffp_key.stages, ffp_key.specular_enabled)
             } else {
-                ([crate::shader_ffp::TextureStageKey::default(); MAX_FFP_STAGES], false)
+                ([TextureStageKey::default(); MAX_FFP_STAGES], false)
             };
-            ShaderRecipe::Programmable {
-                decl_tokens: shaders.vs_decl_tokens.unwrap_or(&[]).to_vec(),
-                vs_tokens: shaders.vs_tokens.unwrap_or(&[]).to_vec(),
-                ps_tokens: shaders.ps_tokens.unwrap_or(&[]).to_vec(),
-                alpha_test_func: ffp_key.alpha_test_func,
-                fog_mode: ffp_key.fog_mode,
-                ffp_stages,
+            let hash = hash_prog_parts(
+                decl_tokens,
+                vs_tokens,
+                ps_tokens,
+                ffp_key.alpha_test_func,
+                ffp_key.fog_mode,
+                &ffp_stages,
                 specular_enabled,
+            );
+            if let Some(idx) = self.find_program_prog(
+                hash,
+                decl_tokens,
+                vs_tokens,
+                ps_tokens,
+                ffp_key.alpha_test_func,
+                ffp_key.fog_mode,
+                &ffp_stages,
+                specular_enabled,
+            ) {
+                idx
+            } else {
+                let recipe = ShaderRecipe::Programmable {
+                    decl_tokens: decl_tokens.to_vec(),
+                    vs_tokens: vs_tokens.to_vec(),
+                    ps_tokens: ps_tokens.to_vec(),
+                    alpha_test_func: ffp_key.alpha_test_func,
+                    fog_mode: ffp_key.fog_mode,
+                    ffp_stages,
+                    specular_enabled,
+                };
+                match self.compile_and_register_program(recipe, None) {
+                    Ok(idx) => idx,
+                    Err(err) => {
+                        eprintln!("[gles3] shader compilation failed: {err}");
+                        return None;
+                    }
+                }
             }
         } else {
-            ShaderRecipe::Ffp(ffp_key)
+            let hash = hash_ffp_key(&ffp_key);
+            if let Some(idx) = self.find_program_ffp(hash, &ffp_key) {
+                idx
+            } else {
+                let recipe = ShaderRecipe::Ffp(ffp_key);
+                match self.compile_and_register_program(recipe, None) {
+                    Ok(idx) => idx,
+                    Err(err) => {
+                        eprintln!("[gles3] shader compilation failed: {err}");
+                        return None;
+                    }
+                }
+            }
         };
-
-        if let Err(err) = self.ensure_program_compiled(&recipe) {
-            eprintln!("[gles3] shader compilation failed: {err}");
-            return None;
-        }
 
         unsafe {
             (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, self.fbo);
             apply_render_states(&self.gl, state, self.fbo_height);
-            bind_textures(&self.gl, &self.textures, state);
-            if let Some(prog) = self.programs.get(&recipe) {
-                (self.gl.gl_use_program)(prog.program);
-                upload_uniforms(&self.gl, prog, state);
-            }
         }
-        Some(recipe)
+        bind_textures(&self.gl, &mut self.textures, &mut self.state_cache, state);
+        let prog_id = self.programs[prog_idx].compiled.program;
+        self.state_cache.use_program(&self.gl, prog_id);
+
+        let view = state.get_transform(D3DTS_VIEW);
+        let inv_view = if self.programs[prog_idx].compiled.u_inv_view >= 0 {
+            if self.last_view.as_ref() != Some(&view) {
+                self.last_inv_view = invert_4x4(&view);
+                self.last_view = Some(view);
+            }
+            Some(&self.last_inv_view)
+        } else {
+            None
+        };
+        unsafe {
+            upload_uniforms(
+                &self.gl,
+                &self.programs[prog_idx].compiled,
+                state,
+                &view,
+                inv_view,
+            );
+        }
+        Some(prog_idx)
     }
 
     fn setup_fvf_attributes(&self, fvf: u32, stride: u32, base_byte_offset: usize) {
@@ -963,8 +1272,10 @@ impl Gles3Backend {
 
 impl Drop for Gles3Backend {
     fn drop(&mut self) {
-        if let Some(path) = self.recipe_cache_path.as_deref() {
-            let _ = self.save_recipe_cache(path);
+        if self.cache_dirty {
+            if let Some(path) = self.recipe_cache_path.as_deref() {
+                let _ = self.save_recipe_cache(path);
+            }
         }
         self.destroy_fbo();
         unsafe {
@@ -989,8 +1300,8 @@ impl Drop for Gles3Backend {
             for buf in self.vbos.values().chain(self.ibos.values()) {
                 (self.gl.gl_delete_buffers)(1, &buf.id);
             }
-            for prog in self.programs.values() {
-                (self.gl.gl_delete_program)(prog.program);
+            for entry in &self.programs {
+                (self.gl.gl_delete_program)(entry.compiled.program);
             }
         }
     }
@@ -1068,13 +1379,37 @@ impl RenderBackend for Gles3Backend {
     }
 
     fn on_texture_upload(&mut self, tex_handle: u32, level: u32, upload: &PreparedTextureUpload) {
-        let entry = self.textures.entry(tex_handle).or_insert_with(|| {
-            let mut id = 0;
+        let mut created = false;
+        let tex_id = self
+            .textures
+            .entry(tex_handle)
+            .or_insert_with(|| {
+                created = true;
+                let mut id = 0;
+                unsafe {
+                    (self.gl.gl_gen_textures)(1, &mut id);
+                }
+                GlTexture {
+                    id,
+                    max_level: 0,
+                    levels: HashMap::new(),
+                    wrap_s: GL_REPEAT,
+                    wrap_t: GL_REPEAT,
+                    mag_filter: GL_NEAREST,
+                    min_filter: GL_NEAREST,
+                }
+            })
+            .id;
+
+        self.state_cache.bind_texture_active(&self.gl, 0, tex_id);
+        let entry = self.textures.get_mut(&tex_handle).unwrap();
+
+        if created {
             unsafe {
-                (self.gl.gl_gen_textures)(1, &mut id);
-                (self.gl.gl_bind_texture)(GL_TEXTURE_2D, id);
                 (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
                 (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT as GLint);
+                (self.gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT as GLint);
                 (self.gl.gl_tex_parameteri)(
                     GL_TEXTURE_2D,
                     GL_TEXTURE_MIN_FILTER,
@@ -1086,34 +1421,53 @@ impl RenderBackend for Gles3Backend {
                     GL_NEAREST as GLint,
                 );
             }
-            GlTexture { id, max_level: 0 }
-        });
+        }
         if level > entry.max_level {
             entry.max_level = level;
+            unsafe {
+                (self.gl.gl_tex_parameteri)(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_MAX_LEVEL,
+                    entry.max_level as GLint,
+                );
+            }
         }
 
         unsafe {
-            (self.gl.gl_bind_texture)(GL_TEXTURE_2D, entry.id);
-            (self.gl.gl_tex_parameteri)(
-                GL_TEXTURE_2D,
-                GL_TEXTURE_MAX_LEVEL,
-                entry.max_level as GLint,
-            );
             (self.gl.gl_pixel_storei)(GL_UNPACK_ALIGNMENT, 1);
 
             match upload {
                 PreparedTextureUpload::Rgba8(img) => {
-                    (self.gl.gl_tex_image2d)(
-                        GL_TEXTURE_2D,
-                        level as GLint,
-                        GL_RGBA8 as GLint,
-                        img.width as GLsizei,
-                        img.height as GLsizei,
-                        0,
-                        GL_RGBA,
-                        GL_UNSIGNED_BYTE,
-                        img.pixels.as_ptr().cast(),
-                    );
+                    let can_sub = entry.levels.get(&level)
+                        == Some(&(img.width, img.height, GL_RGBA8));
+                    if can_sub {
+                        (self.gl.gl_tex_sub_image2d)(
+                            GL_TEXTURE_2D,
+                            level as GLint,
+                            0,
+                            0,
+                            img.width as GLsizei,
+                            img.height as GLsizei,
+                            GL_RGBA,
+                            GL_UNSIGNED_BYTE,
+                            img.pixels.as_ptr().cast(),
+                        );
+                    } else {
+                        (self.gl.gl_tex_image2d)(
+                            GL_TEXTURE_2D,
+                            level as GLint,
+                            GL_RGBA8 as GLint,
+                            img.width as GLsizei,
+                            img.height as GLsizei,
+                            0,
+                            GL_RGBA,
+                            GL_UNSIGNED_BYTE,
+                            img.pixels.as_ptr().cast(),
+                        );
+                        entry
+                            .levels
+                            .insert(level, (img.width, img.height, GL_RGBA8));
+                    }
                 }
                 PreparedTextureUpload::CompressedS3tc {
                     format,
@@ -1127,24 +1481,42 @@ impl RenderBackend for Gles3Backend {
                         D3DFMT_DXT5 => GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
                         _ => GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
                     };
-                    (self.gl.gl_compressed_tex_image2d)(
-                        GL_TEXTURE_2D,
-                        level as GLint,
-                        internal_fmt,
-                        *width as GLsizei,
-                        *height as GLsizei,
-                        0,
-                        data.len() as GLsizei,
-                        data.as_ptr().cast(),
-                    );
+                    let can_sub =
+                        entry.levels.get(&level) == Some(&(*width, *height, internal_fmt));
+                    if can_sub {
+                        (self.gl.gl_compressed_tex_sub_image2d)(
+                            GL_TEXTURE_2D,
+                            level as GLint,
+                            0,
+                            0,
+                            *width as GLsizei,
+                            *height as GLsizei,
+                            internal_fmt,
+                            data.len() as GLsizei,
+                            data.as_ptr().cast(),
+                        );
+                    } else {
+                        (self.gl.gl_compressed_tex_image2d)(
+                            GL_TEXTURE_2D,
+                            level as GLint,
+                            internal_fmt,
+                            *width as GLsizei,
+                            *height as GLsizei,
+                            0,
+                            data.len() as GLsizei,
+                            data.as_ptr().cast(),
+                        );
+                        entry.levels.insert(level, (*width, *height, internal_fmt));
+                    }
                 }
             }
-            (self.gl.gl_bind_texture)(GL_TEXTURE_2D, 0);
         }
+        self.state_cache.bind_texture(&self.gl, 0, 0);
     }
 
     fn on_texture_destroy(&mut self, tex_handle: u32) {
         if let Some(tex) = self.textures.remove(&tex_handle) {
+            self.state_cache.invalidate_texture(tex.id);
             unsafe {
                 (self.gl.gl_delete_textures)(1, &tex.id);
             }
@@ -1167,6 +1539,32 @@ impl RenderBackend for Gles3Backend {
         });
         entry.fvf = fvf;
         upload_gl_buffer(&self.gl, entry, GL_ARRAY_BUFFER, data, usage);
+    }
+
+    fn on_vb_sub_upload(
+        &mut self,
+        vb_handle: u32,
+        full_data: &[u8],
+        offset: usize,
+        sub_data: &[u8],
+        fvf: u32,
+        usage: u32,
+    ) {
+        if let Some(entry) = self.vbos.get_mut(&vb_handle) {
+            entry.fvf = fvf;
+            if upload_gl_buffer_sub(
+                &self.gl,
+                entry,
+                GL_ARRAY_BUFFER,
+                full_data.len(),
+                offset,
+                sub_data,
+                usage,
+            ) {
+                return;
+            }
+        }
+        self.on_vb_upload(vb_handle, full_data, fvf, usage);
     }
 
     fn on_vb_destroy(&mut self, vb_handle: u32) {
@@ -1193,6 +1591,32 @@ impl RenderBackend for Gles3Backend {
         });
         entry.format = format;
         upload_gl_buffer(&self.gl, entry, GL_ELEMENT_ARRAY_BUFFER, data, usage);
+    }
+
+    fn on_ib_sub_upload(
+        &mut self,
+        ib_handle: u32,
+        full_data: &[u8],
+        offset: usize,
+        sub_data: &[u8],
+        format: u32,
+        usage: u32,
+    ) {
+        if let Some(entry) = self.ibos.get_mut(&ib_handle) {
+            entry.format = format;
+            if upload_gl_buffer_sub(
+                &self.gl,
+                entry,
+                GL_ELEMENT_ARRAY_BUFFER,
+                full_data.len(),
+                offset,
+                sub_data,
+                usage,
+            ) {
+                return;
+            }
+        }
+        self.on_ib_upload(ib_handle, full_data, format, usage);
     }
 
     fn on_ib_destroy(&mut self, ib_handle: u32) {
@@ -1412,9 +1836,10 @@ impl RenderBackend for Gles3Backend {
             (self.gl.gl_clear)(GL_COLOR_BUFFER_BIT);
 
             (self.gl.gl_viewport)(vp_x, vp_y, vp_w, vp_h);
-            (self.gl.gl_use_program)(self.present_program);
-            (self.gl.gl_active_texture)(GL_TEXTURE0);
-            (self.gl.gl_bind_texture)(GL_TEXTURE_2D, self.fbo_color_tex);
+        }
+        self.state_cache.use_program(&self.gl, self.present_program);
+        self.state_cache.bind_texture(&self.gl, 0, self.fbo_color_tex);
+        unsafe {
             if self.present_tex_loc >= 0 {
                 (self.gl.gl_uniform1i)(self.present_tex_loc, 0);
             }
@@ -1423,11 +1848,14 @@ impl RenderBackend for Gles3Backend {
         }
 
         self.present_target.swap_buffers();
+        self.state_cache.invalidate_all();
 
         unsafe {
             (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, self.fbo);
             (self.gl.gl_viewport)(0, 0, self.fbo_width as GLsizei, self.fbo_height as GLsizei);
         }
+
+        self.flush_recipe_cache_if_needed();
     }
 }
 
@@ -1488,6 +1916,41 @@ fn upload_gl_buffer(
         }
         (gl.gl_bind_buffer)(target, 0);
     }
+}
+
+fn upload_gl_buffer_sub(
+    gl: &Gles3Functions,
+    entry: &mut GlBuffer,
+    target: GLenum,
+    full_len: usize,
+    offset: usize,
+    sub_data: &[u8],
+    usage: u32,
+) -> bool {
+    let gl_usage = if (usage & D3DUSAGE_DYNAMIC) != 0 {
+        GL_DYNAMIC_DRAW
+    } else {
+        GL_STATIC_DRAW
+    };
+    if sub_data.is_empty()
+        || entry.data.len() != full_len
+        || entry.gl_usage != gl_usage
+        || offset.saturating_add(sub_data.len()) > entry.data.len()
+    {
+        return false;
+    }
+    entry.data[offset..offset + sub_data.len()].copy_from_slice(sub_data);
+    unsafe {
+        (gl.gl_bind_buffer)(target, entry.id);
+        (gl.gl_buffer_sub_data)(
+            target,
+            offset as GLintptr,
+            sub_data.len() as GLsizeiptr,
+            sub_data.as_ptr().cast(),
+        );
+        (gl.gl_bind_buffer)(target, 0);
+    }
+    true
 }
 
 fn build_glsl_for_recipe(recipe: &ShaderRecipe) -> Result<(String, String), String> {
@@ -1566,6 +2029,20 @@ fn adapt_ffp_vs_to_ps_inputs(vs_glsl: &str) -> String {
         .replace("v_fog_factor", "v_oFog")
 }
 
+fn query_driver_id(gl: &Gles3Functions) -> String {
+    let read_str = |name: GLenum| -> String {
+        let ptr = unsafe { (gl.gl_get_string)(name) };
+        if ptr.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(ptr.cast()) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    format!("{}|{}", read_str(GL_RENDERER), read_str(GL_VERSION))
+}
+
 fn query_max_texture_size(gl: &Gles3Functions) -> u32 {
     let mut val: GLint = 2048;
     unsafe {
@@ -1635,7 +2112,12 @@ fn compile_shader(gl: &Gles3Functions, stage: GLenum, source: &str) -> Result<GL
     Ok(shader)
 }
 
-fn compile_and_link_program(gl: &Gles3Functions, vs_src: &str, fs_src: &str) -> Result<GLuint, String> {
+fn compile_and_link_program(
+    gl: &Gles3Functions,
+    vs_src: &str,
+    fs_src: &str,
+    binary_retrievable: bool,
+) -> Result<GLuint, String> {
     let vs = compile_shader(gl, GL_VERTEX_SHADER, vs_src)?;
     let fs = match compile_shader(gl, GL_FRAGMENT_SHADER, fs_src) {
         Ok(s) => s,
@@ -1652,6 +2134,14 @@ fn compile_and_link_program(gl: &Gles3Functions, vs_src: &str, fs_src: &str) -> 
             (gl.gl_delete_shader)(fs);
         }
         return Err("glCreateProgram returned 0".to_owned());
+    }
+
+    if binary_retrievable {
+        if let Some(param_i) = gl.gl_program_parameteri {
+            unsafe {
+                param_i(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE as GLint);
+            }
+        }
     }
 
     let mut status: GLint = 0;
@@ -1682,6 +2172,63 @@ fn compile_and_link_program(gl: &Gles3Functions, vs_src: &str, fs_src: &str) -> 
         return Err(format!("program link failed: {msg}"));
     }
     Ok(program)
+}
+
+fn load_program_from_binary(gl: &Gles3Functions, bin: &CachedProgramBinary) -> Option<GLuint> {
+    let prog_bin_fn = gl.gl_program_binary?;
+    if bin.bytes.is_empty() {
+        return None;
+    }
+    let program = unsafe { (gl.gl_create_program)() };
+    if program == 0 {
+        return None;
+    }
+    let mut status: GLint = 0;
+    unsafe {
+        prog_bin_fn(
+            program,
+            bin.format,
+            bin.bytes.as_ptr().cast(),
+            bin.bytes.len() as GLsizei,
+        );
+        (gl.gl_get_programiv)(program, GL_LINK_STATUS, &mut status);
+    }
+    if status == 0 {
+        unsafe {
+            (gl.gl_delete_program)(program);
+        }
+        None
+    } else {
+        Some(program)
+    }
+}
+
+fn capture_program_binary(gl: &Gles3Functions, program: GLuint) -> Option<CachedProgramBinary> {
+    let get_bin_fn = gl.gl_get_program_binary?;
+    let mut bin_len: GLint = 0;
+    unsafe {
+        (gl.gl_get_programiv)(program, GL_PROGRAM_BINARY_LENGTH, &mut bin_len);
+    }
+    if bin_len <= 0 {
+        return None;
+    }
+    let mut bytes = vec![0u8; bin_len as usize];
+    let mut actual_len: GLsizei = 0;
+    let mut format: GLenum = 0;
+    unsafe {
+        get_bin_fn(
+            program,
+            bin_len as GLsizei,
+            &mut actual_len,
+            &mut format,
+            bytes.as_mut_ptr().cast(),
+        );
+    }
+    if actual_len <= 0 {
+        return None;
+    }
+    bytes.truncate((actual_len as usize).min(bytes.len()));
+    Some(CachedProgramBinary { format, bytes })
 }
 
 fn get_uniform_loc(gl: &Gles3Functions, program: GLuint, name: &str) -> GLint {
@@ -1720,6 +2267,7 @@ impl CompiledProgram {
             program,
             u_world: get_uniform_loc(gl, program, "u_world"),
             u_view: get_uniform_loc(gl, program, "u_view"),
+            u_inv_view: get_uniform_loc(gl, program, "u_inv_view"),
             u_proj: get_uniform_loc(gl, program, "u_proj"),
             u_tex_mats,
             u_viewport: get_uniform_loc(gl, program, "u_viewport"),
@@ -1835,28 +2383,24 @@ unsafe fn apply_render_states(gl: &Gles3Functions, state: &DeviceState, fbo_heig
     }
 }
 
-unsafe fn bind_textures(
+fn bind_textures(
     gl: &Gles3Functions,
-    textures: &HashMap<u32, GlTexture>,
+    textures: &mut HashMap<u32, GlTexture>,
+    state_cache: &mut GlStateCache,
     state: &DeviceState,
 ) {
     for stage in 0..MAX_FFP_STAGES {
         let s = stage as u32;
-        unsafe {
-            (gl.gl_active_texture)(GL_TEXTURE0 + s);
-        }
         let Some(tex_handle) = state.bound_textures[stage] else {
-            unsafe {
-                (gl.gl_bind_texture)(GL_TEXTURE_2D, 0);
-            }
+            state_cache.bind_texture(gl, s, 0);
             continue;
         };
-        let Some(gl_tex) = textures.get(&tex_handle) else {
-            unsafe {
-                (gl.gl_bind_texture)(GL_TEXTURE_2D, 0);
-            }
+        let Some(gl_tex) = textures.get_mut(&tex_handle) else {
+            state_cache.bind_texture(gl, s, 0);
             continue;
         };
+        state_cache.bind_texture(gl, s, gl_tex.id);
+
         let addr_u = map_tex_address(state.get_texture_stage_state(s, D3DTSS_ADDRESSU));
         let addr_v = map_tex_address(state.get_texture_stage_state(s, D3DTSS_ADDRESSV));
         let mag = map_mag_filter(state.get_texture_stage_state(s, D3DTSS_MAGFILTER));
@@ -1865,19 +2409,42 @@ unsafe fn bind_textures(
             state.get_texture_stage_state(s, D3DTSS_MIPFILTER),
             gl_tex.max_level > 0,
         );
-        unsafe {
-            (gl.gl_bind_texture)(GL_TEXTURE_2D, gl_tex.id);
-            (gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, addr_u as GLint);
-            (gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, addr_v as GLint);
-            (gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag as GLint);
-            (gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min as GLint);
+        if gl_tex.wrap_s != addr_u
+            || gl_tex.wrap_t != addr_v
+            || gl_tex.mag_filter != mag
+            || gl_tex.min_filter != min
+        {
+            state_cache.set_active_texture(gl, s);
+            unsafe {
+                if gl_tex.wrap_s != addr_u {
+                    (gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, addr_u as GLint);
+                    gl_tex.wrap_s = addr_u;
+                }
+                if gl_tex.wrap_t != addr_v {
+                    (gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, addr_v as GLint);
+                    gl_tex.wrap_t = addr_v;
+                }
+                if gl_tex.mag_filter != mag {
+                    (gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag as GLint);
+                    gl_tex.mag_filter = mag;
+                }
+                if gl_tex.min_filter != min {
+                    (gl.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min as GLint);
+                    gl_tex.min_filter = min;
+                }
+            }
         }
     }
 }
 
-unsafe fn upload_uniforms(gl: &Gles3Functions, prog: &CompiledProgram, state: &DeviceState) {
+unsafe fn upload_uniforms(
+    gl: &Gles3Functions,
+    prog: &CompiledProgram,
+    state: &DeviceState,
+    view: &[f32; 16],
+    inv_view: Option<&[f32; 16]>,
+) {
     let world = state.get_transform(D3DTS_WORLD);
-    let view = state.get_transform(D3DTS_VIEW);
     let proj = state.get_transform(D3DTS_PROJECTION);
     unsafe {
         if prog.u_world >= 0 {
@@ -1885,6 +2452,11 @@ unsafe fn upload_uniforms(gl: &Gles3Functions, prog: &CompiledProgram, state: &D
         }
         if prog.u_view >= 0 {
             (gl.gl_uniform_matrix4fv)(prog.u_view, 1, GL_FALSE, view.as_ptr());
+        }
+        if let Some(inv) = inv_view {
+            if prog.u_inv_view >= 0 {
+                (gl.gl_uniform_matrix4fv)(prog.u_inv_view, 1, GL_FALSE, inv.as_ptr());
+            }
         }
         if prog.u_proj >= 0 {
             (gl.gl_uniform_matrix4fv)(prog.u_proj, 1, GL_FALSE, proj.as_ptr());
@@ -2122,9 +2694,117 @@ fn map_min_filter(min_filter: u32, mip_filter: u32, has_mips: bool) -> GLenum {
     }
 }
 
+const IDENTITY_4X4: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+];
+
+fn hash_ffp_key(key: &FfpShaderKey) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    0u8.hash(&mut hasher);
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_prog_parts(
+    decl_tokens: &[u32],
+    vs_tokens: &[u32],
+    ps_tokens: &[u32],
+    alpha_test_func: u8,
+    fog_mode: u8,
+    ffp_stages: &[TextureStageKey; MAX_FFP_STAGES],
+    specular_enabled: bool,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    1u8.hash(&mut hasher);
+    decl_tokens.hash(&mut hasher);
+    vs_tokens.hash(&mut hasher);
+    ps_tokens.hash(&mut hasher);
+    alpha_test_func.hash(&mut hasher);
+    fog_mode.hash(&mut hasher);
+    ffp_stages.hash(&mut hasher);
+    specular_enabled.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_recipe(recipe: &ShaderRecipe) -> u64 {
+    match recipe {
+        ShaderRecipe::Ffp(key) => hash_ffp_key(key),
+        ShaderRecipe::Programmable {
+            decl_tokens,
+            vs_tokens,
+            ps_tokens,
+            alpha_test_func,
+            fog_mode,
+            ffp_stages,
+            specular_enabled,
+        } => hash_prog_parts(
+            decl_tokens,
+            vs_tokens,
+            ps_tokens,
+            *alpha_test_func,
+            *fog_mode,
+            ffp_stages,
+            *specular_enabled,
+        ),
+    }
+}
+
+fn invert_4x4(m: &[f32; 16]) -> [f32; 16] {
+    let mut inv = [0.0f32; 16];
+
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
+        + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
+        - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
+        + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
+        - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
+        - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
+        + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
+        - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
+        + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
+        + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
+        - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
+        + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
+        - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
+        - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
+        + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
+        - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
+        + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+    let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if det.abs() <= 1e-12 {
+        return IDENTITY_4X4;
+    }
+    let inv_det = 1.0 / det;
+    for slot in &mut inv {
+        *slot *= inv_det;
+    }
+    inv
+}
+
 #[cfg(test)]
 mod tests {
-    use super::build_glsl_for_recipe;
+    use super::{build_glsl_for_recipe, invert_4x4};
     use crate::shader_cache::ShaderRecipe;
     use crate::shader_ffp::{MAX_FFP_STAGES, TextureStageKey};
 
@@ -2202,5 +2882,26 @@ mod tests {
         assert_eq!(AspectMode::parse("16:9"), Some(AspectMode::Ratio16x9));
         assert_eq!(AspectMode::parse("stretch"), Some(AspectMode::Stretch));
         assert_eq!(AspectMode::parse("invalid"), None);
+    }
+
+    #[test]
+    fn invert_4x4_produces_inverse_for_rigid_transform() {
+        let m = [
+            0.0, 1.0, 0.0, 0.0,
+            -1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            3.0, -4.0, 5.0, 1.0,
+        ];
+        let inv = invert_4x4(&m);
+        for row in 0..4 {
+            for col in 0..4 {
+                let mut sum = 0.0f32;
+                for k in 0..4 {
+                    sum += m[row * 4 + k] * inv[k * 4 + col];
+                }
+                let expected = if row == col { 1.0 } else { 0.0 };
+                assert!((sum - expected).abs() < 1e-5);
+            }
+        }
     }
 }

@@ -2945,13 +2945,19 @@ impl D3d8Context {
             return Ok(D3DERR_INVALIDCALL);
         };
         if (flags & D3DLOCK_READONLY) == 0 {
+            let start = off as usize;
+            let end = start + len as usize;
             if let Some(staging_va) = vb.staging_guest_va {
-                let start = off as usize;
-                let end = start + len as usize;
                 mem.read_into(staging_va + off, &mut vb.data[start..end])?;
             }
-            self.backend
-                .on_vb_upload(handle, &vb.data, vb.fvf, vb.usage);
+            self.backend.on_vb_sub_upload(
+                handle,
+                &vb.data,
+                start,
+                &vb.data[start..end],
+                vb.fvf,
+                vb.usage,
+            );
         }
         Ok(D3D_OK)
     }
@@ -3090,13 +3096,19 @@ impl D3d8Context {
             return Ok(D3DERR_INVALIDCALL);
         };
         if (flags & D3DLOCK_READONLY) == 0 {
+            let start = off as usize;
+            let end = start + len as usize;
             if let Some(staging_va) = ib.staging_guest_va {
-                let start = off as usize;
-                let end = start + len as usize;
                 mem.read_into(staging_va + off, &mut ib.data[start..end])?;
             }
-            self.backend
-                .on_ib_upload(handle, &ib.data, ib.format, ib.usage);
+            self.backend.on_ib_sub_upload(
+                handle,
+                &ib.data,
+                start,
+                &ib.data[start..end],
+                ib.format,
+                ib.usage,
+            );
         }
         Ok(D3D_OK)
     }

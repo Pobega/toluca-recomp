@@ -1,17 +1,26 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
 use crate::shader_ffp::{FfpShaderKey, MAX_FFP_LIGHTS, MAX_FFP_STAGES, TextureStageKey};
 
 pub const SHADER_CACHE_MAGIC: &[u8; 4] = b"TLCP";
-pub const SHADER_CACHE_VERSION: u32 = 2;
+pub const SHADER_CACHE_VERSION: u32 = 3;
 
 const TAG_FFP: u8 = 0;
 const TAG_PROGRAMMABLE: u8 = 1;
 const HEADER_SIZE: usize = 12;
 const CHECKSUM_SIZE: usize = 8;
 const MAX_TOKEN_ARRAY_LEN: usize = 65536;
+const MAX_DRIVER_ID_LEN: usize = 4096;
+const MAX_PROGRAM_BINARY_LEN: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedProgramBinary {
+    pub format: u32,
+    pub bytes: Vec<u8>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ShaderRecipe {
@@ -29,8 +38,10 @@ pub enum ShaderRecipe {
 
 #[derive(Clone, Debug, Default)]
 pub struct ShaderRecipeCache {
+    driver_id: String,
     recipes: Vec<ShaderRecipe>,
-    seen: HashSet<ShaderRecipe>,
+    binaries: Vec<Option<CachedProgramBinary>>,
+    indices: HashMap<ShaderRecipe, usize>,
 }
 
 impl ShaderRecipeCache {
@@ -38,12 +49,43 @@ impl ShaderRecipeCache {
         Self::default()
     }
 
+    pub fn driver_id(&self) -> &str {
+        &self.driver_id
+    }
+
+    pub fn set_driver_id(&mut self, driver_id: String) {
+        self.driver_id = driver_id;
+    }
+
+    pub fn validate_driver_id(&mut self, current_driver_id: &str) -> bool {
+        if self.driver_id == current_driver_id {
+            return true;
+        }
+        self.driver_id = current_driver_id.to_owned();
+        for slot in &mut self.binaries {
+            *slot = None;
+        }
+        false
+    }
+
     pub fn insert(&mut self, recipe: ShaderRecipe) -> bool {
-        if self.seen.insert(recipe.clone()) {
-            self.recipes.push(recipe);
-            true
-        } else {
-            false
+        if self.indices.contains_key(&recipe) {
+            return false;
+        }
+        let idx = self.recipes.len();
+        self.indices.insert(recipe.clone(), idx);
+        self.recipes.push(recipe);
+        self.binaries.push(None);
+        true
+    }
+
+    pub fn binary_at(&self, index: usize) -> Option<&CachedProgramBinary> {
+        self.binaries.get(index).and_then(|b| b.as_ref())
+    }
+
+    pub fn set_binary(&mut self, recipe: &ShaderRecipe, binary: CachedProgramBinary) {
+        if let Some(&idx) = self.indices.get(recipe) {
+            self.binaries[idx] = Some(binary);
         }
     }
 
@@ -65,7 +107,11 @@ impl ShaderRecipeCache {
         buf.extend_from_slice(&SHADER_CACHE_VERSION.to_le_bytes());
         buf.extend_from_slice(&(self.recipes.len() as u32).to_le_bytes());
 
-        for recipe in &self.recipes {
+        let driver_bytes = self.driver_id.as_bytes();
+        buf.extend_from_slice(&(driver_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(driver_bytes);
+
+        for (idx, recipe) in self.recipes.iter().enumerate() {
             match recipe {
                 ShaderRecipe::Ffp(key) => {
                     buf.push(TAG_FFP);
@@ -89,6 +135,14 @@ impl ShaderRecipeCache {
                     encode_stages(&mut buf, ffp_stages);
                     buf.push(u8::from(*specular_enabled));
                 }
+            }
+            if let Some(Some(bin)) = self.binaries.get(idx) {
+                buf.push(1);
+                buf.extend_from_slice(&bin.format.to_le_bytes());
+                buf.extend_from_slice(&(bin.bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bin.bytes);
+            } else {
+                buf.push(0);
             }
         }
 
@@ -120,7 +174,16 @@ impl ShaderRecipeCache {
 
         let entry_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         let mut cursor = ByteCursor::new(&bytes[HEADER_SIZE..payload_end]);
+        let driver_id_len = cursor.read_u32()? as usize;
+        if driver_id_len > MAX_DRIVER_ID_LEN {
+            return Err(format!("driver id length {driver_id_len} exceeds limit"));
+        }
+        let driver_id_bytes = cursor.read_slice(driver_id_len)?;
+        let driver_id = String::from_utf8(driver_id_bytes.to_vec())
+            .map_err(|_| "invalid UTF-8 in shader cache driver id".to_owned())?;
+
         let mut cache = Self::new();
+        cache.set_driver_id(driver_id);
 
         for _ in 0..entry_count {
             let tag = cursor.read_u8()?;
@@ -146,7 +209,27 @@ impl ShaderRecipeCache {
                 }
                 other => return Err(format!("unknown shader recipe tag {other}")),
             };
-            cache.insert(recipe);
+            let has_bin = cursor.read_bool()?;
+            let binary = if has_bin {
+                let format = cursor.read_u32()?;
+                let bin_len = cursor.read_u32()? as usize;
+                if bin_len > MAX_PROGRAM_BINARY_LEN {
+                    return Err(format!("program binary length {bin_len} exceeds limit"));
+                }
+                let bin_bytes = cursor.read_slice(bin_len)?.to_vec();
+                Some(CachedProgramBinary {
+                    format,
+                    bytes: bin_bytes,
+                })
+            } else {
+                None
+            };
+            let is_new = cache.insert(recipe.clone());
+            if is_new {
+                if let Some(bin) = binary {
+                    cache.set_binary(&recipe, bin);
+                }
+            }
         }
 
         if !cursor.is_empty() {
@@ -158,7 +241,18 @@ impl ShaderRecipeCache {
 
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
         let bytes = self.serialize();
-        fs::write(path, bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
+        let mut tmp_os = OsString::from(path.as_os_str());
+        tmp_os.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp_os);
+        if let Err(err) = fs::write(&tmp_path, bytes) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("failed to write {}: {err}", tmp_path.display()));
+        }
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("failed to rename {} to {}: {err}", tmp_path.display(), path.display()));
+        }
+        Ok(())
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
@@ -277,6 +371,17 @@ impl<'a> ByteCursor<'a> {
         let val = u32::from_le_bytes(self.slice[self.pos..self.pos + 4].try_into().unwrap());
         self.pos += 4;
         Ok(val)
+    }
+
+    fn read_slice(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|&e| e <= self.slice.len())
+            .ok_or_else(|| "unexpected EOF reading slice in shader cache".to_owned())?;
+        let slice = &self.slice[self.pos..end];
+        self.pos = end;
+        Ok(slice)
     }
 }
 

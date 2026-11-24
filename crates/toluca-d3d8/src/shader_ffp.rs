@@ -175,6 +175,7 @@ fn generate_ffp_vertex(key: &FfpShaderKey) -> String {
 
     writeln!(vs, "uniform mat4 u_world;").unwrap();
     writeln!(vs, "uniform mat4 u_view;").unwrap();
+    writeln!(vs, "uniform mat4 u_inv_view;").unwrap();
     writeln!(vs, "uniform mat4 u_proj;").unwrap();
     writeln!(vs, "uniform mat4 u_tex_mats[{MAX_FFP_STAGES}];").unwrap();
     writeln!(vs, "uniform vec4 u_viewport;").unwrap();
@@ -293,7 +294,7 @@ fn emit_untransformed_vertex(vs: &mut String, key: &FfpShaderKey) {
         writeln!(vs, "    vec3 spec_rgb = vec3(0.0);").unwrap();
         writeln!(
             vs,
-            "    vec3 eye_pos = (inverse(u_view) * vec4(0.0, 0.0, 0.0, 1.0)).xyz;\n    vec3 to_eye = normalize(eye_pos - world_pos.xyz);"
+            "    vec3 eye_pos = (u_inv_view * vec4(0.0, 0.0, 0.0, 1.0)).xyz;\n    vec3 to_eye = normalize(eye_pos - world_pos.xyz);"
         )
         .unwrap();
 

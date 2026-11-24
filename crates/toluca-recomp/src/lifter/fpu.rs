@@ -222,11 +222,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 true
             }
             Mnemonic::Fxch => {
-                let other_idx = if instr.op_count() > 0 && instr.op_kind(0) == OpKind::Register {
-                    x87_reg_index(instr.op_register(0))
-                } else {
-                    1
-                };
+                let other_idx = x87_second_reg_index(instr);
                 let a = self.x87_load_st(0);
                 let b = self.x87_load_st(other_idx);
                 self.x87_store_st(0, b);
@@ -411,6 +407,9 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     fn x87_compare_rhs(&mut self, instr: &Instruction, is_int: bool) -> Value {
         if instr.op_count() == 0 {
             return self.x87_load_st(1);
+        }
+        if instr.op_count() >= 2 && instr.op_kind(1) == OpKind::Register {
+            return self.x87_load_st(x87_reg_index(instr.op_register(1)));
         }
         if instr.op_kind(0) == OpKind::Register {
             self.x87_load_st(x87_reg_index(instr.op_register(0)))
@@ -631,12 +630,62 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         self.builder.ins().select(in_range, rounded, val)
     }
 
+    fn x87_round_for_int_store(&mut self, val: Value) -> Value {
+        const X87_CW_RC_MASK: i64 = 0x0C00;
+        const X87_CW_RC_FLOOR: i64 = 0x0400;
+        const X87_CW_RC_CEIL: i64 = 0x0800;
+        const X87_CW_RC_TRUNC: i64 = 0x0C00;
+        const TWO_POW_52: f64 = 4_503_599_627_370_496.0;
+
+        let cw = self.x87_load_u16(offset_of!(X87State, control_word));
+        let rc = self.builder.ins().band_imm(cw, X87_CW_RC_MASK);
+
+        let nearest = self.round_nearest_even_f64(val);
+
+        // Compute trunc(val) for |val| < 2^52 without host libcalls.
+        let abs_val = self.builder.ins().fabs(val);
+        let limit = self.builder.ins().f64const(TWO_POW_52);
+        let in_range = self.builder.ins().fcmp(FloatCC::LessThan, abs_val, limit);
+        let trunc_i64 = self.builder.ins().fcvt_to_sint_sat(I64, val);
+        let trunc_f64 = self.builder.ins().fcvt_from_sint(F64, trunc_i64);
+        let trunc_val = self.builder.ins().select(in_range, trunc_f64, val);
+
+        let one = self.builder.ins().f64const(1.0);
+        let need_floor = self.builder.ins().fcmp(FloatCC::LessThan, val, trunc_val);
+        let floor_sub = self.builder.ins().fsub(trunc_val, one);
+        let floor_val = self.builder.ins().select(need_floor, floor_sub, trunc_val);
+
+        let need_ceil = self.builder.ins().fcmp(FloatCC::GreaterThan, val, trunc_val);
+        let ceil_add = self.builder.ins().fadd(trunc_val, one);
+        let ceil_val = self.builder.ins().select(need_ceil, ceil_add, trunc_val);
+
+        let is_floor = self.builder.ins().icmp_imm(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            rc,
+            X87_CW_RC_FLOOR,
+        );
+        let is_ceil = self.builder.ins().icmp_imm(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            rc,
+            X87_CW_RC_CEIL,
+        );
+        let is_trunc = self.builder.ins().icmp_imm(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            rc,
+            X87_CW_RC_TRUNC,
+        );
+
+        let r1 = self.builder.ins().select(is_floor, floor_val, nearest);
+        let r2 = self.builder.ins().select(is_ceil, ceil_val, r1);
+        self.builder.ins().select(is_trunc, val, r2)
+    }
+
     fn x87_store_mem_int(&mut self, instr: &Instruction, val: Value, truncate: bool) {
         let addr = self.compute_memory_addr(instr);
         let rounded = if truncate {
             val
         } else {
-            self.round_nearest_even_f64(val)
+            self.x87_round_for_int_store(val)
         };
         match instr.memory_size() {
             MemorySize::Int16 => {
@@ -664,6 +713,17 @@ enum X87BinOp {
     Mul,
     Div,
     DivRev,
+}
+
+fn x87_second_reg_index(instr: &Instruction) -> u32 {
+    if instr.op_count() >= 2 && instr.op_kind(1) == OpKind::Register {
+        x87_reg_index(instr.op_register(1))
+    } else if instr.op_count() == 1 && instr.op_kind(0) == OpKind::Register {
+        let idx = x87_reg_index(instr.op_register(0));
+        if idx == 0 { 1 } else { idx }
+    } else {
+        1
+    }
 }
 
 const fn x87_reg_index(reg: Register) -> u32 {

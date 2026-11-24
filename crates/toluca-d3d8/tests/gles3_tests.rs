@@ -547,5 +547,63 @@ fn real_gles3_renders_ui_quad_lit_3d_and_programmable_shaders() {
     };
     assert_eq!(pixel_at(&pixels_ps, 64, 32, 32), [0x00, 0x00, 0xFF, 0xFF]);
 
-    eprintln!("[gles3_tests] verified UI quad, lit 3D triangle, and vs_1_1+ps_1_1 on real GLES 3.0");
+    // Test 4: DrawPrimitiveUP fullscreen XYZRHW quad with DXT1 orange texture + D3DTOP_MODULATE2X
+    assert_eq!(
+        call(&mut ctx, &mut mem, dev_va, 20, &[4, 4, 1, 0, D3DFMT_DXT1, D3DPOOL_MANAGED, out_ptr]),
+        D3D_OK
+    );
+    let orange_tex_va = mem.read_u32(out_ptr).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, orange_tex_va, 16, &[0, locked_rect_va, 0, 0]), D3D_OK);
+    let orange_lr = D3dLockedRect::read_from(&mem, locked_rect_va).unwrap();
+    // RGB565 (31, 34, 2) = 0xFC42 (orange)
+    let dxt1_orange: [u8; 8] = [0x42, 0xFC, 0x42, 0xFC, 0, 0, 0, 0];
+    mem.write_bytes(orange_lr.p_bits, &dxt1_orange).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, orange_tex_va, 17, &[0]), D3D_OK);
+
+    let mut dpup_verts = Vec::new();
+    let half_grey = 0x8080_8080u32;
+    let w_f = width as f32;
+    let h_f = height as f32;
+    write_xyzrhw_vertex(&mut dpup_verts, [-0.5, -0.5, 0.01, 1.0], half_grey, [0.0, 0.0]);
+    write_xyzrhw_vertex(&mut dpup_verts, [w_f - 0.5, -0.5, 0.01, 1.0], half_grey, [1.0, 0.0]);
+    write_xyzrhw_vertex(&mut dpup_verts, [w_f - 0.5, h_f - 0.5, 0.01, 1.0], half_grey, [1.0, 1.0]);
+    write_xyzrhw_vertex(&mut dpup_verts, [-0.5, -0.5, 0.01, 1.0], half_grey, [0.0, 0.0]);
+    write_xyzrhw_vertex(&mut dpup_verts, [w_f - 0.5, h_f - 0.5, 0.01, 1.0], half_grey, [1.0, 1.0]);
+    write_xyzrhw_vertex(&mut dpup_verts, [-0.5, h_f - 0.5, 0.01, 1.0], half_grey, [0.0, 1.0]);
+    let dpup_va = mem.alloc(dpup_verts.len(), true).unwrap();
+    mem.write_bytes(dpup_va, &dpup_verts).unwrap();
+
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 34, &[]), D3D_OK);
+    assert_eq!(
+        call(&mut ctx, &mut mem, dev_va, 36, &[0, 0, D3DCLEAR_TARGET, 0xFF00_0000, 1.0f32.to_bits(), 0]),
+        D3D_OK
+    );
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 50, &[D3DRS_ZENABLE, 0]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 50, &[D3DRS_CULLMODE, D3DCULL_NONE]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 61, &[0, orange_tex_va]), D3D_OK);
+    // Stage 0 COLOROP=D3DTOP_MODULATE2X (5), COLORARG1=TEXTURE (2), COLORARG2=DIFFUSE (0)
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 63, &[0, 1, 5]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 63, &[0, 2, 2]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 63, &[0, 3, 0]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 76, &[fvf_ui]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 88, &[0]), D3D_OK);
+    assert_eq!(
+        call(&mut ctx, &mut mem, dev_va, 72, &[D3DPT_TRIANGLELIST, 2, dpup_va, 28]),
+        D3D_OK
+    );
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 35, &[]), D3D_OK);
+
+    let (_, _, pixels_dpup) = {
+        let gles = ctx.backend().as_any().downcast_ref::<Gles3Backend>().unwrap();
+        assert_eq!(gles.last_gl_error(), 0);
+        gles.readback_rgba8().unwrap()
+    };
+    for sample in [pixel_at(&pixels_dpup, 64, 48, 16), pixel_at(&pixels_dpup, 64, 16, 48)] {
+        assert!(
+            sample[0] > 230 && sample[1] > 120 && sample[1] < 160 && sample[2] < 30,
+            "expected orange in both triangles with MODULATE2X, got {sample:?}"
+        );
+    }
+
+    eprintln!("[gles3_tests] verified UI quad, lit 3D triangle, vs_1_1+ps_1_1, and DPUP MODULATE2X on real GLES 3.0");
 }

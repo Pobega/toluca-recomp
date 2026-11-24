@@ -599,6 +599,75 @@ fn diff_x87_fpu() {
             ])
             .with_flags_mask(EFLAGS_CF | EFLAGS_PF | EFLAGS_ZF),
     );
+
+    // Verify fxch st(1) / fxch st(2) stack ordering
+    let fxch_code = [
+        0xD9, 0x05, // fld dword [in_f32_addr] (st0=3.5)
+        (in_f32_addr as u8), ((in_f32_addr >> 8) as u8), ((in_f32_addr >> 16) as u8), ((in_f32_addr >> 24) as u8),
+        0xDB, 0x05, // fild dword [in_i32_addr] (st0=6.0, st1=3.5)
+        (in_i32_addr as u8), ((in_i32_addr >> 8) as u8), ((in_i32_addr >> 16) as u8), ((in_i32_addr >> 24) as u8),
+        0xDD, 0x05, // fld qword [in_f64_addr] (st0=16.0, st1=6.0, st2=3.5)
+        (in_f64_addr as u8), ((in_f64_addr >> 8) as u8), ((in_f64_addr >> 16) as u8), ((in_f64_addr >> 24) as u8),
+        0xD9, 0xC9, // fxch st(1) -> [6.0, 16.0, 3.5]
+        0xD9, 0xCA, // fxch st(2) -> [3.5, 16.0, 6.0]
+        0xD9, 0x1D, // fstp dword [out_f32_addr] -> 3.5
+        (out_f32_addr as u8), ((out_f32_addr >> 8) as u8), ((out_f32_addr >> 16) as u8), ((out_f32_addr >> 24) as u8),
+        0xDB, 0x1D, // fistp dword [out_i32_addr] -> 16
+        (out_i32_addr as u8), ((out_i32_addr >> 8) as u8), ((out_i32_addr >> 16) as u8), ((out_i32_addr >> 24) as u8),
+        0xDD, 0x1D, // fstp qword [out_f64_addr] -> 6.0
+        (out_f64_addr as u8), ((out_f64_addr >> 8) as u8), ((out_f64_addr >> 16) as u8), ((out_f64_addr >> 24) as u8),
+        0xC3,
+    ];
+    assert_matches_unicorn(
+        DifferentialCase::new("x87_fxch", &fxch_code).with_data(&[
+            (0x100, &3.5f32.to_le_bytes()),
+            (0x104, &6i32.to_le_bytes()),
+            (0x108, &16.0f64.to_le_bytes()),
+        ]),
+    );
+
+    // Verify fldcw rounding control with fistp (truncate, floor, ceil, nearest)
+    let cw_trunc_addr = DATA_BASE + 0x110;
+    let cw_floor_addr = DATA_BASE + 0x112;
+    let cw_ceil_addr = DATA_BASE + 0x114;
+    let val_pos_addr = DATA_BASE + 0x118;
+    let val_neg_addr = DATA_BASE + 0x11C;
+    let out_trunc_addr = DATA_BASE + 0x218;
+    let out_floor_addr = DATA_BASE + 0x21C;
+    let out_ceil_addr = DATA_BASE + 0x220;
+    let mut cw_code = Vec::new();
+    // fldcw [cw_trunc_addr] (0x0E7F); fld [val_pos_addr] (31.9f); fistp [out_trunc_addr] -> 31
+    cw_code.extend_from_slice(&[0xD9, 0x2D]);
+    cw_code.extend_from_slice(&cw_trunc_addr.to_le_bytes());
+    cw_code.extend_from_slice(&[0xD9, 0x05]);
+    cw_code.extend_from_slice(&val_pos_addr.to_le_bytes());
+    cw_code.extend_from_slice(&[0xDB, 0x1D]);
+    cw_code.extend_from_slice(&out_trunc_addr.to_le_bytes());
+    // fldcw [cw_floor_addr] (0x067F); fld [val_neg_addr] (-2.2f); fistp [out_floor_addr] -> -3
+    cw_code.extend_from_slice(&[0xD9, 0x2D]);
+    cw_code.extend_from_slice(&cw_floor_addr.to_le_bytes());
+    cw_code.extend_from_slice(&[0xD9, 0x05]);
+    cw_code.extend_from_slice(&val_neg_addr.to_le_bytes());
+    cw_code.extend_from_slice(&[0xDB, 0x1D]);
+    cw_code.extend_from_slice(&out_floor_addr.to_le_bytes());
+    // fldcw [cw_ceil_addr] (0x0A7F); fld [val_pos_addr] (31.9f); fistp [out_ceil_addr] -> 32
+    cw_code.extend_from_slice(&[0xD9, 0x2D]);
+    cw_code.extend_from_slice(&cw_ceil_addr.to_le_bytes());
+    cw_code.extend_from_slice(&[0xD9, 0x05]);
+    cw_code.extend_from_slice(&val_pos_addr.to_le_bytes());
+    cw_code.extend_from_slice(&[0xDB, 0x1D]);
+    cw_code.extend_from_slice(&out_ceil_addr.to_le_bytes());
+    cw_code.push(0xC3);
+
+    assert_matches_unicorn(
+        DifferentialCase::new("x87_fldcw_fistp", &cw_code).with_data(&[
+            (0x110, &0x0E7Fu16.to_le_bytes()),
+            (0x112, &0x067Fu16.to_le_bytes()),
+            (0x114, &0x0A7Fu16.to_le_bytes()),
+            (0x118, &31.9f32.to_le_bytes()),
+            (0x11C, &(-2.2f32).to_le_bytes()),
+        ]),
+    );
 }
 
 #[test]

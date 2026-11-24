@@ -572,7 +572,9 @@ fn is_valid_data_pointer_target(image: &PeImage, target_va: GuestAddr) -> bool {
     if !decodes_cleanly(slice, target_va, DATA_PTR_DECODE_MIN_INSTRS) {
         return false;
     }
-    looks_like_msvc_prologue(slice) || is_preceded_by_padding_or_terminator(image, target_va)
+    looks_like_msvc_prologue(slice)
+        || is_preceded_by_padding_or_terminator(image, target_va)
+        || (target_va as usize).is_multiple_of(PROLOGUE_ALIGNMENT)
 }
 
 fn is_jmp_thunk_to_function(image: &PeImage, va: GuestAddr, slice: &[u8]) -> bool {
@@ -960,5 +962,52 @@ mod tests {
             SeedKind::PrologueScan
         );
         assert!(report.coverage_percent() > 0.0);
+    }
+
+    #[test]
+    fn discovers_aligned_non_frame_function_from_data_pointer() {
+        let image_base = 0x0040_0000u32;
+        let text_rva = 0x1000u32;
+        let data_rva = 0x2000u32;
+        let text_va = image_base + text_rva;
+
+        let mut text = vec![0x90u8; 0x60];
+        // Entry at 0x00: mov eax, [esp+4]; ret
+        text[0..5].copy_from_slice(&[0x8B, 0x44, 0x24, 0x04, 0xC3]);
+        // Simulate jump table bytes right before 0x20 ending in 0x00 (not 0xCC/0x90/0xC3)
+        text[0x1C..0x20].copy_from_slice(&[0x00, 0x10, 0x40, 0x00]);
+        // Function at 0x20: mov eax, 1; xor ecx, ecx; ret (16-byte aligned, no push ebp)
+        text[0x20..0x28].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0x33, 0xC9, 0xC3]);
+
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(&(text_va + 0x20).to_le_bytes());
+
+        let bytes = build_test_pe32(
+            image_base,
+            text_rva,
+            0x0102,
+            &[],
+            &[
+                TestSectionSpec {
+                    name: ".text",
+                    virtual_address: text_rva,
+                    characteristics: IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+                    data: &text,
+                },
+                TestSectionSpec {
+                    name: ".data",
+                    virtual_address: data_rva,
+                    characteristics: IMAGE_SCN_MEM_READ | crate::pe::IMAGE_SCN_MEM_WRITE,
+                    data: &data,
+                },
+            ],
+        );
+
+        let pe = PeImage::parse(bytes).unwrap();
+        let report = discover_functions(&pe);
+        assert_eq!(
+            report.functions.get(&(text_va + 0x20)).map(|f| f.seed_kind),
+            Some(SeedKind::DataPointer)
+        );
     }
 }

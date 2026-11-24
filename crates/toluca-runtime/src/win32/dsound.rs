@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use toluca_core::GuestAddr;
 use toluca_core::aot::ImportSymbol;
@@ -11,6 +11,15 @@ use crate::arena::GuestArena;
 use crate::callconv::{peek_arg_i32, peek_arg_u32, return_stdcall};
 use crate::runtime::{ImportHandler, ImportRegistry, RuntimeContext, RuntimeError};
 use crate::win32::sdl2::Sdl2AudioDevice;
+
+const DSOUND_PERF_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+fn dsound_perf_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TOLUCA_PERF").is_some_and(|v| !v.is_empty() && v != "0")
+    })
+}
 
 pub const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const OUTPUT_CHANNELS: usize = 2;
@@ -186,6 +195,7 @@ pub struct DsoundMixer {
     mix_accum: Vec<f32>,
     pub hardware_clocked: bool,
     pub last_advance: Instant,
+    last_perf_log: Instant,
 }
 
 impl Default for DsoundMixer {
@@ -196,6 +206,7 @@ impl Default for DsoundMixer {
 
 impl DsoundMixer {
     pub fn new() -> Self {
+        let now = Instant::now();
         Self {
             buffers: HashMap::new(),
             next_buf_id: 1,
@@ -208,7 +219,8 @@ impl DsoundMixer {
             output_buffer_frames: DEFAULT_OUTPUT_BUFFER_FRAMES,
             mix_accum: Vec::new(),
             hardware_clocked: false,
-            last_advance: Instant::now(),
+            last_advance: now,
+            last_perf_log: now,
         }
     }
 
@@ -337,7 +349,8 @@ impl DsoundMixer {
     }
 
     pub fn mix_into(&mut self, out: &mut [i16]) {
-        self.last_advance = Instant::now();
+        let now = Instant::now();
+        self.last_advance = now;
         let out_frames = out.len() / OUTPUT_CHANNELS;
         if out_frames == 0 {
             return;
@@ -346,7 +359,8 @@ impl DsoundMixer {
         self.mix_accum.resize(accum_len, 0.0);
         self.mix_accum[..accum_len].fill(0.0);
 
-        let out_rate = f64::from(self.output_sample_rate.max(1));
+        let out_rate_u32 = self.output_sample_rate.max(1);
+        let out_rate = f64::from(out_rate_u32);
         let listener = self.listener.clone();
         for buf in self.buffers.values_mut() {
             if !buf.playing || buf.is_primary {
@@ -359,6 +373,11 @@ impl DsoundMixer {
             }
 
             let (gain_l, gain_r) = compute_channel_gains(buf, &listener);
+            if buf.sample_rate == out_rate_u32 && buf.bits_per_sample == 16 {
+                mix_pcm_16_1to1(buf, total_frames, out_frames, gain_l, gain_r, &mut self.mix_accum);
+                continue;
+            }
+
             let step = f64::from(buf.sample_rate.max(1)) / out_rate;
             let channels = buf.channels;
             let bits = buf.bits_per_sample;
@@ -425,7 +444,89 @@ impl DsoundMixer {
                 .clamp(f32::from(i16::MIN), f32::from(i16::MAX));
             *dst = scaled as i16;
         }
+
+        if dsound_perf_enabled() && now.duration_since(self.last_perf_log) >= DSOUND_PERF_LOG_INTERVAL
+        {
+            self.last_perf_log = now;
+            let playing = self
+                .buffers
+                .values()
+                .filter(|b| b.playing && !b.is_primary)
+                .count();
+            eprintln!(
+                "[toluca-dsound] playing={} total={} aux_frames={}",
+                playing,
+                self.buffers.len(),
+                self.aux_played_frames
+            );
+        }
     }
+}
+
+fn mix_pcm_16_1to1(
+    buf: &mut DsoundBufferData,
+    total_frames: usize,
+    out_frames: usize,
+    gain_l: f32,
+    gain_r: f32,
+    accum: &mut [f32],
+) {
+    let mut pos = if (buf.play_pos_frames as usize) >= total_frames {
+        if buf.looping {
+            (buf.play_pos_frames as usize) % total_frames
+        } else {
+            buf.playing = false;
+            buf.play_pos_frames = 0.0;
+            return;
+        }
+    } else {
+        buf.play_pos_frames as usize
+    };
+
+    let ch = usize::from(buf.channels.max(1));
+    let scale_l = gain_l / 32_768.0;
+    let scale_r = gain_r / 32_768.0;
+    let mut out_idx = 0usize;
+    let mut remaining = out_frames;
+
+    while remaining > 0 {
+        let chunk = remaining.min(total_frames - pos);
+        if ch >= 2 {
+            let mut src_off = pos * ch * 2;
+            let step = ch * 2;
+            for i in 0..chunk {
+                let l = f32::from(i16::from_le_bytes([buf.data[src_off], buf.data[src_off + 1]]));
+                let r =
+                    f32::from(i16::from_le_bytes([buf.data[src_off + 2], buf.data[src_off + 3]]));
+                let dst = (out_idx + i) * 2;
+                accum[dst] += l * scale_l;
+                accum[dst + 1] += r * scale_r;
+                src_off += step;
+            }
+        } else {
+            let mut src_off = pos * 2;
+            for i in 0..chunk {
+                let s = f32::from(i16::from_le_bytes([buf.data[src_off], buf.data[src_off + 1]]));
+                let dst = (out_idx + i) * 2;
+                accum[dst] += s * scale_l;
+                accum[dst + 1] += s * scale_r;
+                src_off += 2;
+            }
+        }
+        pos += chunk;
+        out_idx += chunk;
+        remaining -= chunk;
+        if pos >= total_frames {
+            if buf.looping {
+                pos = 0;
+            } else {
+                buf.playing = false;
+                buf.play_pos_frames = 0.0;
+                return;
+            }
+        }
+    }
+    buf.play_pos_frames = pos as f64;
 }
 
 fn soft_limit_sample(sample: f32) -> f32 {
@@ -556,12 +657,13 @@ struct DsoundBufferGuestMeta {
     mixer_id: usize,
     guest_buf_va: GuestAddr,
     guest_buf_bytes: u32,
+    refcount: u32,
 }
 
 pub struct DsoundState {
     pub mixer: Arc<Mutex<DsoundMixer>>,
     buffers: HashMap<GuestAddr, DsoundBufferGuestMeta>,
-    ds3d_buffers: HashMap<GuestAddr, usize>,
+    ds3d_buffers: HashMap<GuestAddr, (usize, u32)>,
     audio_device: Option<Sdl2AudioDevice>,
     audio_open_attempted: bool,
 }
@@ -642,6 +744,10 @@ pub fn register_imports(registry: &mut ImportRegistry) {
         ("QueryInterface", ds_query_interface),
         ("AddRef", stdcall_one_1),
         ("Release", stdcall_zero_1),
+        ("DSB_AddRef", dsb_add_ref),
+        ("DSB_Release", dsb_release),
+        ("DS3DB_AddRef", ds3db_add_ref),
+        ("DS3DB_Release", ds3db_release),
         ("DS_CreateSoundBuffer", ds_create_sound_buffer),
         ("DS_GetCaps", ds_get_caps),
         ("DS_DuplicateSoundBuffer", ds_duplicate_sound_buffer),
@@ -785,8 +891,8 @@ fn alloc_ds3d_buffer(
 ) -> Result<GuestAddr, RuntimeError> {
     const SLOTS: [&str; DS3DBUFFER_VTABLE_SLOTS] = [
         "QueryInterface",
-        "AddRef",
-        "Release",
+        "DS3DB_AddRef",
+        "DS3DB_Release",
         "DS3DB_GetAllParameters",
         "DS3DB_GetConeAngles",
         "DS3DB_GetConeOrientation",
@@ -807,7 +913,7 @@ fn alloc_ds3d_buffer(
         "DS3DB_SetVelocity",
     ];
     let obj = alloc_com_object(ctx, &SLOTS)?;
-    ctx.win32.dsound.ds3d_buffers.insert(obj, mixer_id);
+    ctx.win32.dsound.ds3d_buffers.insert(obj, (mixer_id, 1));
     Ok(obj)
 }
 
@@ -832,16 +938,28 @@ fn ds_query_interface(
         | IID_IDIRECTSOUND_DATA1
         | IID_IDIRECTSOUND8_DATA1
         | IID_IDIRECTSOUNDBUFFER_DATA1
-        | IID_IDIRECTSOUNDBUFFER8_DATA1 => Some(this_ptr),
+        | IID_IDIRECTSOUNDBUFFER8_DATA1 => {
+            if let Some(meta) = ctx.win32.dsound.buffers.get_mut(&this_ptr) {
+                meta.refcount = meta.refcount.saturating_add(1);
+            } else if let Some((_, refcnt)) = ctx.win32.dsound.ds3d_buffers.get_mut(&this_ptr) {
+                *refcnt = refcnt.saturating_add(1);
+            }
+            Some(this_ptr)
+        }
         IID_IDIRECTSOUND3DLISTENER_DATA1 => Some(alloc_ds3d_listener(ctx)?),
         IID_IDIRECTSOUND3DBUFFER_DATA1 => {
-            let mixer_id = ctx
-                .win32
-                .dsound
-                .buffers
-                .get(&this_ptr)
-                .map_or(0, |m| m.mixer_id);
-            Some(alloc_ds3d_buffer(ctx, mixer_id)?)
+            if let Some((_, refcnt)) = ctx.win32.dsound.ds3d_buffers.get_mut(&this_ptr) {
+                *refcnt = refcnt.saturating_add(1);
+                Some(this_ptr)
+            } else {
+                let mixer_id = ctx
+                    .win32
+                    .dsound
+                    .buffers
+                    .get(&this_ptr)
+                    .map_or(0, |m| m.mixer_id);
+                Some(alloc_ds3d_buffer(ctx, mixer_id)?)
+            }
         }
         _ => None,
     };
@@ -864,8 +982,8 @@ fn alloc_ds_buffer_object(
 ) -> Result<GuestAddr, RuntimeError> {
     const DSB8_SLOTS: [&str; DSB8_VTABLE_SLOTS] = [
         "QueryInterface",
-        "AddRef",
-        "Release",
+        "DSB_AddRef",
+        "DSB_Release",
         "DSB_GetCaps",
         "DSB_GetCurrentPosition",
         "DSB_GetFormat",
@@ -906,6 +1024,7 @@ fn alloc_ds_buffer_object(
             mixer_id,
             guest_buf_va,
             guest_buf_bytes,
+            refcount: 1,
         },
     );
     Ok(obj)
@@ -2081,7 +2200,7 @@ fn with_3dbuf<R>(
     ds3d_va: GuestAddr,
     f: impl FnOnce(&DsoundBufferData) -> R,
 ) -> Option<R> {
-    let &mixer_id = ctx.win32.dsound.ds3d_buffers.get(&ds3d_va)?;
+    let &(mixer_id, _) = ctx.win32.dsound.ds3d_buffers.get(&ds3d_va)?;
     let guard = ctx
         .win32
         .dsound
@@ -2096,7 +2215,7 @@ fn with_3dbuf_mut(
     ds3d_va: GuestAddr,
     f: impl FnOnce(&mut DsoundBufferData),
 ) {
-    if let Some(&mixer_id) = ctx.win32.dsound.ds3d_buffers.get(&ds3d_va) {
+    if let Some(&(mixer_id, _)) = ctx.win32.dsound.ds3d_buffers.get(&ds3d_va) {
         let mut guard = ctx
             .win32
             .dsound
@@ -2107,6 +2226,72 @@ fn with_3dbuf_mut(
             f(buf);
         }
     }
+}
+
+fn dsb_add_ref(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let this_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let refcnt = if let Some(meta) = ctx.win32.dsound.buffers.get_mut(&this_ptr) {
+        meta.refcount = meta.refcount.saturating_add(1);
+        meta.refcount
+    } else {
+        1
+    };
+    return_stdcall(cpu, ctx.arena, 1, refcnt)?;
+    Ok(())
+}
+
+fn dsb_release(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let this_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let (rem, removed_meta) = match ctx.win32.dsound.buffers.get_mut(&this_ptr) {
+        Some(meta) => {
+            meta.refcount = meta.refcount.saturating_sub(1);
+            let rem = meta.refcount;
+            if rem == 0 {
+                (0, ctx.win32.dsound.buffers.remove(&this_ptr))
+            } else {
+                (rem, None)
+            }
+        }
+        None => (0, None),
+    };
+    if let Some(meta) = removed_meta {
+        if let Ok(mut guard) = ctx.win32.dsound.mixer.lock() {
+            guard.buffers.remove(&meta.mixer_id);
+        }
+        if meta.guest_buf_va != 0 {
+            let _ = ctx.heap.free(ctx.arena, meta.guest_buf_va);
+        }
+    }
+    return_stdcall(cpu, ctx.arena, 1, rem)?;
+    Ok(())
+}
+
+fn ds3db_add_ref(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let this_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let refcnt = if let Some((_, rc)) = ctx.win32.dsound.ds3d_buffers.get_mut(&this_ptr) {
+        *rc = rc.saturating_add(1);
+        *rc
+    } else {
+        1
+    };
+    return_stdcall(cpu, ctx.arena, 1, refcnt)?;
+    Ok(())
+}
+
+fn ds3db_release(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let this_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let rem = if let Some((_, rc)) = ctx.win32.dsound.ds3d_buffers.get_mut(&this_ptr) {
+        *rc = rc.saturating_sub(1);
+        let rem = *rc;
+        if rem == 0 {
+            ctx.win32.dsound.ds3d_buffers.remove(&this_ptr);
+        }
+        rem
+    } else {
+        0
+    };
+    return_stdcall(cpu, ctx.arena, 1, rem)?;
+    Ok(())
 }
 
 fn update_listener(
@@ -2549,5 +2734,58 @@ mod tests {
         assert!(peak > 0.85 && peak < 0.999);
         let neg_peak = soft_limit_sample(-1.1);
         assert!(neg_peak < -0.85 && neg_peak > -0.999);
+    }
+
+    #[test]
+    fn com_refcount_keeps_looping_buffer_alive_until_release_zero() {
+        let mut h = TestHarness::new();
+        h.win32.dsound.mixer.lock().unwrap().hardware_clocked = true;
+        let ds8 = h.create_ds8();
+        let buf = h.create_buffer(ds8, 4096, DEFAULT_OUTPUT_SAMPLE_RATE, 2, 16, DSBCAPS_CTRL3D);
+        let mixer_id = h.win32.dsound.buffers[&buf].mixer_id;
+
+        // Fill buffer with non-zero 48 kHz 16-bit PCM so mix_into produces audible samples.
+        {
+            let mut guard = h.win32.dsound.mixer.lock().unwrap();
+            let data = &mut guard.buffers.get_mut(&mixer_id).unwrap().data;
+            for sample in data.chunks_exact_mut(2) {
+                sample.copy_from_slice(&8_000i16.to_le_bytes());
+            }
+        }
+        assert_eq!(h.call_com(buf, 12, &[0, 0, DSBPLAY_LOOPING]), DS_OK);
+
+        // AddRef -> 2, QueryInterface(IDirectSoundBuffer8) -> 3.
+        assert_eq!(h.call_com(buf, 1, &[]), 2);
+        let iid_va = h.heap.alloc(&mut h.arena, 16, true).unwrap();
+        h.arena.write_u32(iid_va, IID_IDIRECTSOUNDBUFFER8_DATA1).unwrap();
+        let ppv = h.heap.alloc(&mut h.arena, 4, true).unwrap();
+        assert_eq!(h.call_com(buf, 0, &[iid_va, ppv]), DS_OK);
+        assert_eq!(h.arena.read_u32(ppv).unwrap(), buf);
+
+        // Also acquire IDirectSound3DBuffer interface and verify its independent refcount cleanup.
+        h.arena.write_u32(iid_va, IID_IDIRECTSOUND3DBUFFER_DATA1).unwrap();
+        assert_eq!(h.call_com(buf, 0, &[iid_va, ppv]), DS_OK);
+        let ds3d = h.arena.read_u32(ppv).unwrap();
+        assert_eq!(h.call_com(ds3d, 1, &[]), 2);
+        assert_eq!(h.call_com(ds3d, 2, &[]), 1);
+        assert_eq!(h.call_com(ds3d, 2, &[]), 0);
+        assert!(!h.win32.dsound.ds3d_buffers.contains_key(&ds3d));
+
+        // Release twice: refcount drops 3 -> 2 -> 1; looping buffer stays alive and mixes audio.
+        assert_eq!(h.call_com(buf, 2, &[]), 2);
+        assert_eq!(h.call_com(buf, 2, &[]), 1);
+        let mut out = [0i16; 32];
+        h.win32.dsound.mixer.lock().unwrap().mix_into(&mut out);
+        assert!(out.iter().any(|&s| s != 0));
+        assert!(h.win32.dsound.mixer.lock().unwrap().buffers.contains_key(&mixer_id));
+
+        // Final Release drops refcount to 0, stopping playback and removing buffer.
+        assert_eq!(h.call_com(buf, 2, &[]), 0);
+        assert!(!h.win32.dsound.buffers.contains_key(&buf));
+        assert!(!h.win32.dsound.mixer.lock().unwrap().buffers.contains_key(&mixer_id));
+
+        out.fill(0);
+        h.win32.dsound.mixer.lock().unwrap().mix_into(&mut out);
+        assert!(out.iter().all(|&s| s == 0));
     }
 }

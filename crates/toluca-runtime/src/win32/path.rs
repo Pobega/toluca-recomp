@@ -14,10 +14,30 @@ pub fn resolve_win32_path(game_root: &Path, win_path: &str) -> PathBuf {
         }
     }
 
-    let mut current = game_root.to_path_buf();
+    let direct = resolve_components(game_root, &stack);
+    if direct.exists()
+        || stack.is_empty()
+        || stack[0].eq_ignore_ascii_case("data")
+    {
+        return direct;
+    }
+
+    let mut data_stack = Vec::with_capacity(stack.len() + 1);
+    data_stack.push("data");
+    data_stack.extend_from_slice(&stack);
+    let under_data = resolve_components(game_root, &data_stack);
+    if under_data.exists() {
+        under_data
+    } else {
+        direct
+    }
+}
+
+fn resolve_components(base: &Path, components: &[&str]) -> PathBuf {
+    let mut current = base.to_path_buf();
     let mut existing = current.is_dir();
 
-    for comp in stack {
+    for &comp in components {
         if existing {
             if let Some(matched) = find_entry_ci(&current, comp) {
                 current.push(matched);

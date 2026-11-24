@@ -1,3 +1,4 @@
+pub mod binkw32;
 pub mod d3d8;
 pub mod dinput8;
 pub mod dsound;
@@ -264,6 +265,7 @@ pub struct Win32State {
     pub dinput8: dinput8::Dinput8State,
     // Declared before window_mgr so Sdl2AudioDevice closes before Sdl2WindowBackend drops.
     pub dsound: dsound::DsoundState,
+    pub bink: binkw32::BinkState,
     pub window_mgr: WindowManager,
     pub d3d8_create_calls: Vec<u32>,
     pub d3d8_present_calls: u64,
@@ -294,6 +296,7 @@ impl Win32State {
         let headless = config.headless;
         let dinput8 = dinput8::Dinput8State::new(&config.script_keys);
         let dsound = dsound::DsoundState::new();
+        let bink = binkw32::BinkState::new();
         let mut d3d8 = D3d8Context::new_null();
         d3d8.trace_d3d8 = config.trace_d3d8;
         Self {
@@ -310,6 +313,7 @@ impl Win32State {
             d3d8,
             dinput8,
             dsound,
+            bink,
             window_mgr: WindowManager::new(headless),
             d3d8_create_calls: Vec::new(),
             d3d8_present_calls: 0,
@@ -463,6 +467,7 @@ pub fn register_all_win32(registry: &mut ImportRegistry) {
     d3d8::register_imports(registry);
     dinput8::register_imports(registry);
     dsound::register_imports(registry);
+    binkw32::register_imports(registry);
     extra_dlls::register_imports(registry);
 }
 

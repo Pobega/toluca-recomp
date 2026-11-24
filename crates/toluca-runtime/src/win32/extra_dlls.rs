@@ -43,24 +43,6 @@ pub fn register_imports(registry: &mut ImportRegistry) {
     registry.register_name("advapi32.dll", "RegCloseKey", reg_close_key);
 
     registry.register_name("ole32.dll", "CoInitialize", co_initialize);
-
-    let bink = "binkw32.dll";
-    let bink_entries: &[(&str, ImportHandler)] = &[
-        ("_BinkSetSoundOnOff@8", stdcall_zero_2),
-        ("_BinkOpen@8", stdcall_zero_2),
-        ("_BinkSetSoundTrack@8", stdcall_zero_2),
-        ("_BinkSetSoundSystem@8", stdcall_zero_2),
-        ("_BinkOpenDirectSound@4", stdcall_zero_1),
-        ("_BinkClose@4", stdcall_zero_1),
-        ("_BinkCopyToBuffer@28", stdcall_zero_7),
-        ("_BinkNextFrame@4", stdcall_zero_1),
-        ("_BinkDoFrame@4", stdcall_zero_1),
-        ("_BinkWait@4", stdcall_zero_1),
-        ("_BinkPause@8", stdcall_zero_2),
-    ];
-    for &(name, handler) in bink_entries {
-        registry.register_name(bink, name, handler);
-    }
 }
 
 fn init_msvc7_string(
@@ -194,20 +176,5 @@ fn reg_close_key(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
 
 fn co_initialize(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     return_stdcall(cpu, ctx.arena, 1, S_OK)?;
-    Ok(())
-}
-
-fn stdcall_zero_1(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 1, 0)?;
-    Ok(())
-}
-
-fn stdcall_zero_2(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 2, 0)?;
-    Ok(())
-}
-
-fn stdcall_zero_7(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 7, 0)?;
     Ok(())
 }

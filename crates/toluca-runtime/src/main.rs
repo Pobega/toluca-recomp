@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use toluca_core::cpu::ExitReason;
+use toluca_d3d8::Gles3Backend;
 use toluca_runtime::{ImportRegistry, Runtime, TrapInfo, Win32Config, register_all_win32};
 
 struct CliArgs {
@@ -9,6 +10,8 @@ struct CliArgs {
     aot_path: PathBuf,
     game_dir: Option<PathBuf>,
     shader_cache: Option<PathBuf>,
+    max_frames: Option<u64>,
+    dump_frame: Option<PathBuf>,
     headless: bool,
     trace_imports: bool,
     trace_d3d8: bool,
@@ -45,7 +48,8 @@ fn main() -> ExitCode {
         headless: opts.headless,
         trace_imports: opts.trace_imports,
         trace_d3d8: opts.trace_d3d8,
-        shader_cache_path,
+        shader_cache_path: shader_cache_path.clone(),
+        max_frames: opts.max_frames,
         command_line: exe_name.clone(),
         exe_name,
     };
@@ -74,8 +78,44 @@ fn main() -> ExitCode {
         "Exit reason: {:?} (detail=0x{:08x}, EAX=0x{:08x}, EIP=0x{:08x}, ESP=0x{:08x})",
         outcome.exit_reason, outcome.exit_detail, outcome.eax, outcome.eip, outcome.esp
     );
-    if !runtime.win32().d3d8_create_calls.is_empty() {
-        println!("Direct3DCreate8 calls: {:?}", runtime.win32().d3d8_create_calls);
+    let (d3d8_create_calls, d3d8_present_calls) = {
+        let win32 = runtime.win32();
+        (win32.d3d8_create_calls.clone(), win32.d3d8_present_calls)
+    };
+    if !d3d8_create_calls.is_empty() {
+        println!(
+            "Direct3DCreate8 calls: {d3d8_create_calls:?}, Present frames: {d3d8_present_calls}"
+        );
+    }
+    if let Some(gles) = runtime
+        .win32()
+        .d3d8
+        .backend()
+        .as_any()
+        .downcast_ref::<Gles3Backend>()
+    {
+        println!(
+            "GLES3 stats: draw_calls={}, present_calls={}, last_gl_error=0x{:04x}",
+            gles.draw_calls,
+            gles.present_calls,
+            gles.last_gl_error()
+        );
+        if let Some(cache_path) = shader_cache_path.as_deref() {
+            if let Err(err) = gles.save_recipe_cache(cache_path) {
+                eprintln!("Failed to write shader cache {}: {err}", cache_path.display());
+            } else {
+                println!("Saved shader recipe cache to {}", cache_path.display());
+            }
+        }
+        if let Some(dump_path) = opts.dump_frame.as_deref() {
+            if let Some((w, h, rgba)) = gles.readback_rgba8() {
+                if let Err(err) = write_ppm_rgba8(dump_path, w, h, &rgba) {
+                    eprintln!("Failed to write frame dump {}: {err}", dump_path.display());
+                } else {
+                    println!("Dumped {}x{} frame to {}", w, h, dump_path.display());
+                }
+            }
+        }
     }
     if let Some(code) = runtime.win32().exit_code {
         println!("Guest ExitProcess code: {code}");
@@ -119,10 +159,22 @@ fn main() -> ExitCode {
     }
 }
 
+fn write_ppm_rgba8(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let header = format!("P6\n{width} {height}\n255\n");
+    let mut out = Vec::with_capacity(header.len() + (width as usize) * (height as usize) * 3);
+    out.extend_from_slice(header.as_bytes());
+    for px in rgba.chunks_exact(4) {
+        out.extend_from_slice(&px[0..3]);
+    }
+    std::fs::write(path, out)
+}
+
 fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut game_dir: Option<PathBuf> = None;
     let mut shader_cache: Option<PathBuf> = None;
+    let mut max_frames: Option<u64> = None;
+    let mut dump_frame: Option<PathBuf> = None;
     let mut headless = false;
     let mut trace_imports = false;
     let mut trace_d3d8 = false;
@@ -144,6 +196,16 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
                 let val = args.get(idx)?;
                 shader_cache = Some(PathBuf::from(val));
             }
+            "--max-frames" => {
+                idx += 1;
+                let val = args.get(idx)?;
+                max_frames = Some(val.parse::<u64>().ok()?);
+            }
+            "--dump-frame" => {
+                idx += 1;
+                let val = args.get(idx)?;
+                dump_frame = Some(PathBuf::from(val));
+            }
             _ if arg.starts_with('-') => {
                 eprintln!("Unknown option: {arg}");
                 return None;
@@ -162,6 +224,8 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         aot_path: positional.remove(0),
         game_dir,
         shader_cache,
+        max_frames,
+        dump_frame,
         headless,
         trace_imports,
         trace_d3d8,
@@ -172,6 +236,6 @@ fn print_usage(args: &[String]) {
     let bin = args.first().map(String::as_str).unwrap_or("toluca-runtime");
     eprintln!("Usage:");
     eprintln!(
-        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--headless] [--trace-imports] [--trace-d3d8]"
+        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--headless] [--trace-imports] [--trace-d3d8]"
     );
 }

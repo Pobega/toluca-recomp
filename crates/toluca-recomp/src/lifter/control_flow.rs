@@ -29,7 +29,19 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         let instr_va = instr.ip() as GuestAddr;
 
         match instr.mnemonic() {
-            Mnemonic::Nop | Mnemonic::Fnop => return ControlFlowOutcome::Continue,
+            Mnemonic::Nop
+            | Mnemonic::Fnop
+            | Mnemonic::Prefetchnta
+            | Mnemonic::Prefetcht0
+            | Mnemonic::Prefetcht1
+            | Mnemonic::Prefetcht2
+            | Mnemonic::Prefetchw
+            | Mnemonic::Prefetchwt1
+            | Mnemonic::Sfence
+            | Mnemonic::Lfence
+            | Mnemonic::Mfence
+            | Mnemonic::Pause
+            | Mnemonic::Clflush => return ControlFlowOutcome::Continue,
             Mnemonic::Cpuid => {
                 self.call_bridge_void(bridge::offsets::CPUID);
                 return ControlFlowOutcome::Continue;

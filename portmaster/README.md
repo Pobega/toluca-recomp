@@ -10,15 +10,15 @@ This directory holds the clean-room PortMaster release assets for *Silent Hill 2
 
 ## Controls (`toluca.gptk`)
 
-By default, `Toluca.sh` runs `gptokeyb2` with `toluca.gptk` and `--no-gamepad` so all menus and gameplay work consistently on stickless and dual-stick handhelds:
+By default, `Toluca.sh` runs `gptokeyb2` with `toluca.gptk` and `--no-gamepad` so all menus and gameplay work consistently on stickless and dual-stick handhelds (Nintendo face-button labels matching the PS2 layout):
 
 - **D-Pad / Left Stick:** Move / Navigate menus (`Arrow keys`)
-- **A / B:** Action / Confirm (`Space`), Cancel / Skip (`Esc`)
-- **X / Y:** Run (`Left Shift`), Map (`M`)
-- **L1 / R1:** Strafe Left / Right (`A` / `D`)
-- **L2 / R2:** Ready Weapon (`S`), Flashlight (`F`)
+- **B (South) / A (East):** Action / Confirm (`Space`), Cancel / Skip (`Esc`)
+- **Y (West) / X (North):** Run (`Left Shift`), Map (`M`)
+- **L1 / R1:** Step Left / Right (`A` / `D`)
+- **L2 / R2:** Search View (`S`), Ready Weapon (`F`)
 - **Start / Select:** Pause (`P`), Inventory (`I`)
-- **L3 / R3 / Right Stick:** Quick Health (`H`), Search View (`L`), Rotate Camera (`Q` / `E`)
+- **L3 / R3 / Right Stick:** Flashlight (`L`), Health Drink (`H`), Rotate Camera (`Q` / `E`)
 
 ## Supported Handheld Displays
 

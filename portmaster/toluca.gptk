@@ -1,9 +1,9 @@
 back = i
 start = p
-a = space
-b = esc
-x = leftshift
-y = m
+a = esc
+b = space
+x = m
+y = leftshift
 l1 = a
 r1 = d
 l2 = s

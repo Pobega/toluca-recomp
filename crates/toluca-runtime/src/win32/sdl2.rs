@@ -1130,7 +1130,10 @@ impl Drop for Sdl2WindowBackend {
 
 fn open_sdl2_library() -> Option<*mut c_void> {
     for candidate in [c"libSDL2-2.0.so.0", c"libSDL2.so"] {
-        let handle = unsafe { libc::dlopen(candidate.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+        // Use RTLD_GLOBAL so LD_PRELOAD shims (such as handheld input remappers
+        // that hook SDL_* and forward via RTLD_NEXT) can resolve real SDL symbols.
+        let handle =
+            unsafe { libc::dlopen(candidate.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) };
         if !handle.is_null() {
             return Some(handle);
         }
@@ -1139,7 +1142,12 @@ fn open_sdl2_library() -> Option<*mut c_void> {
 }
 
 fn load_sym<F: Copy>(lib_handle: *mut c_void, name: &CStr) -> Option<F> {
-    let ptr = unsafe { libc::dlsym(lib_handle, name.as_ptr()) };
+    // Search RTLD_DEFAULT first so LD_PRELOAD interposers (such as NextUI/PortMaster
+    // input shims) intercept SDL_Init/SDL_PollEvent/SDL_GetKeyboardState.
+    let mut ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    if ptr.is_null() {
+        ptr = unsafe { libc::dlsym(lib_handle, name.as_ptr()) };
+    }
     if ptr.is_null() {
         return None;
     }

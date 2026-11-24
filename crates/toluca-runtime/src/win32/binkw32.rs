@@ -17,7 +17,8 @@ const MAX_PATH_LEN: usize = 512;
 const BINK_STRUCT_ALLOC_BYTES: usize = 256;
 const BINK_HEADER_MIN_BYTES: usize = 44;
 const BINK_AUDIO_STEREO_FLAG: u16 = 0x2000;
-const BINK_FLAG_NOSOUND: u32 = 0x0008_0000;
+#[allow(dead_code)]
+const BINK_FLAG_NOSKIP: u32 = 0x0008_0000;
 
 const BINKSURFACE_MASK: u32 = 0x0F;
 pub const BINKSURFACE24: u32 = 1;
@@ -918,6 +919,7 @@ pub struct BinkState {
     ffmpeg: Option<FfmpegApi>,
     ffmpeg_load_attempted: bool,
     logged_missing_ffmpeg: bool,
+    sound_tracks_disabled: bool,
     requested_sound_tracks: Vec<u32>,
     instances: HashMap<GuestAddr, BinkInstance>,
 }
@@ -934,6 +936,7 @@ impl BinkState {
             ffmpeg: None,
             ffmpeg_load_attempted: false,
             logged_missing_ffmpeg: false,
+            sound_tracks_disabled: false,
             requested_sound_tracks: Vec::new(),
             instances: HashMap::new(),
         }
@@ -1014,9 +1017,9 @@ fn read_bink_header_from_file(path: &Path) -> Option<BinkHeader> {
 fn select_audio_track(
     header: &BinkHeader,
     requested_tracks: &[u32],
-    open_flags: u32,
+    sound_tracks_disabled: bool,
 ) -> (usize, Option<BinkAudioTrack>) {
-    if (open_flags & BINK_FLAG_NOSOUND) != 0 || header.audio_tracks.is_empty() {
+    if sound_tracks_disabled || header.audio_tracks.is_empty() {
         return (0, None);
     }
     if !requested_tracks.is_empty() {
@@ -1056,8 +1059,11 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
         return Ok(());
     };
 
-    let (audio_ordinal, selected_audio_track) =
-        select_audio_track(&header, &ctx.win32.bink.requested_sound_tracks, flags);
+    let (audio_ordinal, selected_audio_track) = select_audio_track(
+        &header,
+        &ctx.win32.bink.requested_sound_tracks,
+        ctx.win32.bink.sound_tracks_disabled,
+    );
     if bink_perf_enabled() {
         let track_rate = selected_audio_track.map_or(0, |t| t.sample_rate);
         let track_ch = selected_audio_track.map_or(0, |t| t.channels);
@@ -1140,6 +1146,7 @@ fn bink_set_sound_track(
     let total_tracks = peek_arg_u32(cpu, ctx.arena, 0)?;
     let track_ids_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
     ctx.win32.bink.requested_sound_tracks.clear();
+    ctx.win32.bink.sound_tracks_disabled = total_tracks == 0;
     if total_tracks > 0 && track_ids_ptr != 0 {
         let count = total_tracks.min(32);
         for i in 0..count {
@@ -1176,12 +1183,21 @@ fn bink_set_sound_on_off(
 ) -> Result<(), RuntimeError> {
     let bink_va = peek_arg_u32(cpu, ctx.arena, 0)?;
     let on_off = peek_arg_i32(cpu, ctx.arena, 1)?;
-    let ret = if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
+    let (ret, turned_on) = if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
+        let was_on = inst.sound_on;
         inst.sound_on = on_off != 0;
-        i32::from(inst.sound_on) as u32
+        (i32::from(inst.sound_on) as u32, !was_on && inst.sound_on)
     } else {
-        0
+        (0, false)
     };
+    if turned_on {
+        if let Ok(mut mixer) = ctx.win32.dsound.mixer.lock() {
+            mixer.clear_aux_pcm();
+            if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
+                inst.start_audio_frames = mixer.aux_played_frames();
+            }
+        }
+    }
     return_stdcall(cpu, ctx.arena, 2, ret)?;
     Ok(())
 }
@@ -1266,12 +1282,11 @@ fn bink_do_frame(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
     }
 
     if !decoded_aud.is_empty() && inst.sound_on {
-        let rate = inst
+        let track = inst
             .selected_audio_track
-            .map_or(DEFAULT_AUDIO_RATE, |t| u32::from(t.sample_rate.max(1)));
-        let ch = inst
-            .selected_audio_track
-            .map_or(DEFAULT_AUDIO_CHANNELS, |t| t.channels);
+            .or_else(|| inst.header.audio_tracks.first().copied());
+        let rate = track.map_or(DEFAULT_AUDIO_RATE, |t| u32::from(t.sample_rate.max(1)));
+        let ch = track.map_or(DEFAULT_AUDIO_CHANNELS, |t| t.channels);
         if let Ok(mut mixer) = ctx.win32.dsound.mixer.lock() {
             push_aux_to_mixer(&mut mixer, &decoded_aud, rate, ch);
         }
@@ -1589,5 +1604,35 @@ mod tests {
         convert_yuv_row(first, 0, 640, BINKSURFACE32, &mut row_bgra);
         assert_eq!(row_bgra.len(), 640 * 4);
         assert!(row_bgra.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn select_audio_track_keeps_sound_with_binknoskip_and_disables_on_zero_tracks() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"BIKi");
+        raw.extend_from_slice(&123_456u32.to_le_bytes());
+        raw.extend_from_slice(&10u32.to_le_bytes());
+        raw.extend_from_slice(&4096u32.to_le_bytes());
+        raw.extend_from_slice(&10u32.to_le_bytes());
+        raw.extend_from_slice(&640u32.to_le_bytes());
+        raw.extend_from_slice(&480u32.to_le_bytes());
+        raw.extend_from_slice(&30u32.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&(BINK_FLAG_NOSKIP | 0x4000).to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&4096u32.to_le_bytes());
+        raw.extend_from_slice(&48_000u16.to_le_bytes());
+        raw.extend_from_slice(&0x7000u16.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+
+        let hdr = parse_bink_header(&raw).unwrap();
+        let (ord, track) = select_audio_track(&hdr, &[0], false);
+        assert_eq!(ord, 0);
+        let track = track.expect("0x0008_4000 (BINKSNDTRACK | BINKNOSKIP) must keep audio");
+        assert_eq!(track.sample_rate, 48_000);
+        assert_eq!(track.channels, 2);
+
+        let (_, disabled) = select_audio_track(&hdr, &[], true);
+        assert!(disabled.is_none());
     }
 }

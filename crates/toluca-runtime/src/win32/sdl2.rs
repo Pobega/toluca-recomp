@@ -9,8 +9,9 @@ const SDL_INIT_GAMECONTROLLER: u32 = 0x0000_2000;
 pub const SDL_AUDIO_S16LSB: u16 = 0x8010;
 pub const SDL_AUDIO_DEFAULT_FREQ: i32 = 48_000;
 const SDL_AUDIO_ALLOW_FREQUENCY_CHANGE: i32 = 1;
+const SDL_AUDIO_ALLOW_SAMPLES_CHANGE: i32 = 8;
 pub const SDL_AUDIO_DEFAULT_CHANNELS: u8 = 2;
-pub const SDL_AUDIO_DEFAULT_SAMPLES: u16 = 2048;
+pub const SDL_AUDIO_DEFAULT_SAMPLES: u16 = 1024;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000;
 const SDL_WINDOW_FULLSCREEN_DESKTOP: u32 = 0x0000_1001;
 const SDL_WINDOW_OPENGL: u32 = 0x0000_0002;
@@ -1043,7 +1044,7 @@ impl Sdl2WindowBackend {
                 0,
                 &desired,
                 &mut obtained,
-                SDL_AUDIO_ALLOW_FREQUENCY_CHANGE,
+                SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_SAMPLES_CHANGE,
             )
         };
         if dev_id == 0 {

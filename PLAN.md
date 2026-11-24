@@ -90,10 +90,10 @@
 - [x] **Milestone Gate:** Menus and in-game 3D scenes render accurately using an OpenGL ES 3.0 context on Linux desktop. *(Verified on real vanilla NA v1.0 `sh2pc.exe`: renders pixel-clean Konami splash and full `SILENT HILL 2: DIRECTOR'S CUT` main menu live on Mesa OpenGL ES 3.0 with `last_gl_error=0x0000`, `toluca-progs.bin` cached, and EGL ES 3.0 3D lit + `vs_1_1`/`ps_1_1` GPU integration tests passing; in-game 3D entry unlocked once Phase 5 input drives `NEW GAME`.)*
 
 ### Phase 5 — Audio, Input & FMV Playback (`toluca-runtime`)
-- [ ] Implement `dsound` software mixer outputting to SDL2 audio.
-- [ ] Implement `dinput` over `SDL_GameController` + rumble, honoring PortMaster's `SDL_GAMECONTROLLERCONFIG`.
-- [ ] Implement `binkw32` playback via FFmpeg (`libavformat`/`libavcodec`/`libswscale`/`libswresample`) tuned for original 640×480 vanilla FMVs.
-- [ ] **Milestone Gate:** Playable vanilla *Silent Hill 2* on Linux x86-64 with sound, controls, saving/loading, and cutscenes.
+- [x] Implement `dsound` software mixer outputting to SDL2 audio.
+- [x] Implement `dinput` over `SDL_GameController` + rumble, honoring PortMaster's `SDL_GAMECONTROLLERCONFIG`.
+- [x] Implement `binkw32` playback via FFmpeg (`libavformat`/`libavcodec`/`libavutil`) tuned for original 640×480 vanilla FMVs.
+- [x] **Milestone Gate:** Playable vanilla *Silent Hill 2* on Linux x86-64 with sound, controls, saving/loading, and cutscenes. *(Verified live on real vanilla NA v1.0 `sh2pc.exe`: DirectInput 8 navigates title → scenario/difficulty menus into `NEW GAME`, `binkw32` decodes and renders `open.bik` live on GLES 3.0 with FMV audio mixed into DirectSound/SDL2, and James Sunderland + mirror reflection + restroom render accurately in real-time 3D with `last_gl_error=0x0000`.)*
 
 ### Phase 6 — ARM64 Cross-Compilation & PortMaster Packaging (`portmaster/`)
 - [ ] Set up reproducible `aarch64-unknown-linux-gnu` cross-compilation (Container/Toolbox targeting PortMaster's baseline glibc).

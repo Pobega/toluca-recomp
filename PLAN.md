@@ -96,9 +96,9 @@
 - [x] **Milestone Gate:** Playable vanilla *Silent Hill 2* on Linux x86-64 with sound, controls, saving/loading, and cutscenes. *(Verified live on real vanilla NA v1.0 `sh2pc.exe`: DirectInput 8 navigates title → scenario/difficulty menus into `NEW GAME`, `binkw32` decodes and renders `open.bik` live on GLES 3.0 with FMV audio mixed into DirectSound/SDL2, and James Sunderland + mirror reflection + restroom render accurately in real-time 3D with `last_gl_error=0x0000`.)*
 
 ### Phase 6 — ARM64 Cross-Compilation & PortMaster Packaging (`portmaster/`)
-- [ ] Set up reproducible `aarch64-unknown-linux-gnu` cross-compilation (Container/Toolbox targeting PortMaster's baseline glibc).
-- [ ] Author `portmaster/tools/patchscript` (validates `sh2pc.exe`, runs `toluca-recomp`, reports progress cleanly, verifies peak RAM <100 MB).
-- [ ] Author `portmaster/Toluca.sh`, `port.json`, and resolution/aspect defaults (`640x480` 4:3 and `1280x720` 16:9).
+- [x] Set up reproducible `aarch64-unknown-linux-gnu` cross-compilation (Container/Toolbox targeting PortMaster's baseline glibc). *(Verified via `Containerfile.aarch64` + `scripts/build-aarch64.sh` on Debian Bullseye / glibc 2.31: stripped `toluca-recomp` 5.2 MiB & `toluca-runtime` 1.4 MiB with max `GLIBC_2.30`, zero SDL2/GLES/FFmpeg link deps, 95 ARM64 workspace tests + live `sh2pc.exe` AArch64 compile & headless Frame 1 boot passing under `qemu-aarch64-static`.)*
+- [x] Author `portmaster/tools/patchscript` (validates `sh2pc.exe`, runs `toluca-recomp`, reports progress cleanly, verifies peak RAM <100 MB). *(Dry-run verified on vanilla NA v1.0 `sh2pc.exe`: 40.99 MiB peak RSS, atomic `cache/toluca_code.bin` + SHA-1 stamp.)*
+- [x] Author `portmaster/Toluca.sh`, `port.json`, and resolution/aspect defaults (`640x480` 4:3 and `1280x720` 16:9). *(Packaged cleanly into `dist/toluca-portmaster.zip` via `scripts/package-portmaster.sh`; all shell scripts pass `shellcheck`.)*
 - [ ] Verify end-to-end on real 1 GB ARM64 handheld hardware (cold first launch via `patchscript` → gameplay at steady 30 FPS).
 
 ### Phase 7 — Post-MVP Enhancements

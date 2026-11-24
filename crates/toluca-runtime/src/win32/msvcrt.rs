@@ -8,7 +8,10 @@ use toluca_core::cpu::{ExitReason, Gpr, GuestCpuState};
 use crate::arena::{ArenaError, GuestArena};
 use crate::callconv::{peek_arg_i32, peek_arg_u32, return_cdecl, return_cdecl_u64, return_stdcall};
 use crate::runtime::{ImportHandler, ImportRegistry, RuntimeContext, RuntimeError};
-use crate::win32::{CFileEntry, Win32Handle};
+use crate::win32::{
+    CFileEntry, MSVCRT_IOBUF_FLAG_OFF, MSVCRT_IOBUF_SIZE, MSVCRT_IOEOF, MSVCRT_IOERR,
+    MSVCRT_IOREAD, MSVCRT_IORW, MSVCRT_IOWRT,
+};
 
 const MAX_STR_SCAN: usize = 65536;
 const SEEK_SET: u32 = 0;
@@ -56,6 +59,11 @@ pub fn register_imports(registry: &mut ImportRegistry) {
         ("fseek", c_fseek),
         ("ftell", c_ftell),
         ("feof", c_feof),
+        ("ferror", c_ferror),
+        ("clearerr", c_clearerr),
+        ("rewind", c_rewind),
+        ("fgetc", c_fgetc),
+        ("getc", c_fgetc),
         ("fflush", c_fflush),
         ("fclose", c_fclose),
         ("fgets", c_fgets),
@@ -891,6 +899,20 @@ fn run_sscanf(
     Ok(count)
 }
 
+fn sync_cfile_flags(
+    arena: &mut GuestArena,
+    stream: GuestAddr,
+    base_flag: u32,
+    eof: bool,
+    err: bool,
+) -> Result<(), RuntimeError> {
+    let flags = base_flag
+        | if eof { MSVCRT_IOEOF } else { 0 }
+        | if err { MSVCRT_IOERR } else { 0 };
+    arena.write_u32(stream + MSVCRT_IOBUF_FLAG_OFF, flags)?;
+    Ok(())
+}
+
 fn c_fopen(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let path_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
     let mode_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
@@ -900,24 +922,40 @@ fn c_fopen(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), 
 
     let plus = mode.contains('+');
     let mut opts = OpenOptions::new();
-    match mode.bytes().next() {
+    let base_flag = match mode.bytes().next() {
         Some(b'r') => {
             opts.read(true).write(plus);
+            if plus { MSVCRT_IORW } else { MSVCRT_IOREAD }
         }
         Some(b'w') => {
             opts.read(plus).write(true).create(true).truncate(true);
+            if plus { MSVCRT_IORW } else { MSVCRT_IOWRT }
         }
         Some(b'a') => {
             opts.read(plus).append(true).create(true);
+            if plus { MSVCRT_IORW } else { MSVCRT_IOWRT }
         }
         _ => {
             return_cdecl(cpu, ctx.arena, 0)?;
             return Ok(());
         }
-    }
+    };
 
     let fp = match opts.open(&host_path) {
-        Ok(file) => ctx.win32.alloc_cfile(CFileEntry { file, eof: false }),
+        Ok(file) => {
+            let iobuf_va = ctx.heap.alloc(ctx.arena, MSVCRT_IOBUF_SIZE, true)?;
+            ctx.arena.write_u32(iobuf_va + MSVCRT_IOBUF_FLAG_OFF, base_flag)?;
+            ctx.win32.insert_cfile(
+                iobuf_va,
+                CFileEntry {
+                    file,
+                    eof: false,
+                    err: false,
+                    base_flag,
+                },
+            );
+            iobuf_va
+        }
         Err(_) => 0,
     };
     return_cdecl(cpu, ctx.arena, fp)?;
@@ -936,24 +974,31 @@ fn c_fread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), 
         return Ok(());
     }
 
-    let Some(entry) = ctx.win32.get_cfile_mut(stream) else {
-        return_cdecl(cpu, ctx.arena, 0)?;
-        return Ok(());
+    let (filled, base_flag, eof, err, tmp) = {
+        let Some(entry) = ctx.win32.get_cfile_mut(stream) else {
+            return_cdecl(cpu, ctx.arena, 0)?;
+            return Ok(());
+        };
+
+        let mut tmp = vec![0u8; total_bytes];
+        let mut filled = 0usize;
+        while filled < total_bytes {
+            match entry.file.read(&mut tmp[filled..]) {
+                Ok(0) => {
+                    entry.eof = true;
+                    break;
+                }
+                Ok(n) => filled += n,
+                Err(_) => {
+                    entry.err = true;
+                    break;
+                }
+            }
+        }
+        (filled, entry.base_flag, entry.eof, entry.err, tmp)
     };
 
-    let mut tmp = vec![0u8; total_bytes];
-    let mut filled = 0usize;
-    while filled < total_bytes {
-        match entry.file.read(&mut tmp[filled..]) {
-            Ok(0) => {
-                entry.eof = true;
-                break;
-            }
-            Ok(n) => filled += n,
-            Err(_) => break,
-        }
-    }
-
+    sync_cfile_flags(ctx.arena, stream, base_flag, eof, err)?;
     if filled > 0 {
         ctx.arena.write_bytes(buf_ptr, &tmp[..filled])?;
     }
@@ -974,15 +1019,23 @@ fn c_fwrite(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(),
     }
 
     let data = ctx.arena.read_bytes(buf_ptr, total_bytes)?.to_vec();
-    let Some(entry) = ctx.win32.get_cfile_mut(stream) else {
-        return_cdecl(cpu, ctx.arena, 0)?;
-        return Ok(());
+    let (written, base_flag, eof, err) = {
+        let Some(entry) = ctx.win32.get_cfile_mut(stream) else {
+            return_cdecl(cpu, ctx.arena, 0)?;
+            return Ok(());
+        };
+
+        let written = match entry.file.write_all(&data) {
+            Ok(()) => count as u32,
+            Err(_) => {
+                entry.err = true;
+                0
+            }
+        };
+        (written, entry.base_flag, entry.eof, entry.err)
     };
 
-    let written = match entry.file.write_all(&data) {
-        Ok(()) => count as u32,
-        Err(_) => 0,
-    };
+    sync_cfile_flags(ctx.arena, stream, base_flag, eof, err)?;
     return_cdecl(cpu, ctx.arena, written)?;
     Ok(())
 }
@@ -1002,17 +1055,23 @@ fn c_fseek(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), 
         }
     };
 
-    let res = match ctx.win32.get_cfile_mut(stream) {
+    let (res, flags_to_sync) = match ctx.win32.get_cfile_mut(stream) {
         Some(entry) => {
             entry.eof = false;
-            if entry.file.seek(seek_from).is_ok() {
-                0
-            } else {
-                -1i32 as u32
+            let ok = entry.file.seek(seek_from).is_ok();
+            if !ok {
+                entry.err = true;
             }
+            (
+                if ok { 0 } else { -1i32 as u32 },
+                Some((entry.base_flag, entry.eof, entry.err)),
+            )
         }
-        None => -1i32 as u32,
+        None => (-1i32 as u32, None),
     };
+    if let Some((base_flag, eof, err)) = flags_to_sync {
+        sync_cfile_flags(ctx.arena, stream, base_flag, eof, err)?;
+    }
     return_cdecl(cpu, ctx.arena, res)?;
     Ok(())
 }
@@ -1037,6 +1096,72 @@ fn c_feof(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), R
     Ok(())
 }
 
+fn c_ferror(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let stream = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let err = ctx
+        .win32
+        .get_cfile_mut(stream)
+        .is_some_and(|entry| entry.err);
+    return_cdecl(cpu, ctx.arena, u32::from(err))?;
+    Ok(())
+}
+
+fn c_clearerr(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let stream = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let flags = ctx.win32.get_cfile_mut(stream).map(|entry| {
+        entry.eof = false;
+        entry.err = false;
+        entry.base_flag
+    });
+    if let Some(base_flag) = flags {
+        sync_cfile_flags(ctx.arena, stream, base_flag, false, false)?;
+    }
+    return_cdecl(cpu, ctx.arena, 0)?;
+    Ok(())
+}
+
+fn c_rewind(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let stream = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let flags = ctx.win32.get_cfile_mut(stream).map(|entry| {
+        entry.eof = false;
+        entry.err = false;
+        let _ = entry.file.seek(SeekFrom::Start(0));
+        entry.base_flag
+    });
+    if let Some(base_flag) = flags {
+        sync_cfile_flags(ctx.arena, stream, base_flag, false, false)?;
+    }
+    return_cdecl(cpu, ctx.arena, 0)?;
+    Ok(())
+}
+
+fn c_fgetc(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let stream = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let (ret, flags) = match ctx.win32.get_cfile_mut(stream) {
+        Some(entry) => {
+            let mut b = [0u8; 1];
+            let r = match entry.file.read(&mut b) {
+                Ok(0) => {
+                    entry.eof = true;
+                    -1i32 as u32
+                }
+                Ok(_) => u32::from(b[0]),
+                Err(_) => {
+                    entry.err = true;
+                    -1i32 as u32
+                }
+            };
+            (r, Some((entry.base_flag, entry.eof, entry.err)))
+        }
+        None => (-1i32 as u32, None),
+    };
+    if let Some((base_flag, eof, err)) = flags {
+        sync_cfile_flags(ctx.arena, stream, base_flag, eof, err)?;
+    }
+    return_cdecl(cpu, ctx.arena, ret)?;
+    Ok(())
+}
+
 fn c_fflush(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let stream = peek_arg_u32(cpu, ctx.arena, 0)?;
     if stream != 0 {
@@ -1051,6 +1176,7 @@ fn c_fflush(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(),
 fn c_fclose(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let stream = peek_arg_u32(cpu, ctx.arena, 0)?;
     let res = if ctx.win32.close_cfile(stream) {
+        let _ = ctx.heap.free(ctx.arena, stream);
         0
     } else {
         -1i32 as u32
@@ -1069,29 +1195,36 @@ fn c_fgets(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), 
         return Ok(());
     }
 
-    let Some(entry) = ctx.win32.get_cfile_mut(stream) else {
-        return_cdecl(cpu, ctx.arena, 0)?;
-        return Ok(());
-    };
+    let (mut out, base_flag, eof, err) = {
+        let Some(entry) = ctx.win32.get_cfile_mut(stream) else {
+            return_cdecl(cpu, ctx.arena, 0)?;
+            return Ok(());
+        };
 
-    let mut out = Vec::new();
-    let mut byte = [0u8; 1];
-    while out.len() + 1 < max_count as usize {
-        match entry.file.read(&mut byte) {
-            Ok(0) => {
-                entry.eof = true;
-                break;
-            }
-            Ok(_) => {
-                out.push(byte[0]);
-                if byte[0] == b'\n' {
+        let mut out = Vec::new();
+        let mut byte = [0u8; 1];
+        while out.len() + 1 < max_count as usize {
+            match entry.file.read(&mut byte) {
+                Ok(0) => {
+                    entry.eof = true;
+                    break;
+                }
+                Ok(_) => {
+                    out.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    entry.err = true;
                     break;
                 }
             }
-            Err(_) => break,
         }
-    }
+        (out, entry.base_flag, entry.eof, entry.err)
+    };
 
+    sync_cfile_flags(ctx.arena, stream, base_flag, eof, err)?;
     if out.is_empty() {
         return_cdecl(cpu, ctx.arena, 0)?;
         return Ok(());
@@ -1247,6 +1380,7 @@ fn c_longjmp(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
     cpu.set_gpr(Gpr::Esp, esp);
     cpu.set_gpr(Gpr::Eax, ret_val);
     cpu.eip = ret_va;
+    cpu.exit_reason = ExitReason::Longjmp as u32;
     Ok(())
 }
 
@@ -1648,8 +1782,10 @@ fn c_strtok(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(),
 }
 
 fn c_beginthread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
-    let handle = ctx.win32.alloc_handle(Win32Handle::Thread { exit_code: 0 });
-    return_cdecl(cpu, ctx.arena, handle)?;
+    let start_va = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let param = peek_arg_u32(cpu, ctx.arena, 2)?;
+    let handle = crate::win32::kernel32::alloc_and_queue_guest_thread(ctx, start_va, param, false)?;
+    return_cdecl(cpu, ctx.arena, handle.unwrap_or(u32::MAX))?;
     Ok(())
 }
 

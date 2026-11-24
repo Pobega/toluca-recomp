@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use toluca_core::GuestAddr;
 use toluca_core::aot::ImportSymbol;
@@ -234,6 +236,7 @@ pub struct RuntimeContext<'a> {
     pub vmem: &'a mut VirtualMemoryManager,
     pub win32: &'a mut Win32State,
     pub last_error: &'a mut u32,
+    pub active_host_tid: u64,
     pub host_start_instant: Instant,
     pub pe_image_base: GuestAddr,
     code: &'a AotCodeImage,
@@ -272,7 +275,6 @@ impl<'a> RuntimeContext<'a> {
 
         let saved_eip = cpu.eip;
         let saved_esp = cpu.gpr(Gpr::Esp);
-        let saved_bridge = cpu.bridge;
         let saved_exit_reason = cpu.exit_reason;
         let saved_exit_detail = cpu.exit_detail;
 
@@ -281,12 +283,9 @@ impl<'a> RuntimeContext<'a> {
         cpu.exit_reason = ExitReason::Running as u32;
         cpu.exit_detail = 0;
 
-        let local_bridge = build_host_bridge((self as *mut RuntimeContext<'a>).cast());
-        cpu.bridge = &local_bridge;
         unsafe {
             cb_fn(cpu);
         }
-        cpu.bridge = saved_bridge;
 
         if let Some(err) = self.pending_error.take() {
             return Err(err);
@@ -313,18 +312,65 @@ impl<'a> RuntimeContext<'a> {
     }
 }
 
-pub struct Runtime {
-    pe: PeImage,
-    code: AotCodeImage,
+struct RuntimeInner {
     arena: GuestArena,
     heap: GuestHeap,
     vmem: VirtualMemoryManager,
     win32: Win32State,
     imports: Vec<ResolvedImportSlot>,
     import_slot_map: HashMap<ImportKey, usize>,
-    registry: ImportRegistry,
     last_error: u32,
+}
+
+struct SharedRuntime {
+    pe_image_base: GuestAddr,
+    code: AotCodeImage,
+    registry: ImportRegistry,
     host_start_instant: Instant,
+    arena_base: usize,
+    inner: Mutex<RuntimeInner>,
+    sync_cv: Condvar,
+    shutdown: AtomicBool,
+    worker_done_flags: Mutex<Vec<Arc<AtomicBool>>>,
+}
+
+unsafe impl Send for SharedRuntime {}
+unsafe impl Sync for SharedRuntime {}
+
+pub struct LockedRef<'a, T> {
+    guard: MutexGuard<'a, RuntimeInner>,
+    proj: fn(&RuntimeInner) -> &T,
+}
+
+impl<T> Deref for LockedRef<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        (self.proj)(&self.guard)
+    }
+}
+
+pub struct LockedMut<'a, T> {
+    guard: MutexGuard<'a, RuntimeInner>,
+    proj_ref: fn(&RuntimeInner) -> &T,
+    proj_mut: fn(&mut RuntimeInner) -> &mut T,
+}
+
+impl<T> Deref for LockedMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        (self.proj_ref)(&self.guard)
+    }
+}
+
+impl<T> DerefMut for LockedMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        (self.proj_mut)(&mut self.guard)
+    }
+}
+
+pub struct Runtime {
+    pe: PeImage,
+    shared: Arc<SharedRuntime>,
 }
 
 impl Runtime {
@@ -400,19 +446,29 @@ impl Runtime {
             });
         }
 
-        Ok(Self {
-            pe,
-            code,
+        let arena_base = arena.base_ptr() as usize;
+        let inner = RuntimeInner {
             arena,
             heap,
             vmem: VirtualMemoryManager::new(),
             win32,
             imports,
             import_slot_map,
-            registry,
             last_error: 0,
+        };
+        let shared = Arc::new(SharedRuntime {
+            pe_image_base: pe.image_base,
+            code,
+            registry,
             host_start_instant: Instant::now(),
-        })
+            arena_base,
+            inner: Mutex::new(inner),
+            sync_cv: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            worker_done_flags: Mutex::new(Vec::new()),
+        });
+
+        Ok(Self { pe, shared })
     }
 
     pub fn register_dynamic_import(
@@ -420,60 +476,60 @@ impl Runtime {
         dll_name: &str,
         symbol: ImportSymbol,
     ) -> Option<GuestAddr> {
+        let mut guard = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
         register_dynamic_slot(
-            &mut self.imports,
-            &mut self.import_slot_map,
-            &self.registry,
+            &mut inner.imports,
+            &mut inner.import_slot_map,
+            &self.shared.registry,
             dll_name,
             symbol,
         )
     }
 
     pub fn run_entry(&mut self) -> Result<RunOutcome, RuntimeError> {
-        self.call_va(self.code.entry_point_va(), &[])
+        self.call_va(self.shared.code.entry_point_va(), &[])
     }
 
     pub fn call_va(&mut self, va: GuestAddr, args: &[u32]) -> Result<RunOutcome, RuntimeError> {
         let entry_fn = self
+            .shared
             .code
             .resolve_va(va)
             .ok_or(RuntimeError::UnmappedEntry(va))?;
 
-        let mut cpu = GuestCpuState::new(self.arena.base_ptr(), std::ptr::null());
+        self.shared.shutdown.store(false, Ordering::Release);
+        let mut cpu = GuestCpuState::new(self.shared.arena_base as *mut u8, std::ptr::null());
         cpu.eip = va;
         cpu.fs_base = GUEST_TEB_ADDR;
+        {
+            let mut guard = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            push_args_and_sentinel(&mut cpu, &mut guard.arena, args)?;
+        }
 
-        push_args_and_sentinel(&mut cpu, &mut self.arena, args)?;
-
-        let mut trap: Option<TrapInfo> = None;
-        let mut pending_error: Option<RuntimeError> = None;
-
-        let mut ctx = RuntimeContext {
-            arena: &mut self.arena,
-            heap: &mut self.heap,
-            vmem: &mut self.vmem,
-            win32: &mut self.win32,
-            last_error: &mut self.last_error,
-            host_start_instant: self.host_start_instant,
-            pe_image_base: self.pe.image_base,
-            code: &self.code,
-            imports: &mut self.imports,
-            import_slot_map: &mut self.import_slot_map,
-            registry: &self.registry,
-            trap: &mut trap,
-            pending_error: &mut pending_error,
+        let mut tctx = ThreadBridgeContext {
+            shared: Arc::clone(&self.shared),
+            tid: 1,
+            held_inner: None,
+            trap: None,
+            pending_error: None,
         };
-
-        let bridge = build_host_bridge((&mut ctx as *mut RuntimeContext<'_>).cast());
+        let bridge = build_host_bridge((&raw mut tctx).cast());
         cpu.bridge = &bridge;
 
-        let _sig_guard = SigsegvDiagnosticGuard::install(ctx.arena.base_ptr());
+        let _sig_guard = SigsegvDiagnosticGuard::install(
+            self.shared.arena_base as *mut u8,
+            self.shared.code.code_range(),
+            (&raw mut cpu) as usize,
+        );
         unsafe {
             entry_fn(&mut cpu);
         }
         drop(_sig_guard);
 
-        if let Some(err) = pending_error {
+        self.shutdown_workers();
+
+        if let Some(err) = tctx.pending_error {
             return Err(err);
         }
 
@@ -488,8 +544,27 @@ impl Runtime {
             eax: cpu.gpr(Gpr::Eax),
             eip: cpu.eip,
             esp: cpu.gpr(Gpr::Esp),
-            trap,
+            trap: tctx.trap,
         })
+    }
+
+    fn shutdown_workers(&self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.sync_cv.notify_all();
+        let flags = {
+            let mut list = self
+                .shared
+                .worker_done_flags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *list)
+        };
+        for _ in 0..10 {
+            if flags.iter().all(|f| f.load(Ordering::Acquire)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub fn pe(&self) -> &PeImage {
@@ -497,37 +572,62 @@ impl Runtime {
     }
 
     pub fn code(&self) -> &AotCodeImage {
-        &self.code
+        &self.shared.code
     }
 
-    pub fn arena(&self) -> &GuestArena {
-        &self.arena
+    pub fn arena(&self) -> LockedRef<'_, GuestArena> {
+        LockedRef {
+            guard: self.shared.inner.lock().unwrap_or_else(|e| e.into_inner()),
+            proj: |inner| &inner.arena,
+        }
     }
 
-    pub fn arena_mut(&mut self) -> &mut GuestArena {
-        &mut self.arena
+    pub fn arena_mut(&mut self) -> LockedMut<'_, GuestArena> {
+        LockedMut {
+            guard: self.shared.inner.lock().unwrap_or_else(|e| e.into_inner()),
+            proj_ref: |inner| &inner.arena,
+            proj_mut: |inner| &mut inner.arena,
+        }
     }
 
-    pub fn heap(&self) -> &GuestHeap {
-        &self.heap
+    pub fn heap(&self) -> LockedRef<'_, GuestHeap> {
+        LockedRef {
+            guard: self.shared.inner.lock().unwrap_or_else(|e| e.into_inner()),
+            proj: |inner| &inner.heap,
+        }
     }
 
-    pub fn vmem(&self) -> &VirtualMemoryManager {
-        &self.vmem
+    pub fn vmem(&self) -> LockedRef<'_, VirtualMemoryManager> {
+        LockedRef {
+            guard: self.shared.inner.lock().unwrap_or_else(|e| e.into_inner()),
+            proj: |inner| &inner.vmem,
+        }
     }
 
-    pub fn win32(&self) -> &Win32State {
-        &self.win32
+    pub fn win32(&self) -> LockedRef<'_, Win32State> {
+        LockedRef {
+            guard: self.shared.inner.lock().unwrap_or_else(|e| e.into_inner()),
+            proj: |inner| &inner.win32,
+        }
     }
 
-    pub fn win32_mut(&mut self) -> &mut Win32State {
-        &mut self.win32
+    pub fn win32_mut(&mut self) -> LockedMut<'_, Win32State> {
+        LockedMut {
+            guard: self.shared.inner.lock().unwrap_or_else(|e| e.into_inner()),
+            proj_ref: |inner| &inner.win32,
+            proj_mut: |inner| &mut inner.win32,
+        }
     }
 
     pub fn last_error(&self) -> u32 {
-        self.last_error
+        self.shared
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_error
     }
 }
+
 
 fn import_slot_to_va(slot_idx: usize) -> GuestAddr {
     IMPORT_THUNK_BASE + (slot_idx as u32) * THUNK_STRIDE
@@ -581,6 +681,7 @@ fn exit_reason_from_u32(raw: u32) -> ExitReason {
         4 => ExitReason::UnsupportedInstruction,
         5 => ExitReason::HostTrap,
         6 => ExitReason::GuestException,
+        7 => ExitReason::Longjmp,
         _ => ExitReason::HostTrap,
     }
 }
@@ -600,13 +701,91 @@ fn build_host_bridge(user_data: *mut core::ffi::c_void) -> HostBridge {
     }
 }
 
-unsafe fn context_from_cpu<'a>(
+struct ThreadBridgeContext {
+    shared: Arc<SharedRuntime>,
+    tid: u64,
+    held_inner: Option<*mut RuntimeInner>,
+    trap: Option<TrapInfo>,
+    pending_error: Option<RuntimeError>,
+}
+
+unsafe fn thread_ctx_from_cpu<'a>(
     cpu: *mut GuestCpuState,
-) -> Option<(&'a mut GuestCpuState, &'a mut RuntimeContext<'a>)> {
+) -> Option<(&'a mut GuestCpuState, &'a mut ThreadBridgeContext)> {
     let state = unsafe { cpu.as_mut() }?;
     let bridge = unsafe { state.bridge.as_ref() }?;
-    let ctx = unsafe { bridge.user_data.cast::<RuntimeContext<'a>>().as_mut() }?;
-    Some((state, ctx))
+    let tctx = unsafe { bridge.user_data.cast::<ThreadBridgeContext>().as_mut() }?;
+    Some((state, tctx))
+}
+
+fn with_locked_ctx<R>(
+    tctx: &mut ThreadBridgeContext,
+    state: &mut GuestCpuState,
+    f: impl FnOnce(&mut RuntimeContext<'_>, &mut GuestCpuState) -> R,
+) -> R {
+    if let Some(inner_ptr) = tctx.held_inner {
+        let inner = unsafe { &mut *inner_ptr };
+        let mut ctx = RuntimeContext {
+            arena: &mut inner.arena,
+            heap: &mut inner.heap,
+            vmem: &mut inner.vmem,
+            win32: &mut inner.win32,
+            last_error: &mut inner.last_error,
+            active_host_tid: tctx.tid,
+            host_start_instant: tctx.shared.host_start_instant,
+            pe_image_base: tctx.shared.pe_image_base,
+            code: &tctx.shared.code,
+            imports: &mut inner.imports,
+            import_slot_map: &mut inner.import_slot_map,
+            registry: &tctx.shared.registry,
+            trap: &mut tctx.trap,
+            pending_error: &mut tctx.pending_error,
+        };
+        return f(&mut ctx, state);
+    }
+
+    let (result, pending_wait, pending_threads, pending_timers, notify_sync) = {
+        let mut guard = tctx.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        tctx.held_inner = Some(&raw mut *guard);
+        let inner = &mut *guard;
+        let mut ctx = RuntimeContext {
+            arena: &mut inner.arena,
+            heap: &mut inner.heap,
+            vmem: &mut inner.vmem,
+            win32: &mut inner.win32,
+            last_error: &mut inner.last_error,
+            active_host_tid: tctx.tid,
+            host_start_instant: tctx.shared.host_start_instant,
+            pe_image_base: tctx.shared.pe_image_base,
+            code: &tctx.shared.code,
+            imports: &mut inner.imports,
+            import_slot_map: &mut inner.import_slot_map,
+            registry: &tctx.shared.registry,
+            trap: &mut tctx.trap,
+            pending_error: &mut tctx.pending_error,
+        };
+        let res = f(&mut ctx, state);
+        let wait = inner.win32.pending_wait.take();
+        let threads = std::mem::take(&mut inner.win32.pending_threads);
+        let timers = std::mem::take(&mut inner.win32.pending_timers);
+        let notify = std::mem::replace(&mut inner.win32.notify_sync, false);
+        tctx.held_inner = None;
+        (res, wait, threads, timers, notify)
+    };
+
+    if notify_sync {
+        tctx.shared.sync_cv.notify_all();
+    }
+    for spawn in pending_threads {
+        spawn_guest_thread(Arc::clone(&tctx.shared), spawn);
+    }
+    for timer in pending_timers {
+        spawn_timer_thread(Arc::clone(&tctx.shared), timer);
+    }
+    if let Some(wait) = pending_wait {
+        perform_host_wait(&tctx.shared, tctx.tid, state, wait);
+    }
+    result
 }
 
 fn dispatch_import_slot(ctx: &mut RuntimeContext<'_>, state: &mut GuestCpuState, import_index: u32) {
@@ -694,6 +873,9 @@ fn resolve_data_import(
 const LAST_IMPORT_CAP: usize = 96;
 static ARENA_BASE_ADDR: AtomicUsize = AtomicUsize::new(0);
 static ARENA_END_ADDR: AtomicUsize = AtomicUsize::new(0);
+static CODE_BASE_ADDR: AtomicUsize = AtomicUsize::new(0);
+static CODE_END_ADDR: AtomicUsize = AtomicUsize::new(0);
+static CPU_STATE_ADDR: AtomicUsize = AtomicUsize::new(0);
 static LAST_IMPORT_LEN: AtomicUsize = AtomicUsize::new(0);
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO_U8: AtomicU8 = AtomicU8::new(0);
@@ -718,11 +900,14 @@ struct SigsegvDiagnosticGuard {
 }
 
 impl SigsegvDiagnosticGuard {
-    fn install(arena_base: *mut u8) -> Self {
+    fn install(arena_base: *mut u8, code_range: (usize, usize), cpu_addr: usize) -> Self {
         let base = arena_base as usize;
         let end = base.saturating_add(GUEST_ARENA_SIZE as usize);
         ARENA_BASE_ADDR.store(base, Ordering::Relaxed);
         ARENA_END_ADDR.store(end, Ordering::Relaxed);
+        CODE_BASE_ADDR.store(code_range.0, Ordering::Relaxed);
+        CODE_END_ADDR.store(code_range.1, Ordering::Relaxed);
+        CPU_STATE_ADDR.store(cpu_addr, Ordering::Relaxed);
 
         let mut new_action: libc::sigaction = unsafe { std::mem::zeroed() };
         new_action.sa_sigaction = sigsegv_diagnostic_handler as usize;
@@ -745,13 +930,16 @@ impl Drop for SigsegvDiagnosticGuard {
         }
         ARENA_BASE_ADDR.store(0, Ordering::Relaxed);
         ARENA_END_ADDR.store(0, Ordering::Relaxed);
+        CODE_BASE_ADDR.store(0, Ordering::Relaxed);
+        CODE_END_ADDR.store(0, Ordering::Relaxed);
+        CPU_STATE_ADDR.store(0, Ordering::Relaxed);
     }
 }
 
 extern "C" fn sigsegv_diagnostic_handler(
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
-    _ucontext: *mut core::ffi::c_void,
+    ucontext: *mut core::ffi::c_void,
 ) {
     let fault_addr = if info.is_null() {
         0usize
@@ -760,8 +948,10 @@ extern "C" fn sigsegv_diagnostic_handler(
     };
     let base = ARENA_BASE_ADDR.load(Ordering::Relaxed);
     let end = ARENA_END_ADDR.load(Ordering::Relaxed);
+    let code_base = CODE_BASE_ADDR.load(Ordering::Relaxed);
+    let code_end = CODE_END_ADDR.load(Ordering::Relaxed);
 
-    let mut out = [0u8; 256];
+    let mut out = [0u8; 320];
     let mut pos = 0usize;
     pos = push_bytes(&mut out, pos, b"[SIGSEGV] host=0x");
     pos = push_hex_usize(&mut out, pos, fault_addr);
@@ -771,6 +961,26 @@ extern "C" fn sigsegv_diagnostic_handler(
     } else {
         pos = push_bytes(&mut out, pos, b" (outside guest arena)");
     }
+
+    #[cfg(target_arch = "x86_64")]
+    if !ucontext.is_null() {
+        let uc = ucontext.cast::<libc::ucontext_t>();
+        let rip = unsafe { (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize };
+        pos = push_bytes(&mut out, pos, b" rip=0x");
+        pos = push_hex_usize(&mut out, pos, rip);
+        if code_base != 0 && rip >= code_base && rip < code_end {
+            pos = push_bytes(&mut out, pos, b" code_off=0x");
+            pos = push_hex_usize(&mut out, pos, rip - code_base);
+        }
+    }
+
+    let cpu_addr = CPU_STATE_ADDR.load(Ordering::Relaxed);
+    if cpu_addr != 0 {
+        let eip = unsafe { (*(cpu_addr as *const GuestCpuState)).eip };
+        pos = push_bytes(&mut out, pos, b" eip=0x");
+        pos = push_hex_usize(&mut out, pos, eip as usize);
+    }
+
     pos = push_bytes(&mut out, pos, b" last_import=");
     let imp_len = LAST_IMPORT_LEN.load(Ordering::Relaxed).min(LAST_IMPORT_CAP);
     for slot in &LAST_IMPORT_BUF[..imp_len] {
@@ -809,20 +1019,30 @@ fn push_hex_usize(buf: &mut [u8], mut pos: usize, val: usize) -> usize {
 }
 
 unsafe extern "C" fn bridge_call_import(cpu: *mut GuestCpuState, import_index: u32) {
-    let Some((state, ctx)) = (unsafe { context_from_cpu(cpu) }) else {
+    let Some((state, tctx)) = (unsafe { thread_ctx_from_cpu(cpu) }) else {
         return;
     };
     if state.exit_reason != ExitReason::Running as u32 {
         return;
     }
-    dispatch_import_slot(ctx, state, import_index);
+    if tctx.shared.shutdown.load(Ordering::Acquire) && tctx.tid != 1 {
+        state.exit_reason = ExitReason::Halt as u32;
+        return;
+    }
+    with_locked_ctx(tctx, state, |ctx, state| {
+        dispatch_import_slot(ctx, state, import_index);
+    });
 }
 
 unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u32) {
-    let Some((state, ctx)) = (unsafe { context_from_cpu(cpu) }) else {
+    let Some((state, tctx)) = (unsafe { thread_ctx_from_cpu(cpu) }) else {
         return;
     };
     if state.exit_reason != ExitReason::Running as u32 {
+        return;
+    }
+    if tctx.shared.shutdown.load(Ordering::Acquire) && tctx.tid != 1 {
+        state.exit_reason = ExitReason::Halt as u32;
         return;
     }
 
@@ -836,26 +1056,30 @@ unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u3
         && (target_va - IMPORT_THUNK_BASE).is_multiple_of(THUNK_STRIDE)
     {
         let slot_idx = (target_va - IMPORT_THUNK_BASE) / THUNK_STRIDE;
-        dispatch_import_slot(ctx, state, slot_idx);
+        with_locked_ctx(tctx, state, |ctx, state| {
+            dispatch_import_slot(ctx, state, slot_idx);
+        });
         return;
     }
 
     if let Some((iface, method_idx)) = toluca_d3d8::decode_com_thunk(target_va) {
-        crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_idx);
+        with_locked_ctx(tctx, state, |ctx, state| {
+            crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_idx);
+        });
         return;
     }
 
     if (COM_THUNK_BASE..GUEST_THUNK_END).contains(&target_va) {
         state.exit_reason = ExitReason::HostTrap as u32;
         state.exit_detail = target_va;
-        *ctx.trap = Some(TrapInfo::UnimplementedCom {
+        tctx.trap = Some(TrapInfo::UnimplementedCom {
             interface_id: 0,
             method_index: 0,
         });
         return;
     }
 
-    if let Some(target_fn) = ctx.code.resolve_va(target_va) {
+    if let Some(target_fn) = tctx.shared.code.resolve_va(target_va) {
         unsafe {
             target_fn(cpu);
         }
@@ -864,7 +1088,7 @@ unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u3
 
     state.exit_reason = ExitReason::UnmappedTarget as u32;
     state.exit_detail = target_va;
-    *ctx.trap = Some(TrapInfo::UnresolvedIndirectCall(target_va));
+    tctx.trap = Some(TrapInfo::UnresolvedIndirectCall(target_va));
 }
 
 unsafe extern "C" fn bridge_call_com(
@@ -872,19 +1096,21 @@ unsafe extern "C" fn bridge_call_com(
     interface_id: u32,
     method_index: u32,
 ) {
-    let Some((state, ctx)) = (unsafe { context_from_cpu(cpu) }) else {
+    let Some((state, tctx)) = (unsafe { thread_ctx_from_cpu(cpu) }) else {
         return;
     };
     if state.exit_reason != ExitReason::Running as u32 {
         return;
     }
     if let Some(iface) = toluca_d3d8::ComInterfaceId::from_u32(interface_id) {
-        crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_index);
+        with_locked_ctx(tctx, state, |ctx, state| {
+            crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_index);
+        });
         return;
     }
     state.exit_reason = ExitReason::HostTrap as u32;
     state.exit_detail = (interface_id << COM_INTERFACE_SHIFT) | (method_index & COM_METHOD_MASK);
-    *ctx.trap = Some(TrapInfo::UnimplementedCom {
+    tctx.trap = Some(TrapInfo::UnimplementedCom {
         interface_id,
         method_index,
     });
@@ -897,7 +1123,7 @@ unsafe extern "C" fn bridge_materialize_flags(cpu: *mut GuestCpuState) {
 }
 
 unsafe extern "C" fn bridge_cpuid(cpu: *mut GuestCpuState) {
-    let Some((state, _ctx)) = (unsafe { context_from_cpu(cpu) }) else {
+    let Some((state, _tctx)) = (unsafe { thread_ctx_from_cpu(cpu) }) else {
         return;
     };
     if state.exit_reason != ExitReason::Running as u32 {
@@ -921,14 +1147,14 @@ unsafe extern "C" fn bridge_cpuid(cpu: *mut GuestCpuState) {
 }
 
 unsafe extern "C" fn bridge_rdtsc(cpu: *mut GuestCpuState) {
-    let Some((state, ctx)) = (unsafe { context_from_cpu(cpu) }) else {
+    let Some((state, tctx)) = (unsafe { thread_ctx_from_cpu(cpu) }) else {
         return;
     };
     if state.exit_reason != ExitReason::Running as u32 {
         return;
     }
 
-    let ticks = ctx.host_start_instant.elapsed().as_nanos() as u64;
+    let ticks = tctx.shared.host_start_instant.elapsed().as_nanos() as u64;
     state.set_gpr(Gpr::Eax, ticks as u32);
     state.set_gpr(Gpr::Edx, (ticks >> 32) as u32);
 }
@@ -938,18 +1164,319 @@ unsafe extern "C" fn bridge_unhandled_instruction(
     guest_va: u32,
     reason: u32,
 ) {
-    let Some((state, ctx)) = (unsafe { context_from_cpu(cpu) }) else {
+    let Some((state, tctx)) = (unsafe { thread_ctx_from_cpu(cpu) }) else {
         return;
     };
-    if ctx.win32.config.trace_imports {
-        eprintln!("[unhandled_insn] va=0x{guest_va:08x} reason={reason}");
-    }
     if state.exit_reason != ExitReason::Running as u32 {
         return;
     }
     state.exit_reason = ExitReason::UnsupportedInstruction as u32;
     state.exit_detail = guest_va;
-    *ctx.trap = Some(TrapInfo::UnhandledInstruction { guest_va, reason });
+    tctx.trap = Some(TrapInfo::UnhandledInstruction { guest_va, reason });
 }
 
 unsafe extern "C" fn bridge_trace_hook(_cpu: *mut GuestCpuState, _guest_va: u32) {}
+
+fn perform_host_wait(
+    shared: &Arc<SharedRuntime>,
+    tid: u64,
+    cpu: &mut GuestCpuState,
+    wait: crate::win32::PendingHostWait,
+) {
+    const INFINITE_MS: u32 = 0xFFFF_FFFF;
+    const WAIT_OBJECT_0: u32 = 0;
+
+    match wait {
+        crate::win32::PendingHostWait::SleepMs(ms) => {
+            if ms == 0 {
+                std::thread::sleep(Duration::from_micros(250));
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_millis(ms as u64);
+            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    if tid != 1 {
+                        cpu.exit_reason = ExitReason::Halt as u32;
+                    }
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let rem = (deadline - now).min(Duration::from_millis(20));
+                let (next_guard, _) = shared
+                    .sync_cv
+                    .wait_timeout(guard, rem)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next_guard;
+            }
+        }
+        crate::win32::PendingHostWait::WaitObject { handle, timeout_ms } => {
+            let deadline =
+                (timeout_ms != INFINITE_MS).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
+            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let initial_pulse = match guard.win32.get_handle(handle) {
+                Some(crate::win32::Win32Handle::Event { pulse_seq, .. }) => Some(*pulse_seq),
+                _ => None,
+            };
+            loop {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    if tid != 1 {
+                        cpu.exit_reason = ExitReason::Halt as u32;
+                    }
+                    break;
+                }
+                match guard.win32.get_handle_mut(handle) {
+                    Some(crate::win32::Win32Handle::Event {
+                        manual_reset,
+                        signaled,
+                        pulse_seq,
+                    }) => {
+                        let pulsed = initial_pulse.is_some_and(|p| *pulse_seq != p);
+                        if *signaled || pulsed {
+                            if !*manual_reset {
+                                *signaled = false;
+                            }
+                            cpu.set_gpr(Gpr::Eax, WAIT_OBJECT_0);
+                            break;
+                        }
+                    }
+                    Some(crate::win32::Win32Handle::Mutex {
+                        owner_tid,
+                        recursion,
+                    }) => {
+                        if *owner_tid == 0 || *owner_tid == tid {
+                            *owner_tid = tid;
+                            *recursion = recursion.saturating_add(1);
+                            cpu.set_gpr(Gpr::Eax, WAIT_OBJECT_0);
+                            break;
+                        }
+                    }
+                    Some(crate::win32::Win32Handle::Thread { finished, .. }) => {
+                        if *finished {
+                            cpu.set_gpr(Gpr::Eax, WAIT_OBJECT_0);
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+                let wait_dur = match deadline {
+                    Some(dl) => {
+                        let now = Instant::now();
+                        if now >= dl {
+                            break;
+                        }
+                        (dl - now).min(Duration::from_millis(20))
+                    }
+                    None => Duration::from_millis(20),
+                };
+                let (next_guard, _) = shared
+                    .sync_cv
+                    .wait_timeout(guard, wait_dur)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next_guard;
+            }
+        }
+        crate::win32::PendingHostWait::EnterCriticalSection { cs_addr } => {
+            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    if tid != 1 {
+                        cpu.exit_reason = ExitReason::Halt as u32;
+                    }
+                    break;
+                }
+                let entry = guard.win32.crit_sections.entry(cs_addr).or_insert((0, 0));
+                if entry.0 == 0 || entry.0 == tid {
+                    entry.0 = tid;
+                    entry.1 = entry.1.saturating_add(1);
+                    break;
+                }
+                let (next_guard, _) = shared
+                    .sync_cv
+                    .wait_timeout(guard, Duration::from_millis(10))
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next_guard;
+            }
+        }
+        crate::win32::PendingHostWait::SuspendSelf { handle } => {
+            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    if tid != 1 {
+                        cpu.exit_reason = ExitReason::Halt as u32;
+                    }
+                    break;
+                }
+                let suspended = matches!(
+                    guard.win32.get_handle(handle),
+                    Some(crate::win32::Win32Handle::Thread {
+                        suspended: true,
+                        ..
+                    })
+                );
+                if !suspended {
+                    break;
+                }
+                let (next_guard, _) = shared
+                    .sync_cv
+                    .wait_timeout(guard, Duration::from_millis(20))
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next_guard;
+            }
+        }
+    }
+}
+
+fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingThreadSpawn) {
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let mut flags = shared
+            .worker_done_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        flags.push(Arc::clone(&done));
+    }
+    std::thread::spawn(move || {
+        {
+            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    done.store(true, Ordering::Release);
+                    return;
+                }
+                let suspended = matches!(
+                    guard.win32.get_handle(spawn.handle),
+                    Some(crate::win32::Win32Handle::Thread { suspended: true, .. })
+                );
+                if !suspended {
+                    break;
+                }
+                let (next_guard, _) = shared
+                    .sync_cv
+                    .wait_timeout(guard, Duration::from_millis(10))
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next_guard;
+            }
+        }
+
+        if let Some(entry_fn) = shared.code.resolve_va(spawn.start_va) {
+            let mut cpu = GuestCpuState::new(shared.arena_base as *mut u8, std::ptr::null());
+            cpu.eip = spawn.start_va;
+            cpu.fs_base = spawn.teb_va;
+            cpu.set_gpr(Gpr::Esp, spawn.stack_top);
+            let pushed = {
+                let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                push_args_and_sentinel(&mut cpu, &mut guard.arena, &[spawn.param]).is_ok()
+            };
+            if pushed {
+                let mut tctx = ThreadBridgeContext {
+                    shared: Arc::clone(&shared),
+                    tid: spawn.handle as u64,
+                    held_inner: None,
+                    trap: None,
+                    pending_error: None,
+                };
+                let bridge = build_host_bridge((&raw mut tctx).cast());
+                cpu.bridge = &bridge;
+                unsafe {
+                    entry_fn(&mut cpu);
+                }
+            }
+            let exit_val = cpu.gpr(Gpr::Eax);
+            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(crate::win32::Win32Handle::Thread {
+                exit_code,
+                finished,
+                ..
+            }) = guard.win32.get_handle_mut(spawn.handle)
+            {
+                *exit_code = exit_val;
+                *finished = true;
+            }
+            shared.sync_cv.notify_all();
+        }
+        done.store(true, Ordering::Release);
+    });
+}
+
+fn spawn_timer_thread(shared: Arc<SharedRuntime>, timer: crate::win32::PendingTimerSpawn) {
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let mut flags = shared
+            .worker_done_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        flags.push(Arc::clone(&done));
+    }
+    std::thread::spawn(move || {
+        let Some(cb_fn) = shared.code.resolve_va(timer.callback_va) else {
+            done.store(true, Ordering::Release);
+            return;
+        };
+        let (stack_top, teb_va) = {
+            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = &mut *guard;
+            let Ok(stack_base) = inner.vmem.virtual_alloc(
+                &mut inner.arena,
+                None,
+                64 * 1024,
+                crate::heap::MEM_RESERVE | crate::heap::MEM_COMMIT,
+                crate::heap::PAGE_READWRITE,
+            ) else {
+                done.store(true, Ordering::Release);
+                return;
+            };
+            let Ok(teb) = inner.heap.alloc(&mut inner.arena, 0x1000, true) else {
+                done.store(true, Ordering::Release);
+                return;
+            };
+            (stack_base.wrapping_add(64 * 1024), teb)
+        };
+
+        let tid = 0x10_000u64 + timer.timer_id as u64;
+        let delay = Duration::from_millis(timer.delay_ms.max(1) as u64);
+        loop {
+            {
+                let guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = shared.sync_cv.wait_timeout(guard, delay);
+            }
+            if shared.shutdown.load(Ordering::Acquire) || timer.cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            let mut cpu = GuestCpuState::new(shared.arena_base as *mut u8, std::ptr::null());
+            cpu.eip = timer.callback_va;
+            cpu.fs_base = teb_va;
+            cpu.set_gpr(Gpr::Esp, stack_top);
+            let pushed = {
+                let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                push_args_and_sentinel(
+                    &mut cpu,
+                    &mut guard.arena,
+                    &[timer.timer_id, 0, timer.dw_user, 0, 0],
+                )
+                .is_ok()
+            };
+            if pushed {
+                let mut tctx = ThreadBridgeContext {
+                    shared: Arc::clone(&shared),
+                    tid,
+                    held_inner: None,
+                    trap: None,
+                    pending_error: None,
+                };
+                let bridge = build_host_bridge((&raw mut tctx).cast());
+                cpu.bridge = &bridge;
+                unsafe {
+                    cb_fn(&mut cpu);
+                }
+            }
+            if !timer.periodic {
+                break;
+            }
+        }
+        done.store(true, Ordering::Release);
+    });
+}

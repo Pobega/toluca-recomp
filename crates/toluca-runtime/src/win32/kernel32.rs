@@ -1,7 +1,8 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use toluca_core::GuestAddr;
 use toluca_core::aot::ImportSymbol;
@@ -17,9 +18,11 @@ use crate::win32::path::wildcard_match_ci;
 use crate::win32::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE,
     ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_ENOUGH_MEMORY, ERROR_PATH_NOT_FOUND,
-    ERROR_PROC_NOT_FOUND, ERROR_SUCCESS, FindEntry, FindState, INVALID_FILE_ATTRIBUTES, INVALID_HANDLE_VALUE, INVALID_SET_FILE_POINTER, PROCESS_HEAP_HANDLE,
-    STD_ERR_HOST_HANDLE, STD_ERROR_HANDLE, STD_IN_HOST_HANDLE, STD_INPUT_HANDLE,
-    STD_OUT_HOST_HANDLE, STD_OUTPUT_HANDLE, TLS_OUT_OF_INDEXES, Win32Handle, map_io_error,
+    ERROR_PROC_NOT_FOUND, ERROR_SUCCESS, FindEntry, FindState, INVALID_FILE_ATTRIBUTES,
+    INVALID_HANDLE_VALUE, INVALID_SET_FILE_POINTER, PROCESS_HEAP_HANDLE, PendingHostWait,
+    PendingThreadSpawn, PendingTimerSpawn, STD_ERR_HOST_HANDLE, STD_ERROR_HANDLE,
+    STD_IN_HOST_HANDLE, STD_INPUT_HANDLE, STD_OUT_HOST_HANDLE, STD_OUTPUT_HANDLE,
+    TLS_OUT_OF_INDEXES, Win32Handle, map_io_error,
 };
 
 const MAX_PATH_LEN: usize = 512;
@@ -43,12 +46,19 @@ const FIND_DATA_OFF_ATTRS: u32 = 0;
 const FIND_DATA_OFF_SIZE_HIGH: u32 = 28;
 const FIND_DATA_OFF_SIZE_LOW: u32 = 32;
 const FIND_DATA_OFF_NAME: u32 = 44;
+
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+const STILL_ACTIVE: u32 = 259;
+const GUEST_THREAD_STACK_SIZE: usize = 256 * 1024;
+const GUEST_THREAD_TEB_SIZE: usize = 0x1000;
+const TIME_PERIODIC: u32 = 0x0001;
 const FIND_DATA_NAME_MAX: usize = 259;
 
 const HEAP_ZERO_MEMORY: u32 = 0x0000_0008;
 const GMEM_ZEROINIT: u32 = 0x0040;
 const LMEM_ZEROINIT: u32 = 0x0040;
-const WAIT_OBJECT_0: u32 = 0;
 
 const CURRENT_THREAD_ID: u32 = 1;
 const CURRENT_PROCESS_ID: u32 = 1000;
@@ -274,10 +284,28 @@ fn read_file(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
     let buf_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
     let to_read = peek_arg_u32(cpu, ctx.arena, 2)?;
     let bytes_read_ptr = peek_arg_u32(cpu, ctx.arena, 3)?;
+    let overlapped_ptr = peek_arg_u32(cpu, ctx.arena, 4)?;
+
+    let overlapped_offset = if overlapped_ptr != 0 {
+        let lo = u64::from(ctx.arena.read_u32(overlapped_ptr + 8)?);
+        let hi = u64::from(ctx.arena.read_u32(overlapped_ptr + 12)?);
+        Some((hi << 32) | lo)
+    } else {
+        None
+    };
 
     let mut host_buf = vec![0u8; to_read as usize];
     let result = match ctx.win32.get_handle_mut(handle) {
-        Some(Win32Handle::File { file, .. }) => file.read(&mut host_buf),
+        Some(Win32Handle::File { file, .. }) => {
+            if let Some(off) = overlapped_offset {
+                if let Err(err) = file.seek(SeekFrom::Start(off)) {
+                    *ctx.last_error = map_io_error(&err);
+                    return_stdcall(cpu, ctx.arena, 5, 0)?;
+                    return Ok(());
+                }
+            }
+            file.read(&mut host_buf)
+        }
         _ => {
             *ctx.last_error = ERROR_INVALID_HANDLE;
             return_stdcall(cpu, ctx.arena, 5, 0)?;
@@ -290,6 +318,19 @@ fn read_file(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
             ctx.arena.write_bytes(buf_ptr, &host_buf[..n])?;
             if bytes_read_ptr != 0 {
                 ctx.arena.write_u32(bytes_read_ptr, n as u32)?;
+            }
+            if overlapped_ptr != 0 {
+                ctx.arena.write_u32(overlapped_ptr, 0)?;
+                ctx.arena.write_u32(overlapped_ptr + 4, n as u32)?;
+                let event_handle = ctx.arena.read_u32(overlapped_ptr + 16)?;
+                if event_handle != 0 {
+                    if let Some(Win32Handle::Event { signaled, .. }) =
+                        ctx.win32.get_handle_mut(event_handle)
+                    {
+                        *signaled = true;
+                        ctx.win32.notify_sync = true;
+                    }
+                }
             }
             *ctx.last_error = ERROR_SUCCESS;
             return_stdcall(cpu, ctx.arena, 5, 1)?;
@@ -978,6 +1019,15 @@ fn enter_critical_section(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
+    let cs_addr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let tid = ctx.active_host_tid;
+    let entry = ctx.win32.crit_sections.entry(cs_addr).or_insert((0, 0));
+    if entry.0 == 0 || entry.0 == tid {
+        entry.0 = tid;
+        entry.1 = entry.1.saturating_add(1);
+    } else {
+        ctx.win32.pending_wait = Some(PendingHostWait::EnterCriticalSection { cs_addr });
+    }
     return_stdcall(cpu, ctx.arena, 1, 0)?;
     Ok(())
 }
@@ -986,6 +1036,16 @@ fn leave_critical_section(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
+    let cs_addr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    if let Some(entry) = ctx.win32.crit_sections.get_mut(&cs_addr) {
+        if entry.0 == ctx.active_host_tid && entry.1 > 0 {
+            entry.1 -= 1;
+            if entry.1 == 0 {
+                entry.0 = 0;
+                ctx.win32.notify_sync = true;
+            }
+        }
+    }
     return_stdcall(cpu, ctx.arena, 1, 0)?;
     Ok(())
 }
@@ -994,6 +1054,9 @@ fn delete_critical_section(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
+    let cs_addr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    ctx.win32.crit_sections.remove(&cs_addr);
+    ctx.win32.notify_sync = true;
     return_stdcall(cpu, ctx.arena, 1, 0)?;
     Ok(())
 }
@@ -1004,6 +1067,7 @@ fn create_event_a(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resu
     let handle = ctx.win32.alloc_handle(Win32Handle::Event {
         manual_reset,
         signaled: initial_state,
+        pulse_seq: 0,
     });
     *ctx.last_error = ERROR_SUCCESS;
     return_stdcall(cpu, ctx.arena, 4, handle)?;
@@ -1015,6 +1079,7 @@ fn set_event(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
     let ok = match ctx.win32.get_handle_mut(handle) {
         Some(Win32Handle::Event { signaled, .. }) => {
             *signaled = true;
+            ctx.win32.notify_sync = true;
             true
         }
         _ => false,
@@ -1041,16 +1106,54 @@ fn wait_for_single_object(
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
     let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
-    if let Some(Win32Handle::Event {
-        manual_reset,
-        signaled,
-    }) = ctx.win32.get_handle_mut(handle)
-    {
-        if !*manual_reset {
-            *signaled = false;
+    let timeout_ms = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let tid = ctx.active_host_tid;
+    let result = match ctx.win32.get_handle_mut(handle) {
+        Some(Win32Handle::Event {
+            manual_reset,
+            signaled,
+            ..
+        }) => {
+            if *signaled {
+                if !*manual_reset {
+                    *signaled = false;
+                }
+                WAIT_OBJECT_0
+            } else if timeout_ms == 0 {
+                WAIT_TIMEOUT
+            } else {
+                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject { handle, timeout_ms });
+                WAIT_TIMEOUT
+            }
         }
-    }
-    return_stdcall(cpu, ctx.arena, 2, WAIT_OBJECT_0)?;
+        Some(Win32Handle::Mutex {
+            owner_tid,
+            recursion,
+        }) => {
+            if *owner_tid == 0 || *owner_tid == tid {
+                *owner_tid = tid;
+                *recursion = recursion.saturating_add(1);
+                WAIT_OBJECT_0
+            } else if timeout_ms == 0 {
+                WAIT_TIMEOUT
+            } else {
+                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject { handle, timeout_ms });
+                WAIT_TIMEOUT
+            }
+        }
+        Some(Win32Handle::Thread { finished, .. }) => {
+            if *finished {
+                WAIT_OBJECT_0
+            } else if timeout_ms == 0 {
+                WAIT_TIMEOUT
+            } else {
+                ctx.win32.pending_wait = Some(PendingHostWait::WaitObject { handle, timeout_ms });
+                WAIT_TIMEOUT
+            }
+        }
+        _ => WAIT_OBJECT_0,
+    };
+    return_stdcall(cpu, ctx.arena, 2, result)?;
     Ok(())
 }
 
@@ -1109,7 +1212,8 @@ fn get_current_thread_id(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 0, CURRENT_THREAD_ID)?;
+    let tid = u32::try_from(ctx.active_host_tid).unwrap_or(CURRENT_THREAD_ID);
+    return_stdcall(cpu, ctx.arena, 0, tid)?;
     Ok(())
 }
 
@@ -1200,9 +1304,7 @@ fn get_tick_count(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resu
 
 fn sleep_ms(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let ms = peek_arg_u32(cpu, ctx.arena, 0)?;
-    if ms > 0 && !ctx.win32.config.headless {
-        std::thread::sleep(Duration::from_millis(ms as u64));
-    }
+    ctx.win32.pending_wait = Some(PendingHostWait::SleepMs(ms));
     return_stdcall(cpu, ctx.arena, 1, 0)?;
     Ok(())
 }
@@ -1785,14 +1887,38 @@ fn create_mutex_a(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
-    let handle = ctx.win32.alloc_handle(Win32Handle::Mutex);
+    let initial_owner = peek_arg_u32(cpu, ctx.arena, 1)? != 0;
+    let handle = ctx.win32.alloc_handle(Win32Handle::Mutex {
+        owner_tid: if initial_owner {
+            ctx.active_host_tid
+        } else {
+            0
+        },
+        recursion: u32::from(initial_owner),
+    });
     *ctx.last_error = ERROR_SUCCESS;
     return_stdcall(cpu, ctx.arena, 3, handle)?;
     Ok(())
 }
 
 fn release_mutex(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 1, 1)?;
+    let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let tid = ctx.active_host_tid;
+    let ok = match ctx.win32.get_handle_mut(handle) {
+        Some(Win32Handle::Mutex {
+            owner_tid,
+            recursion,
+        }) if *owner_tid == tid && *recursion > 0 => {
+            *recursion -= 1;
+            if *recursion == 0 {
+                *owner_tid = 0;
+                ctx.win32.notify_sync = true;
+            }
+            true
+        }
+        _ => false,
+    };
+    return_stdcall(cpu, ctx.arena, 1, u32::from(ok))?;
     Ok(())
 }
 
@@ -1894,8 +2020,22 @@ fn get_drive_type_a(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
+    const DRIVE_NO_ROOT_DIR: u32 = 1;
     const DRIVE_FIXED: u32 = 3;
-    return_stdcall(cpu, ctx.arena, 1, DRIVE_FIXED)?;
+    const DRIVE_CDROM: u32 = 5;
+
+    let root_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let drive_type = if root_ptr == 0 {
+        DRIVE_FIXED
+    } else {
+        let root = ctx.arena.read_cstr(root_ptr, MAX_PATH_LEN)?;
+        match root.as_bytes().first().map(u8::to_ascii_lowercase) {
+            Some(b'c') => DRIVE_FIXED,
+            Some(b'd') => DRIVE_CDROM,
+            _ => DRIVE_NO_ROOT_DIR,
+        }
+    };
+    return_stdcall(cpu, ctx.arena, 1, drive_type)?;
     Ok(())
 }
 
@@ -2086,17 +2226,72 @@ fn get_overlapped_result(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
+    let overlapped_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
     let bytes_ptr = peek_arg_u32(cpu, ctx.arena, 2)?;
     if bytes_ptr != 0 {
-        ctx.arena.write_u32(bytes_ptr, 0)?;
+        let transferred = if overlapped_ptr != 0 {
+            ctx.arena.read_u32(overlapped_ptr + 4)?
+        } else {
+            0
+        };
+        ctx.arena.write_u32(bytes_ptr, transferred)?;
     }
+    *ctx.last_error = ERROR_SUCCESS;
     return_stdcall(cpu, ctx.arena, 4, 1)?;
     Ok(())
 }
 
+pub(crate) fn alloc_and_queue_guest_thread(
+    ctx: &mut RuntimeContext<'_>,
+    start_va: u32,
+    param: u32,
+    suspended: bool,
+) -> Result<Option<u32>, RuntimeError> {
+    let Ok(stack_base) = ctx.vmem.virtual_alloc(
+        ctx.arena,
+        None,
+        GUEST_THREAD_STACK_SIZE,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    ) else {
+        *ctx.last_error = ERROR_NOT_ENOUGH_MEMORY;
+        return Ok(None);
+    };
+    let stack_top = stack_base.wrapping_add(GUEST_THREAD_STACK_SIZE as u32);
+    let teb_va = ctx.heap.alloc(ctx.arena, GUEST_THREAD_TEB_SIZE, true)?;
+    let handle = ctx.win32.alloc_handle(Win32Handle::Thread {
+        exit_code: STILL_ACTIVE,
+        finished: false,
+        suspended,
+    });
+    ctx.arena.write_u32(teb_va, 0xFFFF_FFFF)?;
+    ctx.arena.write_u32(teb_va + 4, stack_top)?;
+    ctx.arena.write_u32(teb_va + 8, stack_base)?;
+    ctx.arena.write_u32(teb_va + 0x18, teb_va)?;
+    ctx.arena.write_u32(teb_va + 0x24, handle)?;
+
+    ctx.win32.pending_threads.push(PendingThreadSpawn {
+        handle,
+        start_va,
+        param,
+        stack_top,
+        teb_va,
+    });
+    *ctx.last_error = ERROR_SUCCESS;
+    Ok(Some(handle))
+}
+
 fn create_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
+    let start_va = peek_arg_u32(cpu, ctx.arena, 2)?;
+    let param = peek_arg_u32(cpu, ctx.arena, 3)?;
+    let flags = peek_arg_u32(cpu, ctx.arena, 4)?;
     let id_ptr = peek_arg_u32(cpu, ctx.arena, 5)?;
-    let handle = ctx.win32.alloc_handle(Win32Handle::Thread { exit_code: 0 });
+
+    let suspended = (flags & CREATE_SUSPENDED) != 0;
+    let Some(handle) = alloc_and_queue_guest_thread(ctx, start_va, param, suspended)? else {
+        return_stdcall(cpu, ctx.arena, 6, 0)?;
+        return Ok(());
+    };
     if id_ptr != 0 {
         ctx.arena.write_u32(id_ptr, handle)?;
     }
@@ -2105,7 +2300,10 @@ fn create_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
 }
 
 fn exit_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    let code = peek_arg_u32(cpu, ctx.arena, 0)?;
+    cpu.exit_reason = ExitReason::Halt as u32;
+    cpu.exit_detail = code;
+    return_stdcall(cpu, ctx.arena, 1, code)?;
     Ok(())
 }
 
@@ -2113,9 +2311,24 @@ fn get_exit_code_thread(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
+    let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
     let code_ptr = peek_arg_u32(cpu, ctx.arena, 1)?;
+    let code = match ctx.win32.get_handle(handle) {
+        Some(Win32Handle::Thread {
+            exit_code,
+            finished,
+            ..
+        }) => {
+            if *finished {
+                *exit_code
+            } else {
+                STILL_ACTIVE
+            }
+        }
+        _ => 0,
+    };
     if code_ptr != 0 {
-        ctx.arena.write_u32(code_ptr, 0)?;
+        ctx.arena.write_u32(code_ptr, code)?;
     }
     return_stdcall(cpu, ctx.arena, 2, 1)?;
     Ok(())
@@ -2146,7 +2359,17 @@ fn set_thread_priority_boost(
 }
 
 fn resume_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 1, 1)?;
+    let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let prev = match ctx.win32.get_handle_mut(handle) {
+        Some(Win32Handle::Thread { suspended, .. }) => {
+            let was = u32::from(*suspended);
+            *suspended = false;
+            ctx.win32.notify_sync = true;
+            was
+        }
+        _ => 0,
+    };
+    return_stdcall(cpu, ctx.arena, 1, prev)?;
     Ok(())
 }
 
@@ -2154,12 +2377,38 @@ fn suspend_thread(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 1, 0)?;
+    let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let prev = match ctx.win32.get_handle_mut(handle) {
+        Some(Win32Handle::Thread { suspended, .. }) => {
+            let was = u32::from(*suspended);
+            *suspended = true;
+            if handle as u64 == ctx.active_host_tid {
+                ctx.win32.pending_wait = Some(PendingHostWait::SuspendSelf { handle });
+            }
+            was
+        }
+        _ => 0,
+    };
+    return_stdcall(cpu, ctx.arena, 1, prev)?;
     Ok(())
 }
 
 fn pulse_event(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 1, 1)?;
+    let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let ok = match ctx.win32.get_handle_mut(handle) {
+        Some(Win32Handle::Event {
+            signaled,
+            pulse_seq,
+            ..
+        }) => {
+            *signaled = false;
+            *pulse_seq = pulse_seq.wrapping_add(1);
+            ctx.win32.notify_sync = true;
+            true
+        }
+        _ => false,
+    };
+    return_stdcall(cpu, ctx.arena, 1, u32::from(ok))?;
     Ok(())
 }
 
@@ -2175,7 +2424,27 @@ fn time_set_event(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
-    return_stdcall(cpu, ctx.arena, 5, 1)?;
+    let delay_ms = peek_arg_u32(cpu, ctx.arena, 0)?;
+    let callback_va = peek_arg_u32(cpu, ctx.arena, 2)?;
+    let dw_user = peek_arg_u32(cpu, ctx.arena, 3)?;
+    let fu_event = peek_arg_u32(cpu, ctx.arena, 4)?;
+    if callback_va == 0 {
+        return_stdcall(cpu, ctx.arena, 5, 0)?;
+        return Ok(());
+    }
+    let timer_id = ctx.win32.next_timer_id;
+    ctx.win32.next_timer_id = ctx.win32.next_timer_id.wrapping_add(1).max(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    ctx.win32.timers.insert(timer_id, Arc::clone(&cancelled));
+    ctx.win32.pending_timers.push(PendingTimerSpawn {
+        timer_id,
+        delay_ms: delay_ms.max(1),
+        callback_va,
+        dw_user,
+        periodic: (fu_event & TIME_PERIODIC) != 0,
+        cancelled,
+    });
+    return_stdcall(cpu, ctx.arena, 5, timer_id)?;
     Ok(())
 }
 
@@ -2183,6 +2452,11 @@ fn time_kill_event(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
+    let timer_id = peek_arg_u32(cpu, ctx.arena, 0)?;
+    if let Some(cancelled) = ctx.win32.timers.remove(&timer_id) {
+        cancelled.store(true, Ordering::Release);
+        ctx.win32.notify_sync = true;
+    }
     return_stdcall(cpu, ctx.arena, 1, 0)?;
     Ok(())
 }

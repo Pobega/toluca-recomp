@@ -176,6 +176,19 @@ pub fn dispatch_com_call(
             if let Err(err) = return_stdcall(state, ctx.arena, call_res.arg_count, call_res.ret_val)
             {
                 fail_com_call(ctx, state, iface, method_idx, RuntimeError::Arena(err));
+                return;
+            }
+            if iface == ComInterfaceId::Direct3DDevice8 && method_idx == 15 {
+                ctx.win32.d3d8_present_calls += 1;
+                if ctx
+                    .win32
+                    .config
+                    .max_frames
+                    .is_some_and(|limit| ctx.win32.d3d8_present_calls >= limit)
+                {
+                    ctx.win32.exit_code = Some(0);
+                    state.exit_reason = ExitReason::Halt as u32;
+                }
             }
         }
         Err(msg) => {

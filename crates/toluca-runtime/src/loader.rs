@@ -166,6 +166,11 @@ impl AotCodeImage {
     pub fn entry_point_va(&self) -> GuestAddr {
         self.manifest.header.entry_guest_va
     }
+
+    pub fn code_range(&self) -> (usize, usize) {
+        let base = self.code_base.map_or(0, |p| p.as_ptr() as usize);
+        (base, base.saturating_add(self.code_len))
+    }
 }
 
 impl Drop for AotCodeImage {

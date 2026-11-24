@@ -10,6 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use toluca_core::GuestAddr;
 use toluca_d3d8::D3d8Context;
@@ -31,8 +33,14 @@ pub const PROCESS_HEAP_HANDLE: u32 = 0x0001_0000;
 const FIRST_DYNAMIC_HANDLE: u32 = 0x0000_0100;
 const FIRST_MODULE_HANDLE: u32 = 0x7600_0000;
 const MODULE_HANDLE_STRIDE: u32 = 0x0001_0000;
-const FIRST_CFILE_PTR: u32 = 0x7200_0000;
-const CFILE_STRIDE: u32 = 32;
+
+pub const MSVCRT_IOBUF_SIZE: usize = 32;
+pub const MSVCRT_IOBUF_FLAG_OFF: u32 = 0x0C;
+pub const MSVCRT_IOREAD: u32 = 0x0001;
+pub const MSVCRT_IOWRT: u32 = 0x0002;
+pub const MSVCRT_IOEOF: u32 = 0x0010;
+pub const MSVCRT_IOERR: u32 = 0x0020;
+pub const MSVCRT_IORW: u32 = 0x0080;
 
 pub const TLS_INITIAL_SLOTS: usize = 64;
 pub const TLS_MAX_SLOTS: usize = 1088;
@@ -59,6 +67,7 @@ pub struct Win32Config {
     pub trace_imports: bool,
     pub trace_d3d8: bool,
     pub shader_cache_path: Option<PathBuf>,
+    pub max_frames: Option<u64>,
     pub command_line: String,
     pub exe_name: String,
 }
@@ -71,6 +80,7 @@ impl Default for Win32Config {
             trace_imports: false,
             trace_d3d8: false,
             shader_cache_path: None,
+            max_frames: None,
             command_line: "sh2pc.exe".to_owned(),
             exe_name: "sh2pc.exe".to_owned(),
         }
@@ -102,10 +112,16 @@ pub enum Win32Handle {
     Event {
         manual_reset: bool,
         signaled: bool,
+        pulse_seq: u64,
     },
-    Mutex,
+    Mutex {
+        owner_tid: u64,
+        recursion: u32,
+    },
     Thread {
         exit_code: u32,
+        finished: bool,
+        suspended: bool,
     },
     Module {
         name: String,
@@ -115,9 +131,38 @@ pub enum Win32Handle {
     },
 }
 
+#[derive(Clone, Debug)]
+pub enum PendingHostWait {
+    SleepMs(u32),
+    WaitObject { handle: u32, timeout_ms: u32 },
+    EnterCriticalSection { cs_addr: GuestAddr },
+    SuspendSelf { handle: u32 },
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingThreadSpawn {
+    pub handle: u32,
+    pub start_va: GuestAddr,
+    pub param: u32,
+    pub stack_top: GuestAddr,
+    pub teb_va: GuestAddr,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingTimerSpawn {
+    pub timer_id: u32,
+    pub delay_ms: u32,
+    pub callback_va: GuestAddr,
+    pub dw_user: u32,
+    pub periodic: bool,
+    pub cancelled: Arc<AtomicBool>,
+}
+
 pub struct CFileEntry {
     pub file: File,
     pub eof: bool,
+    pub err: bool,
+    pub base_flag: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -208,11 +253,11 @@ pub struct Win32State {
     tls_allocated: Vec<bool>,
     tls_values: Vec<u32>,
     c_files: HashMap<u32, CFileEntry>,
-    next_cfile_ptr: u32,
     pub mapped_views: HashMap<GuestAddr, usize>,
     pub d3d8: D3d8Context,
     pub window_mgr: WindowManager,
     pub d3d8_create_calls: Vec<u32>,
+    pub d3d8_present_calls: u64,
     pub exit_code: Option<u32>,
     pub command_line_guest: Option<GuestAddr>,
     pub module_filename_guest: Option<GuestAddr>,
@@ -223,7 +268,16 @@ pub struct Win32State {
     pub unhandled_exception_filter: GuestAddr,
     pub rng_state: u32,
     pub atexit_callbacks: Vec<GuestAddr>,
+    pub crit_sections: HashMap<GuestAddr, (u64, u32)>,
+    pub timers: HashMap<u32, Arc<AtomicBool>>,
+    pub next_timer_id: u32,
+    pub pending_wait: Option<PendingHostWait>,
+    pub pending_threads: Vec<PendingThreadSpawn>,
+    pub pending_timers: Vec<PendingTimerSpawn>,
+    pub notify_sync: bool,
 }
+
+unsafe impl Send for Win32State {}
 
 impl Win32State {
     pub fn new(config: Win32Config) -> Self {
@@ -241,11 +295,11 @@ impl Win32State {
             tls_allocated: vec![false; TLS_INITIAL_SLOTS],
             tls_values: vec![0; TLS_INITIAL_SLOTS],
             c_files: HashMap::new(),
-            next_cfile_ptr: FIRST_CFILE_PTR,
             mapped_views: HashMap::new(),
             d3d8,
             window_mgr: WindowManager::new(headless),
             d3d8_create_calls: Vec::new(),
+            d3d8_present_calls: 0,
             exit_code: None,
             command_line_guest: None,
             module_filename_guest: None,
@@ -256,6 +310,13 @@ impl Win32State {
             unhandled_exception_filter: 0,
             rng_state: 1,
             atexit_callbacks: Vec::new(),
+            crit_sections: HashMap::new(),
+            timers: HashMap::new(),
+            next_timer_id: 1,
+            pending_wait: None,
+            pending_threads: Vec::new(),
+            pending_timers: Vec::new(),
+            notify_sync: false,
         }
     }
 
@@ -365,11 +426,8 @@ impl Win32State {
         }
     }
 
-    pub fn alloc_cfile(&mut self, entry: CFileEntry) -> u32 {
-        let ptr = self.next_cfile_ptr;
-        self.next_cfile_ptr = self.next_cfile_ptr.wrapping_add(CFILE_STRIDE);
+    pub fn insert_cfile(&mut self, ptr: u32, entry: CFileEntry) {
         self.c_files.insert(ptr, entry);
-        ptr
     }
 
     pub fn get_cfile_mut(&mut self, ptr: u32) -> Option<&mut CFileEntry> {

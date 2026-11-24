@@ -170,12 +170,15 @@ impl DsoundBufferData {
     }
 }
 
+const SOFT_LIMIT_KNEE: f32 = 0.85;
+
 pub struct DsoundMixer {
     pub buffers: HashMap<usize, DsoundBufferData>,
     next_buf_id: usize,
     pub listener: Ds3dListenerParams,
     pub deferred_listener: Ds3dListenerParams,
     pub aux_pcm: VecDeque<i16>,
+    mix_accum: Vec<f32>,
     pub hardware_clocked: bool,
     pub last_advance: Instant,
 }
@@ -194,6 +197,7 @@ impl DsoundMixer {
             listener: Ds3dListenerParams::default(),
             deferred_listener: Ds3dListenerParams::default(),
             aux_pcm: VecDeque::new(),
+            mix_accum: Vec::new(),
             hardware_clocked: false,
             last_advance: Instant::now(),
         }
@@ -276,7 +280,9 @@ impl DsoundMixer {
         if out_frames == 0 {
             return;
         }
-        let mut accum = vec![0.0f32; out_frames * OUTPUT_CHANNELS];
+        let accum_len = out_frames * OUTPUT_CHANNELS;
+        self.mix_accum.resize(accum_len, 0.0);
+        self.mix_accum[..accum_len].fill(0.0);
 
         let listener = self.listener.clone();
         for buf in self.buffers.values_mut() {
@@ -324,8 +330,8 @@ impl DsoundMixer {
                 let l = l0 + (l1 - l0) * frac;
                 let r = r0 + (r1 - r0) * frac;
 
-                accum[frame_out * 2] += l * gain_l;
-                accum[frame_out * 2 + 1] += r * gain_r;
+                self.mix_accum[frame_out * 2] += l * gain_l;
+                self.mix_accum[frame_out * 2 + 1] += r * gain_r;
 
                 buf.play_pos_frames += step;
                 if buf.play_pos_frames >= total_f {
@@ -339,17 +345,31 @@ impl DsoundMixer {
             }
         }
 
-        for slot in accum.iter_mut() {
+        for slot in self.mix_accum[..accum_len].iter_mut() {
             let Some(aux) = self.aux_pcm.pop_front() else {
                 break;
             };
             *slot += f32::from(aux) / 32_768.0;
         }
 
-        for (dst, &sample) in out.iter_mut().zip(accum.iter()) {
-            let scaled = (sample * 32_768.0).clamp(f32::from(i16::MIN), f32::from(i16::MAX));
+        for (dst, &sample) in out.iter_mut().zip(self.mix_accum[..accum_len].iter()) {
+            let limited = soft_limit_sample(sample);
+            let scaled = (limited * 32_768.0)
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX));
             *dst = scaled as i16;
         }
+    }
+}
+
+fn soft_limit_sample(sample: f32) -> f32 {
+    let mag = sample.abs();
+    if mag <= SOFT_LIMIT_KNEE {
+        sample
+    } else {
+        let headroom = 1.0 - SOFT_LIMIT_KNEE;
+        let compressed = SOFT_LIMIT_KNEE + headroom * ((mag - SOFT_LIMIT_KNEE) / headroom).tanh();
+        sample.signum() * compressed
     }
 }
 
@@ -2424,5 +2444,15 @@ mod tests {
         assert_eq!(out[4], 10_000);
         assert_eq!(out[5], 10_000);
         assert_eq!(mixer.aux_pcm.len(), 0);
+    }
+
+    #[test]
+    fn soft_limiter_preserves_normal_signals_and_rounds_hot_peaks() {
+        assert_eq!(soft_limit_sample(0.5), 0.5);
+        assert_eq!(soft_limit_sample(-0.85), -0.85);
+        let peak = soft_limit_sample(1.1);
+        assert!(peak > 0.85 && peak < 0.999);
+        let neg_peak = soft_limit_sample(-1.1);
+        assert!(neg_peak < -0.85 && neg_peak > -0.999);
     }
 }

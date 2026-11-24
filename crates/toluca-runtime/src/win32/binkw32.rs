@@ -1237,7 +1237,10 @@ fn bink_next_frame(
         } else {
             inst.frame_num += 1;
         }
-        inst.next_frame_due = Instant::now() + inst.header.frame_duration();
+        let frame_period = inst.header.frame_duration();
+        let now = Instant::now();
+        let min_due = now.checked_sub(frame_period * 2).unwrap_or(now);
+        inst.next_frame_due = (inst.next_frame_due + frame_period).max(min_due);
         write_guest_bink_struct(
             ctx.arena,
             bink_va,

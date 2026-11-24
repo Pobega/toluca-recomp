@@ -15,6 +15,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::FinalizedRelocTarget;
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::control::ControlPlane;
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::I32;
 use cranelift_codegen::ir::{
     AbiParam, Block, ExternalName, FuncRef, InstBuilder, MemFlags, SigRef, Signature, Type,
@@ -22,11 +23,11 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::{self, CallConv, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
 use toluca_core::GuestAddr;
 use toluca_core::aot::{RelocKind, TargetArch};
-use toluca_core::cpu::offsets as cpu_offsets;
+use toluca_core::cpu::{ExitReason, offsets as cpu_offsets};
 use target_lexicon::Triple;
 
 use crate::cfg::{DiscoveredFunction, JumpTable, discover_functions};
@@ -118,6 +119,7 @@ pub struct LifterContext<'ctx, 'b> {
     pub call_conv: CallConv,
     pub image: &'b PeImage,
     pub func_blocks: &'b BTreeMap<GuestAddr, Block>,
+    pub unwind_block: Block,
     pub jump_tables: &'b BTreeMap<GuestAddr, &'b JumpTable>,
     pub direct_call_refs: HashMap<GuestAddr, FuncRef>,
     pub sig_void_cpu: SigRef,
@@ -174,7 +176,7 @@ pub fn lift_function(
         call_conv,
     };
 
-    let split_vas = collect_split_vas(image, func, jump_tables);
+    let (split_vas, call_return_vas) = collect_split_vas(image, func, jump_tables);
     if !split_vas.contains(&func.entry_va) {
         return Err(LifterError::NoInstructions(func.entry_va));
     }
@@ -206,6 +208,7 @@ pub fn lift_function(
         for &va in &split_vas {
             func_blocks.insert(va, builder.create_block());
         }
+        let unwind_block = builder.create_block();
 
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -235,6 +238,7 @@ pub fn lift_function(
             call_conv,
             image,
             func_blocks: &func_blocks,
+            unwind_block,
             jump_tables,
             direct_call_refs: HashMap::new(),
             sig_void_cpu,
@@ -265,6 +269,13 @@ pub fn lift_function(
 
         let count = lifter.unsupported_count;
         drop(lifter);
+        emit_unwind_block(
+            &mut builder,
+            cpu_ptr,
+            unwind_block,
+            &func_blocks,
+            &call_return_vas,
+        );
         builder.seal_all_blocks();
         builder.finalize();
         count
@@ -405,8 +416,9 @@ fn collect_split_vas(
     image: &PeImage,
     func: &DiscoveredFunction,
     jump_tables: &BTreeMap<GuestAddr, &JumpTable>,
-) -> BTreeSet<GuestAddr> {
+) -> (BTreeSet<GuestAddr>, BTreeSet<GuestAddr>) {
     let mut splits = BTreeSet::new();
+    let mut call_return_vas = BTreeSet::new();
     for &va in func.blocks.keys() {
         splits.insert(va);
     }
@@ -428,6 +440,12 @@ fn collect_split_vas(
             let next_va = instr_va.saturating_add(instr.len() as u32);
 
             match instr.flow_control() {
+                FlowControl::Call | FlowControl::IndirectCall => {
+                    if contains_va_in_func(func, next_va) {
+                        splits.insert(next_va);
+                        call_return_vas.insert(next_va);
+                    }
+                }
                 FlowControl::ConditionalBranch => {
                     let target = instr.near_branch32();
                     if contains_va_in_func(func, target) {
@@ -470,7 +488,70 @@ fn collect_split_vas(
         }
     }
 
-    splits
+    (splits, call_return_vas)
+}
+
+fn emit_unwind_block(
+    builder: &mut FunctionBuilder<'_>,
+    cpu_ptr: Value,
+    unwind_block: Block,
+    func_blocks: &BTreeMap<GuestAddr, Block>,
+    call_return_vas: &BTreeSet<GuestAddr>,
+) {
+    builder.switch_to_block(unwind_block);
+    let resume_targets: Vec<(GuestAddr, Block)> = call_return_vas
+        .iter()
+        .filter_map(|va| func_blocks.get(va).map(|&b| (*va, b)))
+        .collect();
+    if resume_targets.is_empty() {
+        builder.ins().return_(&[]);
+        return;
+    }
+
+    let exit_reason = builder.ins().load(
+        I32,
+        MemFlags::trusted(),
+        cpu_ptr,
+        cpu_offsets::EXIT_REASON as i32,
+    );
+    let is_longjmp = builder.ins().icmp_imm(
+        IntCC::Equal,
+        exit_reason,
+        ExitReason::Longjmp as i64,
+    );
+    let return_block = builder.create_block();
+    let dispatch_block = builder.create_block();
+    builder
+        .ins()
+        .brif(is_longjmp, dispatch_block, &[], return_block, &[]);
+
+    builder.switch_to_block(return_block);
+    builder.ins().return_(&[]);
+
+    builder.switch_to_block(dispatch_block);
+    let eip = builder
+        .ins()
+        .load(I32, MemFlags::trusted(), cpu_ptr, cpu_offsets::EIP as i32);
+    let running = builder.ins().iconst(I32, ExitReason::Running as i64);
+    let mut switch = Switch::new();
+    let mut resume_blocks = Vec::with_capacity(resume_targets.len());
+    for (ret_va, target_block) in resume_targets {
+        let resume_block = builder.create_block();
+        switch.set_entry(ret_va as u128, resume_block);
+        resume_blocks.push((resume_block, target_block));
+    }
+    switch.emit(builder, eip, return_block);
+
+    for (resume_block, target_block) in resume_blocks {
+        builder.switch_to_block(resume_block);
+        builder.ins().store(
+            MemFlags::trusted(),
+            running,
+            cpu_ptr,
+            cpu_offsets::EXIT_REASON as i32,
+        );
+        builder.ins().jump(target_block, &[]);
+    }
 }
 
 fn contains_va_in_func(func: &DiscoveredFunction, va: GuestAddr) -> bool {

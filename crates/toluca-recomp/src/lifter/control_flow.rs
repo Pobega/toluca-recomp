@@ -126,7 +126,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     let target_val = self.builder.ins().iconst(I32, target_va as i64);
                     self.call_bridge_u32(bridge::offsets::CALL_INDIRECT, target_val);
                 }
-                ControlFlowOutcome::Continue
+                self.emit_post_call_exit_check(next_va)
             }
             FlowControl::IndirectCall => {
                 if let Some(iat_va) =
@@ -144,7 +144,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     self.push32(ret_va);
                     self.call_bridge_u32(bridge::offsets::CALL_INDIRECT, target_va);
                 }
-                ControlFlowOutcome::Continue
+                self.emit_post_call_exit_check(next_va)
             }
             FlowControl::IndirectBranch => {
                 if let Some(iat_va) =
@@ -205,6 +205,30 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 ControlFlowOutcome::Terminated
             }
             _ => ControlFlowOutcome::NotHandled,
+        }
+    }
+
+    fn emit_post_call_exit_check(&mut self, next_va: GuestAddr) -> ControlFlowOutcome {
+        let exit_reason = self.builder.ins().load(
+            I32,
+            MemFlags::trusted(),
+            self.cpu_ptr,
+            cpu_offsets::EXIT_REASON as i32,
+        );
+        let running = self.builder.ins().iconst(I32, ExitReason::Running as i64);
+        let is_exiting = self.builder.ins().icmp(IntCC::NotEqual, exit_reason, running);
+        if let Some(&next_block) = self.func_blocks.get(&next_va) {
+            self.builder
+                .ins()
+                .brif(is_exiting, self.unwind_block, &[], next_block, &[]);
+            ControlFlowOutcome::Terminated
+        } else {
+            let continue_block = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(is_exiting, self.unwind_block, &[], continue_block, &[]);
+            self.builder.switch_to_block(continue_block);
+            ControlFlowOutcome::Continue
         }
     }
 

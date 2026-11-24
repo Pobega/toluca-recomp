@@ -1,6 +1,6 @@
 use core::mem::offset_of;
 
-use cranelift_codegen::ir::condcodes::FloatCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I8, I16, I32, I64};
 use cranelift_codegen::ir::{InstBuilder, MemFlags, Type, Value};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
@@ -198,12 +198,22 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 );
                 true
             }
+            Mnemonic::Cmpps => self.lift_cmp_ps(instr, false),
+            Mnemonic::Cmpss => self.lift_cmp_ps(instr, true),
             Mnemonic::Paddb => self.lift_packed_int_arith(instr, I8, false),
             Mnemonic::Paddw => self.lift_packed_int_arith(instr, I16, false),
             Mnemonic::Paddd => self.lift_packed_int_arith(instr, I32, false),
             Mnemonic::Psubb => self.lift_packed_int_arith(instr, I8, true),
             Mnemonic::Psubw => self.lift_packed_int_arith(instr, I16, true),
             Mnemonic::Psubd => self.lift_packed_int_arith(instr, I32, true),
+            Mnemonic::Psllw => self.lift_packed_int_shift(instr, I16, ShiftDir::Left),
+            Mnemonic::Pslld => self.lift_packed_int_shift(instr, I32, ShiftDir::Left),
+            Mnemonic::Psllq => self.lift_packed_int_shift(instr, I64, ShiftDir::Left),
+            Mnemonic::Psrlw => self.lift_packed_int_shift(instr, I16, ShiftDir::RightLogical),
+            Mnemonic::Psrld => self.lift_packed_int_shift(instr, I32, ShiftDir::RightLogical),
+            Mnemonic::Psrlq => self.lift_packed_int_shift(instr, I64, ShiftDir::RightLogical),
+            Mnemonic::Psraw => self.lift_packed_int_shift(instr, I16, ShiftDir::RightArith),
+            Mnemonic::Psrad => self.lift_packed_int_shift(instr, I32, ShiftDir::RightArith),
             Mnemonic::Emms => {
                 let tw = self
                     .builder
@@ -576,6 +586,106 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         true
     }
 
+    fn lift_cmp_ps(&mut self, instr: &Instruction, scalar: bool) -> bool {
+        let Some(cc) = sse_float_cc(instr.immediate8()) else {
+            return false;
+        };
+        let dst = xmm_index(instr.op_register(0));
+        let all_ones = self.builder.ins().iconst(I32, -1);
+        let zero = self.builder.ins().iconst(I32, 0);
+        if scalar {
+            let lhs = self.xmm_load_lane(dst, F32, 0);
+            let rhs = self.read_sse_f32_operand(instr, 1);
+            let cond = self.builder.ins().fcmp(cc, lhs, rhs);
+            let mask = self.builder.ins().select(cond, all_ones, zero);
+            self.xmm_store_lane(dst, mask, 0);
+        } else {
+            let lhs = [
+                self.xmm_load_lane(dst, F32, 0),
+                self.xmm_load_lane(dst, F32, 1),
+                self.xmm_load_lane(dst, F32, 2),
+                self.xmm_load_lane(dst, F32, 3),
+            ];
+            let rhs = self.read_xmm_f32x4_operand(instr, 1);
+            for lane in 0..4 {
+                let cond = self.builder.ins().fcmp(cc, lhs[lane], rhs[lane]);
+                let mask = self.builder.ins().select(cond, all_ones, zero);
+                self.xmm_store_lane(dst, mask, lane);
+            }
+        }
+        true
+    }
+
+    fn lift_packed_int_shift(
+        &mut self,
+        instr: &Instruction,
+        lane_ty: Type,
+        dir: ShiftDir,
+    ) -> bool {
+        let count_i64 = match instr.op_kind(1) {
+            OpKind::Immediate8 => self.builder.ins().iconst(I64, instr.immediate8() as i64),
+            OpKind::Register if is_xmm_reg(instr.op_register(1)) => {
+                self.xmm_load_lane(xmm_index(instr.op_register(1)), I64, 0)
+            }
+            OpKind::Register if is_mm_reg(instr.op_register(1)) => {
+                self.mm_load_lane(mm_index(instr.op_register(1)), I64, 0)
+            }
+            OpKind::Memory => {
+                let addr = self.compute_memory_addr(instr);
+                self.load_guest(addr, I64)
+            }
+            _ => return false,
+        };
+
+        let lane_bits = lane_ty.bits() as i64;
+        let in_range = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThan, count_i64, lane_bits);
+        let max_shift = self.builder.ins().iconst(I64, lane_bits - 1);
+        let clamped_shift = self.builder.ins().select(in_range, count_i64, max_shift);
+        let shift_amt = self.builder.ins().ireduce(I32, clamped_shift);
+
+        let is_mm = is_mm_reg(instr.op_register(0));
+        let lane_count = if is_mm {
+            MM_BYTES as usize / lane_ty.bytes() as usize
+        } else {
+            XMM_BYTES as usize / lane_ty.bytes() as usize
+        };
+        let reg_idx = if is_mm {
+            mm_index(instr.op_register(0))
+        } else {
+            xmm_index(instr.op_register(0))
+        };
+
+        for lane in 0..lane_count {
+            let val = if is_mm {
+                self.mm_load_lane(reg_idx, lane_ty, lane)
+            } else {
+                self.xmm_load_lane(reg_idx, lane_ty, lane)
+            };
+            let res = match dir {
+                ShiftDir::Left => {
+                    let shifted = self.builder.ins().ishl(val, shift_amt);
+                    let zero = self.builder.ins().iconst(lane_ty, 0);
+                    self.builder.ins().select(in_range, shifted, zero)
+                }
+                ShiftDir::RightLogical => {
+                    let shifted = self.builder.ins().ushr(val, shift_amt);
+                    let zero = self.builder.ins().iconst(lane_ty, 0);
+                    self.builder.ins().select(in_range, shifted, zero)
+                }
+                ShiftDir::RightArith => self.builder.ins().sshr(val, shift_amt),
+            };
+            if is_mm {
+                self.mm_store_lane(reg_idx, res, lane);
+            } else {
+                self.xmm_store_lane(reg_idx, res, lane);
+            }
+        }
+        true
+    }
+
     fn emit_float_binop(&mut self, op: FloatBinOp, lhs: Value, rhs: Value) -> Value {
         match op {
             FloatBinOp::Add => self.builder.ins().fadd(lhs, rhs),
@@ -768,6 +878,27 @@ enum SimdBitOp {
     AndNot,
     Or,
     Xor,
+}
+
+#[derive(Copy, Clone)]
+enum ShiftDir {
+    Left,
+    RightLogical,
+    RightArith,
+}
+
+const fn sse_float_cc(imm: u8) -> Option<FloatCC> {
+    match imm & 7 {
+        0 => Some(FloatCC::Equal),
+        1 => Some(FloatCC::LessThan),
+        2 => Some(FloatCC::LessThanOrEqual),
+        3 => Some(FloatCC::Unordered),
+        4 => Some(FloatCC::NotEqual),
+        5 => Some(FloatCC::UnorderedOrGreaterThanOrEqual),
+        6 => Some(FloatCC::UnorderedOrGreaterThan),
+        7 => Some(FloatCC::Ordered),
+        _ => None,
+    }
 }
 
 const fn is_xmm_reg(reg: Register) -> bool {

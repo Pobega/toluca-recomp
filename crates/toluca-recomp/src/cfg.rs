@@ -538,7 +538,7 @@ fn enqueue_immediate_code_pointers(
     for op_idx in 0..instr.op_count() {
         if instr.op_kind(op_idx) == OpKind::Immediate32 {
             let imm = instr.immediate32();
-            if is_valid_data_pointer_target(image, imm) {
+            if is_valid_code_immediate_target(image, imm) {
                 enqueue_seed(
                     image,
                     imm,
@@ -549,6 +549,17 @@ fn enqueue_immediate_code_pointers(
             }
         }
     }
+}
+
+fn is_valid_code_immediate_target(image: &PeImage, target_va: GuestAddr) -> bool {
+    let Some((_sec, slice)) = executable_slice_from_va(image, target_va) else {
+        return false;
+    };
+    if slice.first() == Some(&0xCC) {
+        return false;
+    }
+    is_jmp_thunk_to_function(image, target_va, slice)
+        || decodes_cleanly(slice, target_va, DATA_PTR_DECODE_MIN_INSTRS)
 }
 
 fn is_valid_data_pointer_target(image: &PeImage, target_va: GuestAddr) -> bool {
@@ -665,6 +676,9 @@ fn is_preceded_by_padding_or_terminator(image: &PeImage, va: GuestAddr) -> bool 
         return false;
     }
     matches!(raw[offset - 1], 0xCC | 0x90 | 0xC3)
+        || (offset >= 3 && raw[offset - 3] == 0xC2 && raw[offset - 1] == 0x00 && raw[offset - 2].is_multiple_of(4))
+        || (offset >= 5 && raw[offset - 5] == 0xE9)
+        || (offset >= 6 && raw[offset - 6] == 0xFF && raw[offset - 5] == 0x25)
 }
 
 fn looks_like_msvc_prologue(bytes: &[u8]) -> bool {

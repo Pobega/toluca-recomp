@@ -218,6 +218,7 @@ pub enum ExitReason {
     UnsupportedInstruction = 4,
     HostTrap = 5,
     GuestException = 6,
+    Longjmp = 7,
 }
 
 #[repr(C, align(16))]

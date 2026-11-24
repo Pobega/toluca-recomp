@@ -1453,13 +1453,22 @@ fn spawn_timer_thread(shared: Arc<SharedRuntime>, timer: crate::win32::PendingTi
 
         let tid = 0x10_000u64 + timer.timer_id as u64;
         let delay = Duration::from_millis(timer.delay_ms.max(1) as u64);
+        const TIMER_POLL_SLICE: Duration = Duration::from_millis(5);
+        let mut next_fire = Instant::now() + delay;
         loop {
-            {
-                let guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = shared.sync_cv.wait_timeout(guard, delay);
-            }
-            if shared.shutdown.load(Ordering::Acquire) || timer.cancelled.load(Ordering::Acquire) {
-                break;
+            loop {
+                if shared.shutdown.load(Ordering::Acquire)
+                    || timer.cancelled.load(Ordering::Acquire)
+                {
+                    done.store(true, Ordering::Release);
+                    return;
+                }
+                let now = Instant::now();
+                if now >= next_fire {
+                    break;
+                }
+                let rem = next_fire.saturating_duration_since(now);
+                std::thread::sleep(rem.min(TIMER_POLL_SLICE));
             }
             let mut cpu = GuestCpuState::new(shared.arena_base as *mut u8, std::ptr::null());
             cpu.eip = timer.callback_va;
@@ -1491,6 +1500,7 @@ fn spawn_timer_thread(shared: Arc<SharedRuntime>, timer: crate::win32::PendingTi
             if !timer.periodic {
                 break;
             }
+            next_fire = (next_fire + delay).max(Instant::now());
         }
         done.store(true, Ordering::Release);
     });

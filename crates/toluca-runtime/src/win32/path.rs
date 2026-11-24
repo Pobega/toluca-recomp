@@ -34,6 +34,24 @@ pub fn resolve_win32_path(game_root: &Path, win_path: &str) -> PathBuf {
 }
 
 fn resolve_components(base: &Path, components: &[&str]) -> PathBuf {
+    let mut exact = base.to_path_buf();
+    for &comp in components {
+        exact.push(comp);
+    }
+    if exact.exists() {
+        return exact;
+    }
+
+    if !components.is_empty() {
+        let mut lower = base.to_path_buf();
+        for &comp in components {
+            lower.push(comp.to_ascii_lowercase());
+        }
+        if lower.exists() {
+            return lower;
+        }
+    }
+
     let mut current = base.to_path_buf();
     let mut existing = current.is_dir();
 

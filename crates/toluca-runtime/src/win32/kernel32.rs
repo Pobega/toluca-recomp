@@ -294,7 +294,6 @@ fn read_file(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
         None
     };
 
-    let mut host_buf = vec![0u8; to_read as usize];
     let result = match ctx.win32.get_handle_mut(handle) {
         Some(Win32Handle::File { file, .. }) => {
             if let Some(off) = overlapped_offset {
@@ -304,7 +303,8 @@ fn read_file(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
                     return Ok(());
                 }
             }
-            file.read(&mut host_buf)
+            let dst = ctx.arena.write_slice_mut(buf_ptr, to_read as usize)?;
+            file.read(dst)
         }
         _ => {
             *ctx.last_error = ERROR_INVALID_HANDLE;
@@ -315,7 +315,6 @@ fn read_file(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
 
     match result {
         Ok(n) => {
-            ctx.arena.write_bytes(buf_ptr, &host_buf[..n])?;
             if bytes_read_ptr != 0 {
                 ctx.arena.write_u32(bytes_read_ptr, n as u32)?;
             }
@@ -586,11 +585,22 @@ fn find_first_file_a(
     };
 
     let mut entries = Vec::new();
+    for dot in [".", ".."] {
+        if wildcard_match_ci(file_pattern, dot) {
+            entries.push(FindEntry {
+                file_name: dot.to_owned(),
+                is_dir: true,
+                file_size: 0,
+            });
+        }
+    }
+
+    let mut real_entries = Vec::new();
     for entry in read_dir.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if wildcard_match_ci(file_pattern, &name) {
             let meta = entry.metadata().ok();
-            entries.push(FindEntry {
+            real_entries.push(FindEntry {
                 file_name: name,
                 is_dir: meta.as_ref().is_some_and(|m| m.is_dir()),
                 file_size: meta.as_ref().map_or(0, |m| m.len()),
@@ -598,7 +608,8 @@ fn find_first_file_a(
         }
     }
 
-    entries.sort_by(|a, b| a.file_name.to_ascii_lowercase().cmp(&b.file_name.to_ascii_lowercase()));
+    real_entries.sort_by(|a, b| a.file_name.to_ascii_lowercase().cmp(&b.file_name.to_ascii_lowercase()));
+    entries.extend(real_entries);
 
     if entries.is_empty() {
         *ctx.last_error = ERROR_FILE_NOT_FOUND;
@@ -2459,4 +2470,179 @@ fn time_kill_event(
     }
     return_stdcall(cpu, ctx.arena, 1, 0)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    use toluca_core::bridge::HostBridge;
+    use toluca_core::memory::DEFAULT_IMAGE_BASE;
+
+    use super::*;
+    use crate::arena::GuestArena;
+    use crate::callconv::push_u32;
+    use crate::heap::{GuestHeap, VirtualMemoryManager};
+    use crate::loader::AotCodeImage;
+    use crate::win32::{Win32Config, Win32State};
+
+    static TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let id = TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "toluca_k32_test_{prefix}_{}_{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn run_k32_call(
+        arena: &mut GuestArena,
+        heap: &mut GuestHeap,
+        win32: &mut Win32State,
+        last_error: &mut u32,
+        handler: crate::runtime::ImportHandler,
+        args: &[u32],
+    ) -> u32 {
+        let mut vmem = VirtualMemoryManager::new();
+        let registry = ImportRegistry::new();
+        let mut imports = Vec::new();
+        let mut import_slot_map = HashMap::new();
+        let code = AotCodeImage::empty_for_test();
+        let bridge = HostBridge::new_stub();
+        let mut cpu = GuestCpuState::new(arena.base_ptr(), &bridge);
+        for &arg in args.iter().rev() {
+            push_u32(&mut cpu, arena, arg).unwrap();
+        }
+        push_u32(&mut cpu, arena, 0xDEAD_BEEF).unwrap();
+        let mut trap = None;
+        let mut pending_error = None;
+        let mut ctx = RuntimeContext {
+            arena,
+            heap,
+            vmem: &mut vmem,
+            win32,
+            registry: &registry,
+            imports: &mut imports,
+            import_slot_map: &mut import_slot_map,
+            code: &code,
+            last_error,
+            host_start_instant: Instant::now(),
+            pe_image_base: DEFAULT_IMAGE_BASE,
+            active_host_tid: 1,
+            trap: &mut trap,
+            pending_error: &mut pending_error,
+        };
+        handler(&mut ctx, &mut cpu).unwrap();
+        cpu.gpr(toluca_core::cpu::Gpr::Eax)
+    }
+
+    #[test]
+    fn find_first_file_empty_dir_returns_dot_and_dotdot_for_star() {
+        let root = TempDir::new("find_empty");
+        std::fs::create_dir_all(root.path.join("Data").join("save")).unwrap();
+
+        let mut arena = GuestArena::new().unwrap();
+        arena.init_thread_environment(DEFAULT_IMAGE_BASE).unwrap();
+        let mut heap = GuestHeap::new();
+        let mut win32 = Win32State::new(Win32Config {
+            game_root: root.path.clone(),
+            headless: true,
+            ..Win32Config::default()
+        });
+        let mut last_error = 0u32;
+
+        let find_data_va = heap.alloc(&mut arena, WIN32_FIND_DATA_SIZE, true).unwrap();
+        let star_pat_va = heap.alloc(&mut arena, 64, true).unwrap();
+        arena.write_cstr(star_pat_va, r"Data\save\*").unwrap();
+
+        let handle = run_k32_call(
+            &mut arena,
+            &mut heap,
+            &mut win32,
+            &mut last_error,
+            find_first_file_a,
+            &[star_pat_va, find_data_va],
+        );
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(last_error, ERROR_SUCCESS);
+        assert_eq!(
+            arena.read_u32(find_data_va + FIND_DATA_OFF_ATTRS).unwrap(),
+            FILE_ATTRIBUTE_DIRECTORY
+        );
+        assert_eq!(
+            arena.read_cstr(find_data_va + FIND_DATA_OFF_NAME, 64).unwrap(),
+            "."
+        );
+
+        let next_ok = run_k32_call(
+            &mut arena,
+            &mut heap,
+            &mut win32,
+            &mut last_error,
+            find_next_file_a,
+            &[handle, find_data_va],
+        );
+        assert_eq!(next_ok, 1);
+        assert_eq!(last_error, ERROR_SUCCESS);
+        assert_eq!(
+            arena.read_u32(find_data_va + FIND_DATA_OFF_ATTRS).unwrap(),
+            FILE_ATTRIBUTE_DIRECTORY
+        );
+        assert_eq!(
+            arena.read_cstr(find_data_va + FIND_DATA_OFF_NAME, 64).unwrap(),
+            ".."
+        );
+
+        let end_ok = run_k32_call(
+            &mut arena,
+            &mut heap,
+            &mut win32,
+            &mut last_error,
+            find_next_file_a,
+            &[handle, find_data_va],
+        );
+        assert_eq!(end_ok, 0);
+        assert_eq!(last_error, ERROR_NO_MORE_FILES);
+
+        let closed = run_k32_call(
+            &mut arena,
+            &mut heap,
+            &mut win32,
+            &mut last_error,
+            find_close,
+            &[handle],
+        );
+        assert_eq!(closed, 1);
+
+        let sav_pat_va = heap.alloc(&mut arena, 64, true).unwrap();
+        arena.write_cstr(sav_pat_va, r"Data\save\*.sav").unwrap();
+        let miss = run_k32_call(
+            &mut arena,
+            &mut heap,
+            &mut win32,
+            &mut last_error,
+            find_first_file_a,
+            &[sav_pat_va, find_data_va],
+        );
+        assert_eq!(miss, INVALID_HANDLE_VALUE);
+        assert_eq!(last_error, ERROR_FILE_NOT_FOUND);
+    }
 }

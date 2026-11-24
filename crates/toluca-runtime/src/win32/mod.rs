@@ -175,11 +175,167 @@ pub struct PendingTimerSpawn {
     pub cancelled: Arc<AtomicBool>,
 }
 
+const CFILE_READ_BUF_CAP: usize = 8192;
+
 pub struct CFileEntry {
     pub file: File,
     pub eof: bool,
     pub err: bool,
     pub base_flag: u32,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+    read_len: usize,
+}
+
+impl CFileEntry {
+    pub fn new(file: File, base_flag: u32) -> Self {
+        Self {
+            file,
+            eof: false,
+            err: false,
+            base_flag,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            read_len: 0,
+        }
+    }
+
+    fn unconsumed_read_bytes(&self) -> usize {
+        self.read_len - self.read_pos
+    }
+
+    fn discard_read_buf(&mut self) {
+        self.read_pos = 0;
+        self.read_len = 0;
+    }
+
+    fn sync_read_cursor(&mut self) -> std::io::Result<()> {
+        let ahead = self.unconsumed_read_bytes();
+        if ahead > 0 {
+            use std::io::Seek;
+            self.file.seek(std::io::SeekFrom::Current(-(ahead as i64)))?;
+            self.discard_read_buf();
+        }
+        Ok(())
+    }
+
+    pub fn read_byte(&mut self) -> Option<u8> {
+        use std::io::Read;
+        if self.read_pos < self.read_len {
+            let b = self.read_buf[self.read_pos];
+            self.read_pos += 1;
+            return Some(b);
+        }
+        if self.read_buf.is_empty() {
+            self.read_buf.resize(CFILE_READ_BUF_CAP, 0);
+        }
+        match self.file.read(&mut self.read_buf) {
+            Ok(0) => {
+                self.eof = true;
+                None
+            }
+            Ok(n) => {
+                self.read_pos = 1;
+                self.read_len = n;
+                Some(self.read_buf[0])
+            }
+            Err(_) => {
+                self.err = true;
+                None
+            }
+        }
+    }
+
+    pub fn read_up_to(&mut self, dst: &mut [u8]) -> usize {
+        use std::io::Read;
+        let mut filled = 0usize;
+        let avail = self.unconsumed_read_bytes();
+        if avail > 0 {
+            let take = avail.min(dst.len());
+            dst[..take].copy_from_slice(&self.read_buf[self.read_pos..self.read_pos + take]);
+            self.read_pos += take;
+            filled += take;
+        }
+        while filled < dst.len() {
+            let rem = dst.len() - filled;
+            if rem >= CFILE_READ_BUF_CAP {
+                match self.file.read(&mut dst[filled..]) {
+                    Ok(0) => {
+                        self.eof = true;
+                        break;
+                    }
+                    Ok(n) => filled += n,
+                    Err(_) => {
+                        self.err = true;
+                        break;
+                    }
+                }
+            } else {
+                if self.read_buf.is_empty() {
+                    self.read_buf.resize(CFILE_READ_BUF_CAP, 0);
+                }
+                match self.file.read(&mut self.read_buf) {
+                    Ok(0) => {
+                        self.eof = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        self.read_pos = 0;
+                        let take = n.min(rem);
+                        dst[filled..filled + take].copy_from_slice(&self.read_buf[..take]);
+                        self.read_pos = take;
+                        self.read_len = n;
+                        filled += take;
+                    }
+                    Err(_) => {
+                        self.err = true;
+                        break;
+                    }
+                }
+            }
+        }
+        filled
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> bool {
+        use std::io::Write;
+        if self.sync_read_cursor().is_err() || self.file.write_all(bytes).is_err() {
+            self.err = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn seek(&mut self, from: std::io::SeekFrom) -> bool {
+        use std::io::Seek;
+        self.eof = false;
+        let adjusted = match from {
+            std::io::SeekFrom::Current(delta) => {
+                std::io::SeekFrom::Current(delta - self.unconsumed_read_bytes() as i64)
+            }
+            other => other,
+        };
+        self.discard_read_buf();
+        if self.file.seek(adjusted).is_ok() {
+            true
+        } else {
+            self.err = true;
+            false
+        }
+    }
+
+    pub fn stream_position(&mut self) -> Option<u64> {
+        use std::io::Seek;
+        let ahead = self.unconsumed_read_bytes() as u64;
+        self.file.stream_position().ok().map(|p| p.saturating_sub(ahead))
+    }
+
+    pub fn flush(&mut self) {
+        use std::io::Write;
+        let _ = self.sync_read_cursor();
+        let _ = self.file.flush();
+    }
 }
 
 #[derive(Clone, Debug)]

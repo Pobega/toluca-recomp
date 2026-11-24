@@ -332,6 +332,17 @@ impl GuestArena {
         Ok(())
     }
 
+    pub fn write_slice_mut(&mut self, addr: GuestAddr, len: usize) -> Result<&mut [u8], ArenaError> {
+        self.ensure_writable(addr, len)?;
+        if len == 0 {
+            return Ok(&mut []);
+        }
+        unsafe {
+            let dst = self.base.as_ptr().add(addr as usize);
+            Ok(std::slice::from_raw_parts_mut(dst, len))
+        }
+    }
+
     pub fn zero_range(&mut self, addr: GuestAddr, len: usize) -> Result<(), ArenaError> {
         self.ensure_writable(addr, len)?;
         if len == 0 {

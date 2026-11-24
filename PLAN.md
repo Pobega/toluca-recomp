@@ -80,14 +80,14 @@
 - [x] **Milestone Gate:** Vanilla `sh2pc.exe` boots natively on Linux x86-64, loads `data/` files, and reaches `Direct3DCreate8`. *(Verified on real vanilla NA v1.0 `sh2pc.exe`: completes MSVC 7.0 CRT init, C++ static ctors, `RegisterClassExA`/`CreateWindowExA` + guest `WndProc`, `DirectInput8Create`, `FindFirstFileA`, `_beginthread`, and calls `d3d8.dll!Direct3DCreate8(220)`.)*
 
 ### Phase 4 — Clean-Room Direct3D 8 → OpenGL ES 3.0 Renderer (`toluca-d3d8`)
-- [ ] Implement guest-memory COM vtables for `IDirect3D8`, `IDirect3DDevice8`, `IDirect3DTexture8`, `IDirect3DSurface8`, `IDirect3DVertexBuffer8`, and `IDirect3DIndexBuffer8`.
-- [ ] Implement D3D8 fixed-function pipeline + `vs_1_1` / `ps_1_x` → `#version 300 es` GLSL shader generator:
+- [x] Implement guest-memory COM vtables for `IDirect3D8`, `IDirect3DDevice8`, `IDirect3DTexture8`, `IDirect3DSurface8`, `IDirect3DVertexBuffer8`, and `IDirect3DIndexBuffer8`.
+- [x] Implement D3D8 fixed-function pipeline + `vs_1_1` / `ps_1_x` → `#version 300 es` GLSL shader generator:
   - Handle Y-axis flip and `[0, 1]` → `[-1, 1]` depth remapping in vertex shader epilogues (avoiding desktop-only `glClipControl`).
   - Swizzle `D3DCOLOR` `.bgra` vertex attributes in shaders instead of desktop `GL_BGRA` vertex format.
   - Present via fullscreen textured quad (compatible with 16-bit handheld displays where `glBlitFramebuffer` fails).
-- [ ] Implement software S3TC/DXT1/3/5 decompression fallback when `GL_EXT_texture_compression_s3tc` is absent (Mali/PowerVR blobs) and enforce GPU `GL_MAX_TEXTURE_SIZE`.
-- [ ] Add a portable shader recipe cache (`toluca-progs.bin`) to eliminate repeat area-load stutters.
-- [ ] **Milestone Gate:** Menus and in-game 3D scenes render accurately using an OpenGL ES 3.0 context on Linux desktop.
+- [x] Implement software S3TC/DXT1/3/5 decompression fallback when `GL_EXT_texture_compression_s3tc` is absent (Mali/PowerVR blobs) and enforce GPU `GL_MAX_TEXTURE_SIZE`.
+- [x] Add a portable shader recipe cache (`toluca-progs.bin`) to eliminate repeat area-load stutters.
+- [x] **Milestone Gate:** Menus and in-game 3D scenes render accurately using an OpenGL ES 3.0 context on Linux desktop. *(Verified on real vanilla NA v1.0 `sh2pc.exe`: renders pixel-clean Konami splash and full `SILENT HILL 2: DIRECTOR'S CUT` main menu live on Mesa OpenGL ES 3.0 with `last_gl_error=0x0000`, `toluca-progs.bin` cached, and EGL ES 3.0 3D lit + `vs_1_1`/`ps_1_1` GPU integration tests passing; in-game 3D entry unlocked once Phase 5 input drives `NEW GAME`.)*
 
 ### Phase 5 — Audio, Input & FMV Playback (`toluca-runtime`)
 - [ ] Implement `dsound` software mixer outputting to SDL2 audio.

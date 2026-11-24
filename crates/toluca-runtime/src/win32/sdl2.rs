@@ -9,9 +9,8 @@ const SDL_INIT_GAMECONTROLLER: u32 = 0x0000_2000;
 pub const SDL_AUDIO_S16LSB: u16 = 0x8010;
 pub const SDL_AUDIO_DEFAULT_FREQ: i32 = 48_000;
 const SDL_AUDIO_ALLOW_FREQUENCY_CHANGE: i32 = 1;
-const SDL_AUDIO_ALLOW_SAMPLES_CHANGE: i32 = 8;
 pub const SDL_AUDIO_DEFAULT_CHANNELS: u8 = 2;
-pub const SDL_AUDIO_DEFAULT_SAMPLES: u16 = 1024;
+pub const SDL_AUDIO_DEFAULT_SAMPLES: u16 = 2048;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000;
 const SDL_WINDOW_FULLSCREEN_DESKTOP: u32 = 0x0000_1001;
 const SDL_WINDOW_OPENGL: u32 = 0x0000_0002;
@@ -737,7 +736,9 @@ impl Sdl2WindowBackend {
         let swap_window = self.gl_swap_window_fn?;
         let get_proc = self.gl_get_proc_addr_fn?;
 
+        crate::win32::pin_current_thread_to_host_cores();
         let ctx = unsafe { create_ctx(window) };
+        crate::win32::pin_current_thread_to_guest_core();
         if ctx.is_null() {
             return None;
         }
@@ -1038,15 +1039,17 @@ impl Sdl2WindowBackend {
             userdata: boxed,
         };
         let mut obtained = unsafe { std::mem::zeroed::<SdlAudioSpec>() };
+        crate::win32::pin_current_thread_to_host_cores();
         let dev_id = unsafe {
             open_fn(
                 std::ptr::null(),
                 0,
                 &desired,
                 &mut obtained,
-                SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_SAMPLES_CHANGE,
+                SDL_AUDIO_ALLOW_FREQUENCY_CHANGE,
             )
         };
+        crate::win32::pin_current_thread_to_guest_core();
         if dev_id == 0 {
             unsafe {
                 drop(Box::from_raw(boxed.cast::<T>()));

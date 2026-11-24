@@ -545,6 +545,7 @@ impl Runtime {
             self.shared.code.code_range(),
             (&raw mut cpu) as usize,
         );
+        crate::win32::pin_current_thread_to_guest_core();
         unsafe {
             entry_fn(&mut cpu);
         }
@@ -1399,6 +1400,7 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
 
         let slot_idx = crate::win32::register_thread_suspend_slot(os_tid);
         let suspend_slot = slot_idx.and_then(crate::win32::thread_suspend_slot);
+        crate::win32::pin_current_thread_to_guest_core();
 
         let thread_priority = {
             let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1541,6 +1543,8 @@ fn schedule_timers(
 fn timer_worker_loop(shared: Arc<SharedRuntime>, done: Arc<AtomicBool>) {
     const TIMER_STACK_BYTES: usize = 64 * 1024;
     const TIMER_TEB_BYTES: usize = 0x1000;
+
+    crate::win32::pin_current_thread_to_guest_core();
 
     let (stack_top, teb_va) = {
         let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());

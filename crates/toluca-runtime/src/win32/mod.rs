@@ -17,7 +17,7 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 
 use toluca_core::GuestAddr;
 use toluca_d3d8::D3d8Context;
@@ -341,6 +341,71 @@ pub fn park_while_suspended(slot: &ThreadSuspendState, shutdown: &AtomicBool) {
     }
 }
 
+pub fn guest_single_core_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TOLUCA_MULTICORE").is_none_or(|v| v != "1"))
+}
+
+#[cfg(target_os = "linux")]
+fn initial_available_cpus() -> &'static [usize] {
+    static CPUS: OnceLock<Vec<usize>> = OnceLock::new();
+    CPUS.get_or_init(|| {
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) }
+            != 0
+        {
+            return Vec::new();
+        }
+        let mut cpus = Vec::new();
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            if unsafe { libc::CPU_ISSET(cpu, &set) } {
+                cpus.push(cpu);
+            }
+        }
+        cpus
+    })
+}
+
+pub fn pin_current_thread_to_guest_core() {
+    #[cfg(target_os = "linux")]
+    {
+        if !guest_single_core_enabled() {
+            return;
+        }
+        let cpus = initial_available_cpus();
+        if cpus.len() < 2 {
+            return;
+        }
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(cpus[0], &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+}
+
+pub fn pin_current_thread_to_host_cores() {
+    #[cfg(target_os = "linux")]
+    {
+        if !guest_single_core_enabled() {
+            return;
+        }
+        let cpus = initial_available_cpus();
+        if cpus.len() < 2 {
+            return;
+        }
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::CPU_ZERO(&mut set);
+            for &cpu in &cpus[1..] {
+                libc::CPU_SET(cpu, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+}
+
 pub fn apply_host_thread_priority(os_tid: libc::pid_t, win32_priority: i32) {
     #[cfg(target_os = "linux")]
     {
@@ -362,7 +427,8 @@ pub fn apply_host_thread_priority(os_tid: libc::pid_t, win32_priority: i32) {
             -14..=-2 => 15,
             -1 => 5,
             0 => 0,
-            _ => -5,
+            1 => -4,
+            _ => -10,
         };
         unsafe {
             libc::setpriority(libc::PRIO_PROCESS, os_tid as libc::id_t, nice);

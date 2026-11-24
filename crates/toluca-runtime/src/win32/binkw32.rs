@@ -543,6 +543,9 @@ impl FfmpegDecoder {
         if unsafe { (api.avcodec_receive_frame)(self.video_ctx, self.frame) } == 0 {
             let vid = extract_video_frame(self.frame);
             unsafe { (api.av_frame_unref)(self.frame) };
+            if !self.audio_ctx.is_null() {
+                drain_audio(api, self.audio_ctx, self.frame, &mut decoded_audio);
+            }
             return (vid, decoded_audio);
         }
 
@@ -554,6 +557,9 @@ impl FfmpegDecoder {
                 if unsafe { (api.avcodec_receive_frame)(self.video_ctx, self.frame) } == 0 {
                     let vid = extract_video_frame(self.frame);
                     unsafe { (api.av_frame_unref)(self.frame) };
+                    if !self.audio_ctx.is_null() {
+                        drain_audio(api, self.audio_ctx, self.frame, &mut decoded_audio);
+                    }
                     return (vid, decoded_audio);
                 }
                 return (None, decoded_audio);
@@ -569,6 +575,9 @@ impl FfmpegDecoder {
                 {
                     let vid = extract_video_frame(self.frame);
                     unsafe { (api.av_frame_unref)(self.frame) };
+                    if !self.audio_ctx.is_null() {
+                        drain_audio(api, self.audio_ctx, self.frame, &mut decoded_audio);
+                    }
                     return (vid, decoded_audio);
                 }
             } else if Some(stream_idx) == self.audio_stream_idx && !self.audio_ctx.is_null() {
@@ -900,6 +909,7 @@ struct BinkInstance {
     sound_on: bool,
     selected_audio_track: Option<BinkAudioTrack>,
     next_frame_due: Instant,
+    start_audio_frames: u64,
     decoder: Option<FfmpegDecoder>,
     current_frame: Option<DecodedVideoFrame>,
 }
@@ -1055,6 +1065,17 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
     write_guest_bink_struct(ctx.arena, bink_va, &header, 1, 0, flags)?;
 
     let frame_period = header.frame_duration();
+    let sound_on = selected_audio_track.is_some();
+    let start_audio_frames = if sound_on {
+        if let Ok(mut mixer) = ctx.win32.dsound.mixer.lock() {
+            mixer.clear_aux_pcm();
+            mixer.aux_played_frames()
+        } else {
+            0
+        }
+    } else {
+        0
+    };
     ctx.win32.bink.instances.insert(
         bink_va,
         BinkInstance {
@@ -1063,9 +1084,10 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
             frame_num: 1,
             last_frame_num: 0,
             paused: false,
-            sound_on: selected_audio_track.is_some(),
+            sound_on,
             selected_audio_track,
             next_frame_due: Instant::now() + frame_period,
+            start_audio_frames,
             decoder,
             current_frame: None,
         },
@@ -1080,6 +1102,9 @@ fn bink_close(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(
     if let Some(inst) = ctx.win32.bink.instances.remove(&bink_va) {
         if let (Some(dec), Some(api)) = (inst.decoder, ctx.win32.bink.ffmpeg.as_ref()) {
             dec.close(api);
+        }
+        if let Ok(mut mixer) = ctx.win32.dsound.mixer.lock() {
+            mixer.clear_aux_pcm();
         }
         let _ = ctx.heap.free(ctx.arena, bink_va);
     }
@@ -1153,6 +1178,29 @@ fn bink_pause(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(
     Ok(())
 }
 
+fn should_wait_for_frame(
+    inst: &BinkInstance,
+    mixer_mutex: &std::sync::Mutex<DsoundMixer>,
+) -> bool {
+    if inst.paused {
+        return true;
+    }
+    if inst.sound_on {
+        if let Ok(mixer) = mixer_mutex.lock() {
+            let played = mixer.aux_played_frames();
+            if mixer.hardware_clocked && played > inst.start_audio_frames {
+                let rate = u128::from(mixer.output_sample_rate().max(1));
+                let elapsed_ns =
+                    u128::from(played - inst.start_audio_frames) * 1_000_000_000 / rate;
+                let target_ns = inst.header.frame_duration().as_nanos()
+                    * u128::from(inst.frame_num.saturating_sub(1));
+                return elapsed_ns < target_ns;
+            }
+        }
+    }
+    Instant::now() < inst.next_frame_due
+}
+
 fn bink_wait(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let bink_va = peek_arg_u32(cpu, ctx.arena, 0)?;
     if ctx.win32.config.headless || ctx.win32.config.max_frames.is_some() {
@@ -1161,7 +1209,7 @@ fn bink_wait(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
     }
     let wait = match ctx.win32.bink.instances.get(&bink_va) {
         Some(inst) if inst.decoder.is_some() => {
-            u32::from(inst.paused || Instant::now() < inst.next_frame_due)
+            u32::from(should_wait_for_frame(inst, &ctx.win32.dsound.mixer))
         }
         _ => 0,
     };
@@ -1233,6 +1281,11 @@ fn bink_next_frame(
             inst.frame_num = 1;
             if let (Some(dec), Some(api)) = (inst.decoder.as_mut(), ctx.win32.bink.ffmpeg.as_ref()) {
                 dec.rewind(api);
+            }
+            if inst.sound_on {
+                if let Ok(mixer) = ctx.win32.dsound.mixer.lock() {
+                    inst.start_audio_frames = mixer.aux_played_frames();
+                }
             }
         } else {
             inst.frame_num += 1;

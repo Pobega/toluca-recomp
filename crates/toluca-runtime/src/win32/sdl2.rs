@@ -7,7 +7,8 @@ const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_INIT_GAMECONTROLLER: u32 = 0x0000_2000;
 pub const SDL_AUDIO_S16LSB: u16 = 0x8010;
-pub const SDL_AUDIO_DEFAULT_FREQ: i32 = 44_100;
+pub const SDL_AUDIO_DEFAULT_FREQ: i32 = 48_000;
+const SDL_AUDIO_ALLOW_FREQUENCY_CHANGE: i32 = 1;
 pub const SDL_AUDIO_DEFAULT_CHANNELS: u8 = 2;
 pub const SDL_AUDIO_DEFAULT_SAMPLES: u16 = 2048;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000;
@@ -282,6 +283,7 @@ type SdlCloseAudioDeviceFn = unsafe extern "C" fn(dev: u32);
 
 pub struct Sdl2AudioDevice {
     device_id: u32,
+    obtained_freq: u32,
     close_fn: SdlCloseAudioDeviceFn,
     userdata: *mut c_void,
     drop_userdata: unsafe fn(*mut c_void),
@@ -292,6 +294,10 @@ unsafe impl Send for Sdl2AudioDevice {}
 impl Sdl2AudioDevice {
     pub fn device_id(&self) -> u32 {
         self.device_id
+    }
+
+    pub fn obtained_freq(&self) -> u32 {
+        self.obtained_freq
     }
 }
 
@@ -1026,13 +1032,26 @@ impl Sdl2WindowBackend {
             userdata: boxed,
         };
         let mut obtained = unsafe { std::mem::zeroed::<SdlAudioSpec>() };
-        let dev_id = unsafe { open_fn(std::ptr::null(), 0, &desired, &mut obtained, 0) };
+        let dev_id = unsafe {
+            open_fn(
+                std::ptr::null(),
+                0,
+                &desired,
+                &mut obtained,
+                SDL_AUDIO_ALLOW_FREQUENCY_CHANGE,
+            )
+        };
         if dev_id == 0 {
             unsafe {
                 drop(Box::from_raw(boxed.cast::<T>()));
             }
             return None;
         }
+        let obtained_freq = if obtained.freq > 0 {
+            obtained.freq as u32
+        } else {
+            SDL_AUDIO_DEFAULT_FREQ as u32
+        };
 
         unsafe {
             pause_fn(dev_id, 0);
@@ -1048,6 +1067,7 @@ impl Sdl2WindowBackend {
 
         Some(Sdl2AudioDevice {
             device_id: dev_id,
+            obtained_freq,
             close_fn,
             userdata: boxed,
             drop_userdata: drop_boxed::<T>,

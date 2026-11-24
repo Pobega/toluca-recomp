@@ -12,9 +12,9 @@ use crate::callconv::{peek_arg_i32, peek_arg_u32, return_stdcall};
 use crate::runtime::{ImportHandler, ImportRegistry, RuntimeContext, RuntimeError};
 use crate::win32::sdl2::Sdl2AudioDevice;
 
-pub const OUTPUT_SAMPLE_RATE: u32 = 44_100;
+pub const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const OUTPUT_CHANNELS: usize = 2;
-const MAX_AUX_PCM_SAMPLES: usize = (OUTPUT_SAMPLE_RATE as usize) * OUTPUT_CHANNELS * 2;
+const MAX_AUX_PCM_SAMPLES: usize = (DEFAULT_OUTPUT_SAMPLE_RATE as usize) * OUTPUT_CHANNELS * 4;
 const WRITE_CURSOR_LEAD_FRAMES: usize = 1024;
 const MIN_BUFFER_BYTES: u32 = 4096;
 const MAX_BUFFER_BYTES: u32 = 4 * 1024 * 1024;
@@ -178,6 +178,9 @@ pub struct DsoundMixer {
     pub listener: Ds3dListenerParams,
     pub deferred_listener: Ds3dListenerParams,
     pub aux_pcm: VecDeque<i16>,
+    aux_resample_frac: f64,
+    pub aux_played_frames: u64,
+    pub output_sample_rate: u32,
     mix_accum: Vec<f32>,
     pub hardware_clocked: bool,
     pub last_advance: Instant,
@@ -197,10 +200,26 @@ impl DsoundMixer {
             listener: Ds3dListenerParams::default(),
             deferred_listener: Ds3dListenerParams::default(),
             aux_pcm: VecDeque::new(),
+            aux_resample_frac: 0.0,
+            aux_played_frames: 0,
+            output_sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             mix_accum: Vec::new(),
             hardware_clocked: false,
             last_advance: Instant::now(),
         }
+    }
+
+    pub fn clear_aux_pcm(&mut self) {
+        self.aux_pcm.clear();
+        self.aux_resample_frac = 0.0;
+    }
+
+    pub fn aux_played_frames(&self) -> u64 {
+        self.aux_played_frames
+    }
+
+    pub fn output_sample_rate(&self) -> u32 {
+        self.output_sample_rate
     }
 
     pub fn alloc_buffer(&mut self, buf: DsoundBufferData) -> usize {
@@ -252,8 +271,43 @@ impl DsoundMixer {
             return;
         }
 
-        let step = f64::from(src_rate) / f64::from(OUTPUT_SAMPLE_RATE);
-        let mut pos = 0.0f64;
+        let out_rate = self.output_sample_rate.max(1);
+        if src_rate == out_rate {
+            self.aux_resample_frac = 0.0;
+            let new_samples = src_frames * OUTPUT_CHANNELS;
+            if new_samples >= MAX_AUX_PCM_SAMPLES {
+                self.aux_pcm.clear();
+            } else {
+                while self.aux_pcm.len() + new_samples > MAX_AUX_PCM_SAMPLES {
+                    self.aux_pcm.pop_front();
+                    self.aux_pcm.pop_front();
+                }
+            }
+            if ch == 2 {
+                let take = new_samples.min(MAX_AUX_PCM_SAMPLES);
+                let skip = (src_frames * 2).saturating_sub(take);
+                self.aux_pcm.extend(samples[skip..src_frames * 2].iter().copied());
+            } else if ch == 1 {
+                let max_frames = MAX_AUX_PCM_SAMPLES / OUTPUT_CHANNELS;
+                let skip = src_frames.saturating_sub(max_frames);
+                for &s in &samples[skip..src_frames] {
+                    self.aux_pcm.push_back(s);
+                    self.aux_pcm.push_back(s);
+                }
+            } else {
+                let max_frames = MAX_AUX_PCM_SAMPLES / OUTPUT_CHANNELS;
+                let skip = src_frames.saturating_sub(max_frames);
+                for f in skip..src_frames {
+                    let base = f * ch;
+                    self.aux_pcm.push_back(samples[base]);
+                    self.aux_pcm.push_back(samples[base + 1]);
+                }
+            }
+            return;
+        }
+
+        let step = f64::from(src_rate) / f64::from(out_rate);
+        let mut pos = self.aux_resample_frac;
         while (pos as usize) < src_frames {
             let f0 = pos as usize;
             let f1 = (f0 + 1).min(src_frames - 1);
@@ -272,6 +326,7 @@ impl DsoundMixer {
             self.aux_pcm.push_back(r);
             pos += step;
         }
+        self.aux_resample_frac = (pos - src_frames as f64).max(0.0);
     }
 
     pub fn mix_into(&mut self, out: &mut [i16]) {
@@ -284,6 +339,7 @@ impl DsoundMixer {
         self.mix_accum.resize(accum_len, 0.0);
         self.mix_accum[..accum_len].fill(0.0);
 
+        let out_rate = f64::from(self.output_sample_rate.max(1));
         let listener = self.listener.clone();
         for buf in self.buffers.values_mut() {
             if !buf.playing || buf.is_primary {
@@ -296,7 +352,7 @@ impl DsoundMixer {
             }
 
             let (gain_l, gain_r) = compute_channel_gains(buf, &listener);
-            let step = f64::from(buf.sample_rate.max(1)) / f64::from(OUTPUT_SAMPLE_RATE);
+            let step = f64::from(buf.sample_rate.max(1)) / out_rate;
             let channels = buf.channels;
             let bits = buf.bits_per_sample;
             let total_f = total_frames as f64;
@@ -345,12 +401,15 @@ impl DsoundMixer {
             }
         }
 
+        let mut popped_aux = 0usize;
         for slot in self.mix_accum[..accum_len].iter_mut() {
             let Some(aux) = self.aux_pcm.pop_front() else {
                 break;
             };
             *slot += f32::from(aux) / 32_768.0;
+            popped_aux += 1;
         }
+        self.aux_played_frames += (popped_aux / OUTPUT_CHANNELS) as u64;
 
         for (dst, &sample) in out.iter_mut().zip(self.mix_accum[..accum_len].iter()) {
             let limited = soft_limit_sample(sample);
@@ -528,6 +587,7 @@ impl DsoundState {
         if let Some(dev) = sdl.open_audio_device(sdl_audio_callback, Arc::clone(&self.mixer)) {
             if let Ok(mut guard) = self.mixer.lock() {
                 guard.hardware_clocked = true;
+                guard.output_sample_rate = dev.obtained_freq();
             }
             self.audio_device = Some(dev);
         }
@@ -880,7 +940,7 @@ fn ds_create_sound_buffer(
             }
         }
     } else {
-        (OUTPUT_SAMPLE_RATE, 2, 16)
+        (DEFAULT_OUTPUT_SAMPLE_RATE, 2, 16)
     };
 
     let size = if is_primary {
@@ -1092,7 +1152,7 @@ fn dsb_get_format(
                     .get(&m.mixer_id)
                     .map(|b| (b.sample_rate, b.channels, b.bits_per_sample))
             })
-            .unwrap_or((OUTPUT_SAMPLE_RATE, 2, 16));
+            .unwrap_or((DEFAULT_OUTPUT_SAMPLE_RATE, 2, 16));
         let block_align = ch * (bits / 8);
         let avg_bytes = rate * u32::from(block_align);
         ctx.arena.write_u16(pwfx, WAVE_FORMAT_PCM)?;
@@ -1194,7 +1254,7 @@ fn dsb_get_frequency(
     let this_ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
     let p_freq = peek_arg_u32(cpu, ctx.arena, 1)?;
     if p_freq != 0 {
-        let freq = with_buf(ctx, this_ptr, |b| b.sample_rate).unwrap_or(OUTPUT_SAMPLE_RATE);
+        let freq = with_buf(ctx, this_ptr, |b| b.sample_rate).unwrap_or(DEFAULT_OUTPUT_SAMPLE_RATE);
         ctx.arena.write_u32(p_freq, freq)?;
     }
     return_stdcall(cpu, ctx.arena, 2, DS_OK)?;
@@ -2248,7 +2308,7 @@ mod tests {
         let mut mixer = DsoundMixer::new();
         mixer.alloc_buffer(DsoundBufferData {
             data: vec![255, 255, 255, 255],
-            sample_rate: 22_050,
+            sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE / 2,
             channels: 1,
             bits_per_sample: 8,
             playing: true,
@@ -2267,7 +2327,7 @@ mod tests {
         }
         mixer.alloc_buffer(DsoundBufferData {
             data: s16_bytes,
-            sample_rate: OUTPUT_SAMPLE_RATE,
+            sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             channels: 2,
             bits_per_sample: 16,
             playing: true,
@@ -2284,7 +2344,7 @@ mod tests {
         mixer.mix_into(&mut out);
         assert_eq!(out[0], i16::MAX);
         assert!(out[1] > 20_000);
-        // 8-bit 22050Hz 4-frame buffer ends after 8 output frames; 16-bit 44100Hz 8-frame buffer also ends.
+        // 8-bit half-rate 4-frame buffer and 16-bit full-rate 8-frame buffer both finish after 8 output frames.
         assert_eq!(mixer.buffers.values().filter(|b| b.playing).count(), 0);
     }
 
@@ -2297,7 +2357,7 @@ mod tests {
         }
         let id = mixer.alloc_buffer(DsoundBufferData {
             data: s16_bytes,
-            sample_rate: OUTPUT_SAMPLE_RATE,
+            sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             channels: 1,
             bits_per_sample: 16,
             playing: true,
@@ -2332,7 +2392,7 @@ mod tests {
         }
         mixer.alloc_buffer(DsoundBufferData {
             data: s16_bytes,
-            sample_rate: OUTPUT_SAMPLE_RATE,
+            sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             channels: 1,
             bits_per_sample: 16,
             playing: true,
@@ -2362,7 +2422,7 @@ mod tests {
     fn circular_lock_unlock_copies_wrapped_pcm_into_mixer() {
         let mut h = TestHarness::new();
         let ds8 = h.create_ds8();
-        let buf = h.create_buffer(ds8, 4096, OUTPUT_SAMPLE_RATE, 1, 16, DSBCAPS_CTRLVOLUME);
+        let buf = h.create_buffer(ds8, 4096, DEFAULT_OUTPUT_SAMPLE_RATE, 1, 16, DSBCAPS_CTRLVOLUME);
 
         let pp1 = h.heap.alloc(&mut h.arena, 4, true).unwrap();
         let pb1 = h.heap.alloc(&mut h.arena, 4, true).unwrap();
@@ -2393,8 +2453,8 @@ mod tests {
         let mut h = TestHarness::new();
         h.win32.dsound.mixer.lock().unwrap().hardware_clocked = true;
         let ds8 = h.create_ds8();
-        let buf_loop = h.create_buffer(ds8, 4096, OUTPUT_SAMPLE_RATE, 1, 16, 0);
-        let buf_once = h.create_buffer(ds8, 4096, OUTPUT_SAMPLE_RATE, 1, 16, 0);
+        let buf_loop = h.create_buffer(ds8, 4096, DEFAULT_OUTPUT_SAMPLE_RATE, 1, 16, 0);
+        let buf_once = h.create_buffer(ds8, 4096, DEFAULT_OUTPUT_SAMPLE_RATE, 1, 16, 0);
 
         assert_eq!(h.call_com(buf_loop, 12, &[0, 0, DSBPLAY_LOOPING]), DS_OK);
         assert_eq!(h.call_com(buf_once, 12, &[0, 0, 0]), DS_OK);
@@ -2436,7 +2496,7 @@ mod tests {
     #[test]
     fn push_aux_pcm_resamples_and_mixes_into_output() {
         let mut mixer = DsoundMixer::new();
-        mixer.push_aux_pcm(&[10_000, 10_000, 10_000], 22_050, 1);
+        mixer.push_aux_pcm(&[10_000, 10_000, 10_000], DEFAULT_OUTPUT_SAMPLE_RATE / 2, 1);
         let mut out = [0i16; 12];
         mixer.mix_into(&mut out);
         assert_eq!(out[0], 10_000);
@@ -2444,6 +2504,33 @@ mod tests {
         assert_eq!(out[4], 10_000);
         assert_eq!(out[5], 10_000);
         assert_eq!(mixer.aux_pcm.len(), 0);
+    }
+
+    #[test]
+    fn push_aux_pcm_fast_path_fractional_continuity_and_played_frames() {
+        let mut mixer = DsoundMixer::new();
+        // 1:1 48 kHz stereo copy path preserves exact samples and tracks aux_played_frames.
+        mixer.push_aux_pcm(&[1_234, -2_345, 3_456, -4_567], 48_000, 2);
+        assert_eq!(mixer.aux_pcm.len(), 4);
+        let mut out = [0i16; 4];
+        mixer.mix_into(&mut out);
+        assert_eq!(out, [1_234, -2_345, 3_456, -4_567]);
+        assert_eq!(mixer.aux_played_frames(), 2);
+
+        // Fractional phase continuity: 1000 frames @ 44100 Hz pushed in 10x100-frame chunks vs 1x1000-frame push.
+        let src: Vec<i16> = (0..1000)
+            .flat_map(|i| [((i * 13) % 20_000) as i16, ((i * 7) % 20_000) as i16])
+            .collect();
+        let mut single = DsoundMixer::new();
+        single.push_aux_pcm(&src, 44_100, 2);
+
+        let mut chunked = DsoundMixer::new();
+        for chunk in src.chunks(200) {
+            chunked.push_aux_pcm(chunk, 44_100, 2);
+        }
+        assert_eq!(single.aux_pcm.len(), chunked.aux_pcm.len());
+        chunked.clear_aux_pcm();
+        assert_eq!(chunked.aux_pcm.len(), 0);
     }
 
     #[test]

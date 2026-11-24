@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use toluca_core::GuestAddr;
 use toluca_core::aot::ImportSymbol;
-use toluca_core::bridge::{HostBridge, default_x87_helper};
+use toluca_core::bridge::{HostBridge, default_rep_movs, default_rep_stos, default_x87_helper};
 use toluca_core::cpu::{ExitReason, Gpr, GuestCpuState};
 use toluca_core::memory::{GUEST_ARENA_SIZE, GUEST_TEB_ADDR, GUEST_THUNK_BASE, GUEST_THUNK_END};
 use toluca_core::pe::{PeError, PeImage};
@@ -698,6 +698,8 @@ fn build_host_bridge(user_data: *mut core::ffi::c_void) -> HostBridge {
         rdtsc: bridge_rdtsc,
         unhandled_instruction: bridge_unhandled_instruction,
         trace_hook: bridge_trace_hook,
+        rep_movs: default_rep_movs,
+        rep_stos: default_rep_stos,
     }
 }
 

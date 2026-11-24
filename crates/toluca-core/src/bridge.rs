@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 use core::mem::offset_of;
 
-use crate::cpu::{ExitReason, GuestCpuState, X87_SW_C2};
+use crate::cpu::{EFLAGS_DF, ExitReason, Gpr, GuestCpuState, X87_SW_C2};
 
 pub type RecompiledFn = unsafe extern "C" fn(cpu: *mut GuestCpuState);
 
@@ -65,6 +65,8 @@ pub struct HostBridge {
     pub unhandled_instruction:
         unsafe extern "C" fn(cpu: *mut GuestCpuState, guest_va: u32, reason: u32),
     pub trace_hook: unsafe extern "C" fn(cpu: *mut GuestCpuState, guest_va: u32),
+    pub rep_movs: unsafe extern "C" fn(cpu: *mut GuestCpuState, elem_size: u32),
+    pub rep_stos: unsafe extern "C" fn(cpu: *mut GuestCpuState, elem_size: u32),
 }
 
 impl HostBridge {
@@ -80,6 +82,8 @@ impl HostBridge {
             rdtsc: stub_rdtsc,
             unhandled_instruction: stub_unhandled_instruction,
             trace_hook: stub_trace_hook,
+            rep_movs: default_rep_movs,
+            rep_stos: default_rep_stos,
         }
     }
 }
@@ -103,6 +107,8 @@ pub mod offsets {
     pub const RDTSC: usize = offset_of!(HostBridge, rdtsc);
     pub const UNHANDLED_INSTRUCTION: usize = offset_of!(HostBridge, unhandled_instruction);
     pub const TRACE_HOOK: usize = offset_of!(HostBridge, trace_hook);
+    pub const REP_MOVS: usize = offset_of!(HostBridge, rep_movs);
+    pub const REP_STOS: usize = offset_of!(HostBridge, rep_stos);
 }
 
 unsafe fn set_exit(cpu: *mut GuestCpuState, reason: ExitReason, detail: u32) {
@@ -240,6 +246,137 @@ pub unsafe extern "C" fn default_x87_helper(cpu: *mut GuestCpuState, op: u32) {
     }
 }
 
+unsafe fn copy_elem(src: *const u8, dst: *mut u8, elem: usize) {
+    match elem {
+        1 => unsafe { dst.write(src.read()) },
+        2 => unsafe { dst.cast::<u16>().write_unaligned(src.cast::<u16>().read_unaligned()) },
+        4 => unsafe { dst.cast::<u32>().write_unaligned(src.cast::<u32>().read_unaligned()) },
+        _ => {}
+    }
+}
+
+unsafe fn write_elem(dst: *mut u8, eax: u32, elem: usize) {
+    match elem {
+        1 => unsafe { dst.write(eax as u8) },
+        2 => {
+            let bytes = (eax as u16).to_le_bytes();
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 2) };
+        }
+        4 => {
+            let bytes = eax.to_le_bytes();
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 4) };
+        }
+        _ => {}
+    }
+}
+
+/// Bulk host implementation for x86 `rep movsb/movsw/movsd`.
+///
+/// # Safety
+/// `cpu` must be null or point to a valid, exclusively accessible `GuestCpuState` whose
+/// `mem_base` covers `[esi, esi + ecx*elem_size)` and `[edi, edi + ecx*elem_size)`.
+pub unsafe extern "C" fn default_rep_movs(cpu: *mut GuestCpuState, elem_size: u32) {
+    let Some(state) = (unsafe { cpu.as_mut() }) else {
+        return;
+    };
+    let elem = elem_size as usize;
+    let ecx = state.gpr[Gpr::Ecx as usize];
+    if state.mem_base.is_null() || ecx == 0 || !matches!(elem, 1 | 2 | 4) {
+        return;
+    }
+
+    let base = state.mem_base;
+    let mut esi = state.gpr[Gpr::Esi as usize];
+    let mut edi = state.gpr[Gpr::Edi as usize];
+    let count = ecx as usize;
+    let byte_len = count * elem;
+
+    if (state.eflags & EFLAGS_DF) == 0 {
+        let no_forward_rle =
+            edi <= esi || (edi as usize) >= (esi as usize).saturating_add(byte_len);
+        if no_forward_rle {
+            unsafe {
+                core::ptr::copy(base.add(esi as usize), base.add(edi as usize), byte_len);
+            }
+        } else {
+            for _ in 0..count {
+                unsafe { copy_elem(base.add(esi as usize), base.add(edi as usize), elem) };
+                esi = esi.wrapping_add(elem_size);
+                edi = edi.wrapping_add(elem_size);
+            }
+            state.gpr[Gpr::Esi as usize] = esi;
+            state.gpr[Gpr::Edi as usize] = edi;
+            state.gpr[Gpr::Ecx as usize] = 0;
+            return;
+        }
+        state.gpr[Gpr::Esi as usize] = esi.wrapping_add(byte_len as u32);
+        state.gpr[Gpr::Edi as usize] = edi.wrapping_add(byte_len as u32);
+    } else {
+        for _ in 0..count {
+            unsafe { copy_elem(base.add(esi as usize), base.add(edi as usize), elem) };
+            esi = esi.wrapping_sub(elem_size);
+            edi = edi.wrapping_sub(elem_size);
+        }
+        state.gpr[Gpr::Esi as usize] = esi;
+        state.gpr[Gpr::Edi as usize] = edi;
+    }
+    state.gpr[Gpr::Ecx as usize] = 0;
+}
+
+/// Bulk host implementation for x86 `rep stosb/stosw/stosd`.
+///
+/// # Safety
+/// `cpu` must be null or point to a valid, exclusively accessible `GuestCpuState` whose
+/// `mem_base` covers `[edi, edi + ecx*elem_size)`.
+pub unsafe extern "C" fn default_rep_stos(cpu: *mut GuestCpuState, elem_size: u32) {
+    let Some(state) = (unsafe { cpu.as_mut() }) else {
+        return;
+    };
+    let elem = elem_size as usize;
+    let ecx = state.gpr[Gpr::Ecx as usize];
+    if state.mem_base.is_null() || ecx == 0 || !matches!(elem, 1 | 2 | 4) {
+        return;
+    }
+
+    let base = state.mem_base;
+    let eax = state.gpr[Gpr::Eax as usize];
+    let mut edi = state.gpr[Gpr::Edi as usize];
+    let count = ecx as usize;
+    let byte_len = count * elem;
+
+    if (state.eflags & EFLAGS_DF) == 0 {
+        let dst = unsafe { base.add(edi as usize) };
+        let fill_byte = eax as u8;
+        let uniform_byte = elem == 1
+            || (elem == 2 && (eax as u16) == u16::from_le_bytes([fill_byte, fill_byte]))
+            || (elem == 4 && eax == u32::from_le_bytes([fill_byte, fill_byte, fill_byte, fill_byte]));
+        if uniform_byte {
+            unsafe { core::ptr::write_bytes(dst, fill_byte, byte_len) };
+        } else {
+            let slice = unsafe { core::slice::from_raw_parts_mut(dst, byte_len) };
+            if elem == 2 {
+                let bytes = (eax as u16).to_le_bytes();
+                for chunk in slice.chunks_exact_mut(2) {
+                    chunk.copy_from_slice(&bytes);
+                }
+            } else {
+                let bytes = eax.to_le_bytes();
+                for chunk in slice.chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&bytes);
+                }
+            }
+        }
+        state.gpr[Gpr::Edi as usize] = edi.wrapping_add(byte_len as u32);
+    } else {
+        for _ in 0..count {
+            unsafe { write_elem(base.add(edi as usize), eax, elem) };
+            edi = edi.wrapping_sub(elem_size);
+        }
+        state.gpr[Gpr::Edi as usize] = edi;
+    }
+    state.gpr[Gpr::Ecx as usize] = 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +396,8 @@ mod tests {
             offsets::RDTSC,
             offsets::UNHANDLED_INSTRUCTION,
             offsets::TRACE_HOOK,
+            offsets::REP_MOVS,
+            offsets::REP_STOS,
         ];
         for (idx, window) in all_offsets.windows(2).enumerate() {
             assert_eq!(
@@ -329,5 +468,120 @@ mod tests {
         }
         assert_ne!(cpu.eflags & EFLAGS_ZF, 0);
         assert_eq!(cpu.lazy_flags.op, LazyFlagOp::None as u32);
+    }
+
+    #[test]
+    fn default_rep_movs_handles_forward_overlap_backward_and_zero() {
+        let bridge = HostBridge::new_stub();
+        let mut mem = [0u8; 64];
+        mem[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut cpu = GuestCpuState::new(mem.as_mut_ptr(), &bridge);
+
+        // Non-overlapping forward dword copy (ecx=2, elem=4).
+        cpu.set_gpr(Gpr::Esi, 0);
+        cpu.set_gpr(Gpr::Edi, 16);
+        cpu.set_gpr(Gpr::Ecx, 2);
+        unsafe { (bridge.rep_movs)(&mut cpu, 4) };
+        assert_eq!(&mem[16..24], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(cpu.gpr(Gpr::Esi), 8);
+        assert_eq!(cpu.gpr(Gpr::Edi), 24);
+        assert_eq!(cpu.gpr(Gpr::Ecx), 0);
+
+        // Forward overlapping RLE copy: edi = esi + 1 repeats byte across 5 bytes.
+        mem[30] = 0xAB;
+        cpu.set_gpr(Gpr::Esi, 30);
+        cpu.set_gpr(Gpr::Edi, 31);
+        cpu.set_gpr(Gpr::Ecx, 5);
+        unsafe { (bridge.rep_movs)(&mut cpu, 1) };
+        assert_eq!(&mem[30..36], &[0xAB; 6]);
+        assert_eq!(cpu.gpr(Gpr::Esi), 35);
+        assert_eq!(cpu.gpr(Gpr::Edi), 36);
+        assert_eq!(cpu.gpr(Gpr::Ecx), 0);
+
+        // Backward copy (DF=1).
+        cpu.eflags |= EFLAGS_DF;
+        mem[40..44].copy_from_slice(&[9, 8, 7, 6]);
+        cpu.set_gpr(Gpr::Esi, 43);
+        cpu.set_gpr(Gpr::Edi, 53);
+        cpu.set_gpr(Gpr::Ecx, 4);
+        unsafe { (bridge.rep_movs)(&mut cpu, 1) };
+        assert_eq!(&mem[50..54], &[9, 8, 7, 6]);
+        assert_eq!(cpu.gpr(Gpr::Esi), 39);
+        assert_eq!(cpu.gpr(Gpr::Edi), 49);
+        assert_eq!(cpu.gpr(Gpr::Ecx), 0);
+
+        // ecx = 0 is a no-op.
+        cpu.eflags &= !EFLAGS_DF;
+        cpu.set_gpr(Gpr::Esi, 0);
+        cpu.set_gpr(Gpr::Edi, 50);
+        cpu.set_gpr(Gpr::Ecx, 0);
+        unsafe { (bridge.rep_movs)(&mut cpu, 4) };
+        assert_eq!(&mem[50..54], &[9, 8, 7, 6]);
+        assert_eq!(cpu.gpr(Gpr::Esi), 0);
+        assert_eq!(cpu.gpr(Gpr::Edi), 50);
+    }
+
+    #[test]
+    fn default_rep_stos_handles_fills_backward_and_zero() {
+        let bridge = HostBridge::new_stub();
+        let mut mem = [0xFFu8; 64];
+        let mut cpu = GuestCpuState::new(mem.as_mut_ptr(), &bridge);
+
+        // Byte fill.
+        cpu.set_gpr(Gpr::Eax, 0x3C);
+        cpu.set_gpr(Gpr::Edi, 2);
+        cpu.set_gpr(Gpr::Ecx, 5);
+        unsafe { (bridge.rep_stos)(&mut cpu, 1) };
+        assert_eq!(&mem[2..7], &[0x3C; 5]);
+        assert_eq!(cpu.gpr(Gpr::Edi), 7);
+        assert_eq!(cpu.gpr(Gpr::Ecx), 0);
+
+        // Non-uniform word fill.
+        cpu.set_gpr(Gpr::Eax, 0x1234);
+        cpu.set_gpr(Gpr::Edi, 10);
+        cpu.set_gpr(Gpr::Ecx, 2);
+        unsafe { (bridge.rep_stos)(&mut cpu, 2) };
+        assert_eq!(&mem[10..14], &[0x34, 0x12, 0x34, 0x12]);
+        assert_eq!(cpu.gpr(Gpr::Edi), 14);
+
+        // Non-uniform dword fill.
+        cpu.set_gpr(Gpr::Eax, 0xDEAD_BEEF);
+        cpu.set_gpr(Gpr::Edi, 16);
+        cpu.set_gpr(Gpr::Ecx, 2);
+        unsafe { (bridge.rep_stos)(&mut cpu, 4) };
+        assert_eq!(
+            &mem[16..24],
+            &[0xEF, 0xBE, 0xAD, 0xDE, 0xEF, 0xBE, 0xAD, 0xDE]
+        );
+        assert_eq!(cpu.gpr(Gpr::Edi), 24);
+
+        // Zero fill fast path (dword uniform 0).
+        cpu.set_gpr(Gpr::Eax, 0);
+        cpu.set_gpr(Gpr::Edi, 16);
+        cpu.set_gpr(Gpr::Ecx, 2);
+        unsafe { (bridge.rep_stos)(&mut cpu, 4) };
+        assert_eq!(&mem[16..24], &[0u8; 8]);
+
+        // Backward dword fill (DF=1).
+        cpu.eflags |= EFLAGS_DF;
+        cpu.set_gpr(Gpr::Eax, 0x0102_0304);
+        cpu.set_gpr(Gpr::Edi, 44);
+        cpu.set_gpr(Gpr::Ecx, 2);
+        unsafe { (bridge.rep_stos)(&mut cpu, 4) };
+        assert_eq!(
+            &mem[40..48],
+            &[0x04, 0x03, 0x02, 0x01, 0x04, 0x03, 0x02, 0x01]
+        );
+        assert_eq!(cpu.gpr(Gpr::Edi), 36);
+        assert_eq!(cpu.gpr(Gpr::Ecx), 0);
+
+        // ecx = 0 is a no-op.
+        cpu.eflags &= !EFLAGS_DF;
+        cpu.set_gpr(Gpr::Eax, 0x77);
+        cpu.set_gpr(Gpr::Edi, 40);
+        cpu.set_gpr(Gpr::Ecx, 0);
+        unsafe { (bridge.rep_stos)(&mut cpu, 1) };
+        assert_eq!(mem[40], 0x04);
+        assert_eq!(cpu.gpr(Gpr::Edi), 40);
     }
 }

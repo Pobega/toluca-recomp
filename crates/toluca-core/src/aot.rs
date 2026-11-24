@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const AOT_MAGIC: [u8; 4] = *b"TLCA";
-pub const AOT_FORMAT_VERSION: u32 = 1;
+pub const AOT_FORMAT_VERSION: u32 = 2;
 
 pub const AOT_HEADER_SIZE: usize = 64;
 pub const AOT_SECTION_ENTRY_SIZE: usize = 32;

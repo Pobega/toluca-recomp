@@ -2,6 +2,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I8, I16, I32};
 use cranelift_codegen::ir::{InstBuilder, Type, Value};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use toluca_core::bridge;
 use toluca_core::cpu::{EFLAGS_DF, Gpr, LazyFlagOp};
 
 use super::LifterContext;
@@ -29,6 +30,17 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
 
         let has_rep = instr.has_rep_prefix() || instr.has_repe_prefix();
         let has_repne = instr.has_repne_prefix();
+
+        if has_rep && matches!(kind, StringOpKind::Movs | StringOpKind::Stos) {
+            let offset = match kind {
+                StringOpKind::Movs => bridge::offsets::REP_MOVS,
+                StringOpKind::Stos => bridge::offsets::REP_STOS,
+                _ => unreachable!(),
+            };
+            let elem_val = self.builder.ins().iconst(I32, ty.bytes() as i64);
+            self.call_bridge_u32(offset, elem_val);
+            return true;
+        }
 
         let eflags = self.read_eflags();
         let df_bit = self.builder.ins().band_imm(eflags, EFLAGS_DF as i64);

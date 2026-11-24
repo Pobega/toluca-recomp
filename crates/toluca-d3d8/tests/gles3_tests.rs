@@ -605,5 +605,90 @@ fn real_gles3_renders_ui_quad_lit_3d_and_programmable_shaders() {
         );
     }
 
-    eprintln!("[gles3_tests] verified UI quad, lit 3D triangle, vs_1_1+ps_1_1, and DPUP MODULATE2X on real GLES 3.0");
+    // Test 5: Sub-rect LockRect/UnlockRect (glTexSubImage2D) + DrawIndexedPrimitiveUP streaming buffers
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            20,
+            &[8, 8, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED, out_ptr]
+        ),
+        D3D_OK
+    );
+    let sub_tex_va = mem.read_u32(out_ptr).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, sub_tex_va, 16, &[0, locked_rect_va, 0, 0]), D3D_OK);
+    let sub_lr = D3dLockedRect::read_from(&mem, locked_rect_va).unwrap();
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            mem.write_u32(sub_lr.p_bits + y * sub_lr.pitch as u32 + x * 4, 0xFF00_0000).unwrap();
+        }
+    }
+    assert_eq!(call(&mut ctx, &mut mem, sub_tex_va, 17, &[0]), D3D_OK);
+
+    // Patch center 4x4 region to bright green via LockRect(pRect).
+    let rect_va = mem.alloc(16, true).unwrap();
+    mem.write_u32(rect_va, 2).unwrap();
+    mem.write_u32(rect_va + 4, 2).unwrap();
+    mem.write_u32(rect_va + 8, 6).unwrap();
+    mem.write_u32(rect_va + 12, 6).unwrap();
+    assert_eq!(
+        call(&mut ctx, &mut mem, sub_tex_va, 16, &[0, locked_rect_va, rect_va, 0]),
+        D3D_OK
+    );
+    let patch_lr = D3dLockedRect::read_from(&mem, locked_rect_va).unwrap();
+    for dy in 0..4u32 {
+        for dx in 0..4u32 {
+            mem.write_u32(patch_lr.p_bits + dy * patch_lr.pitch as u32 + dx * 4, 0xFF00_FF00).unwrap();
+        }
+    }
+    assert_eq!(call(&mut ctx, &mut mem, sub_tex_va, 17, &[0]), D3D_OK);
+
+    let mut dipup_verts = Vec::new();
+    let white = 0xFFFF_FFFFu32;
+    write_xyzrhw_vertex(&mut dipup_verts, [-0.5, -0.5, 0.01, 1.0], white, [0.0, 0.0]);
+    write_xyzrhw_vertex(&mut dipup_verts, [w_f - 0.5, -0.5, 0.01, 1.0], white, [1.0, 0.0]);
+    write_xyzrhw_vertex(&mut dipup_verts, [w_f - 0.5, h_f - 0.5, 0.01, 1.0], white, [1.0, 1.0]);
+    write_xyzrhw_vertex(&mut dipup_verts, [-0.5, h_f - 0.5, 0.01, 1.0], white, [0.0, 1.0]);
+    let dipup_v_va = mem.alloc(dipup_verts.len(), true).unwrap();
+    mem.write_bytes(dipup_v_va, &dipup_verts).unwrap();
+
+    let dipup_indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+    let dipup_i_bytes: Vec<u8> = dipup_indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let dipup_i_va = mem.alloc(dipup_i_bytes.len(), true).unwrap();
+    mem.write_bytes(dipup_i_va, &dipup_i_bytes).unwrap();
+
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 34, &[]), D3D_OK);
+    assert_eq!(
+        call(&mut ctx, &mut mem, dev_va, 36, &[0, 0, D3DCLEAR_TARGET, 0xFF00_0000, 1.0f32.to_bits(), 0]),
+        D3D_OK
+    );
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 61, &[0, sub_tex_va]), D3D_OK);
+    // Stage 0 COLOROP=D3DTOP_SELECTARG1 (2), COLORARG1=TEXTURE (2)
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 63, &[0, 1, 2]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 63, &[0, 2, 2]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 63, &[0, 5, 1]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 63, &[0, 6, 1]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 76, &[fvf_ui]), D3D_OK);
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            73,
+            &[D3DPT_TRIANGLELIST, 0, 4, 2, dipup_i_va, toluca_d3d8::types::D3DFMT_INDEX16, dipup_v_va, 28]
+        ),
+        D3D_OK
+    );
+    assert_eq!(call(&mut ctx, &mut mem, dev_va, 35, &[]), D3D_OK);
+
+    let (_, _, pixels_sub) = {
+        let gles = ctx.backend().as_any().downcast_ref::<Gles3Backend>().unwrap();
+        assert_eq!(gles.last_gl_error(), 0);
+        gles.readback_rgba8().unwrap()
+    };
+    assert_eq!(pixel_at(&pixels_sub, 64, 32, 32), [0, 255, 0, 255]);
+    assert_eq!(pixel_at(&pixels_sub, 64, 4, 4), [0, 0, 0, 255]);
+
+    eprintln!("[gles3_tests] verified UI quad, lit 3D triangle, vs_1_1+ps_1_1, DPUP, and sub-rect+DIPUP on real GLES 3.0");
 }

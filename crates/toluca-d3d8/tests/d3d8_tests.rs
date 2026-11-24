@@ -549,3 +549,148 @@ fn vb_and_ib_partial_lock_and_discard_sync_only_requested_range() {
         2
     );
 }
+
+#[test]
+fn lock_rect_unlock_sub_upload_uses_sub_rect_hook_and_staging_cache() {
+    use std::any::Any;
+    use toluca_d3d8::backend::{ActiveShaders, RenderBackend};
+    use toluca_d3d8::state::DeviceState;
+    use toluca_d3d8::texture::{DecodedRgba8, PreparedTextureUpload};
+    use toluca_d3d8::types::D3dRect;
+
+    struct SubUploadRecord {
+        level: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        pixels: Vec<u8>,
+    }
+
+    #[derive(Default)]
+    struct SubUploadBackend {
+        full_uploads: u32,
+        sub_uploads: Vec<SubUploadRecord>,
+    }
+
+    impl RenderBackend for SubUploadBackend {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn max_texture_size(&self) -> u32 {
+            2048
+        }
+        fn supports_s3tc(&self) -> bool {
+            false
+        }
+        fn on_device_create(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_device_reset(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_clear(&mut self, _: u32, _: u32, _: f32, _: u32, _: &[D3dRect]) {}
+        fn on_texture_upload(&mut self, _: u32, _: u32, _: &PreparedTextureUpload) {
+            self.full_uploads += 1;
+        }
+        fn on_texture_sub_upload(
+            &mut self,
+            _tex_handle: u32,
+            level: u32,
+            x: u32,
+            y: u32,
+            upload: &DecodedRgba8,
+        ) -> bool {
+            self.sub_uploads.push(SubUploadRecord {
+                level,
+                x,
+                y,
+                w: upload.width,
+                h: upload.height,
+                pixels: upload.pixels.clone(),
+            });
+            true
+        }
+        fn on_texture_destroy(&mut self, _: u32) {}
+        fn on_vb_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_vb_destroy(&mut self, _: u32) {}
+        fn on_ib_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_ib_destroy(&mut self, _: u32) {}
+        fn on_draw_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32) {}
+        fn on_draw_indexed_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32, _: u32, _: u32) {}
+        fn on_present(&mut self) {}
+    }
+
+    let mut mem = MockMemory::new();
+    let mut ctx = D3d8Context::new(Box::new(SubUploadBackend::default()));
+
+    let pp_va = mem.alloc(D3dPresentParameters::SIZE, true).unwrap();
+    let out_ptr = mem.alloc(4, true).unwrap();
+    let d3d8_va = ctx.create_direct3d8(&mut mem, D3D_SDK_VERSION).unwrap();
+    let pp = D3dPresentParameters {
+        back_buffer_width: 640,
+        back_buffer_height: 480,
+        back_buffer_format: D3DFMT_X8R8G8B8,
+        back_buffer_count: 1,
+        swap_effect: 1,
+        windowed: 1,
+        ..Default::default()
+    };
+    pp.write_to(&mut mem, pp_va).unwrap();
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            d3d8_va,
+            15,
+            &[0, D3DDEVTYPE_HAL, 0x0002_0000, 0x40, pp_va, out_ptr]
+        ),
+        D3D_OK
+    );
+    let dev_va = mem.read_u32(out_ptr).unwrap();
+
+    assert_eq!(
+        call(
+            &mut ctx,
+            &mut mem,
+            dev_va,
+            20,
+            &[8, 8, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, out_ptr]
+        ),
+        D3D_OK
+    );
+    let tex_va = mem.read_u32(out_ptr).unwrap();
+    let lr_va = mem.alloc(8, true).unwrap();
+    let rect_va = mem.alloc(16, true).unwrap();
+
+    // First full lock populates initial texture via full upload.
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+    // Partial LockRect (2, 3, 4, 5) -> 2x2 sub-rect.
+    mem.write_u32(rect_va, 2).unwrap();
+    mem.write_u32(rect_va + 4, 3).unwrap();
+    mem.write_u32(rect_va + 8, 4).unwrap();
+    mem.write_u32(rect_va + 12, 5).unwrap();
+    assert_eq!(
+        call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, rect_va, 0]),
+        D3D_OK
+    );
+    let lr = D3dLockedRect::read_from(&mem, lr_va).unwrap();
+    assert_eq!(lr.pitch, 32);
+    // Write ARGB 0xFF112233 -> RGBA [0x11, 0x22, 0x33, 0xFF] to (2, 3) and (3, 4).
+    mem.write_u32(lr.p_bits, 0xFF11_2233).unwrap();
+    mem.write_u32(lr.p_bits + 32 + 4, 0xFF44_5566).unwrap();
+    assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+    let backend = ctx
+        .backend()
+        .as_any()
+        .downcast_ref::<SubUploadBackend>()
+        .unwrap();
+    assert_eq!(backend.full_uploads, 1);
+    assert_eq!(backend.sub_uploads.len(), 1);
+    let rec = &backend.sub_uploads[0];
+    assert_eq!((rec.level, rec.x, rec.y, rec.w, rec.h), (0, 2, 3, 2, 2));
+    assert_eq!(&rec.pixels[0..4], &[0x11, 0x22, 0x33, 0xFF]);
+    assert_eq!(&rec.pixels[12..16], &[0x44, 0x55, 0x66, 0xFF]);
+}

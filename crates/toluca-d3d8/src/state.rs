@@ -98,6 +98,12 @@ pub struct DeviceState {
     pub in_scene: bool,
     pub frame_count: u64,
     pub recording_state_block: Option<StateBlockData>,
+    transforms_gen: u64,
+    render_state_gen: u64,
+    lights_gen: u64,
+    material_gen: u64,
+    vs_const_gen: u64,
+    ps_const_gen: u64,
 }
 
 impl DeviceState {
@@ -131,6 +137,12 @@ impl DeviceState {
             in_scene: false,
             frame_count: 0,
             recording_state_block: None,
+            transforms_gen: 1,
+            render_state_gen: 1,
+            lights_gen: 1,
+            material_gen: 1,
+            vs_const_gen: 1,
+            ps_const_gen: 1,
         };
         state.transforms.insert(D3DTS_VIEW, IDENTITY_MATRIX_4X4);
         state.transforms.insert(D3DTS_PROJECTION, IDENTITY_MATRIX_4X4);
@@ -140,8 +152,44 @@ impl DeviceState {
 
     pub fn reset(&mut self, width: u32, height: u32, z_enable: bool) {
         let frame_count = self.frame_count;
+        let transforms_gen = self.transforms_gen + 1;
+        let render_state_gen = self.render_state_gen + 1;
+        let lights_gen = self.lights_gen + 1;
+        let material_gen = self.material_gen + 1;
+        let vs_const_gen = self.vs_const_gen + 1;
+        let ps_const_gen = self.ps_const_gen + 1;
         *self = Self::new(width, height, z_enable);
         self.frame_count = frame_count;
+        self.transforms_gen = transforms_gen;
+        self.render_state_gen = render_state_gen;
+        self.lights_gen = lights_gen;
+        self.material_gen = material_gen;
+        self.vs_const_gen = vs_const_gen;
+        self.ps_const_gen = ps_const_gen;
+    }
+
+    pub fn transforms_gen(&self) -> u64 {
+        self.transforms_gen
+    }
+
+    pub fn render_state_gen(&self) -> u64 {
+        self.render_state_gen
+    }
+
+    pub fn lights_gen(&self) -> u64 {
+        self.lights_gen
+    }
+
+    pub fn material_gen(&self) -> u64 {
+        self.material_gen
+    }
+
+    pub fn vs_const_gen(&self) -> u64 {
+        self.vs_const_gen
+    }
+
+    pub fn ps_const_gen(&self) -> u64 {
+        self.ps_const_gen
     }
 
     pub fn get_transform(&self, state: u32) -> [f32; 16] {
@@ -156,6 +204,7 @@ impl DeviceState {
             sb.transforms.insert(state, mat);
         } else {
             self.transforms.insert(state, mat);
+            self.transforms_gen += 1;
         }
     }
 
@@ -169,7 +218,11 @@ impl DeviceState {
         if let Some(sb) = &mut self.recording_state_block {
             sb.render_states.insert(state, value);
         } else if (state as usize) < NUM_RENDER_STATES {
-            self.render_states[state as usize] = value;
+            let slot = &mut self.render_states[state as usize];
+            if *slot != value {
+                *slot = value;
+                self.render_state_gen += 1;
+            }
         }
     }
 
@@ -212,6 +265,7 @@ impl DeviceState {
             sb.material = Some(material);
         } else {
             self.material = material;
+            self.material_gen += 1;
         }
     }
 
@@ -229,6 +283,7 @@ impl DeviceState {
                 self.lights.resize(idx + 1, LightSlot::default());
             }
             self.lights[idx].light = light;
+            self.lights_gen += 1;
         }
     }
 
@@ -252,6 +307,7 @@ impl DeviceState {
                 self.lights.resize(idx + 1, LightSlot::default());
             }
             self.lights[idx].enabled = enable;
+            self.lights_gen += 1;
         }
     }
 
@@ -313,6 +369,7 @@ impl DeviceState {
     }
 
     pub fn set_vs_constants(&mut self, start_reg: u32, regs: &[[f32; 4]]) {
+        let mut mutated = false;
         for (i, &val) in regs.iter().enumerate() {
             let reg = start_reg + i as u32;
             if (reg as usize) >= NUM_VS_CONSTANTS {
@@ -322,11 +379,16 @@ impl DeviceState {
                 sb.vs_constants.insert(reg, val);
             } else {
                 self.vs_constants[reg as usize] = val;
+                mutated = true;
             }
+        }
+        if mutated {
+            self.vs_const_gen += 1;
         }
     }
 
     pub fn set_ps_constants(&mut self, start_reg: u32, regs: &[[f32; 4]]) {
+        let mut mutated = false;
         for (i, &val) in regs.iter().enumerate() {
             let reg = start_reg + i as u32;
             if (reg as usize) >= NUM_PS_CONSTANTS {
@@ -336,7 +398,11 @@ impl DeviceState {
                 sb.ps_constants.insert(reg, val);
             } else {
                 self.ps_constants[reg as usize] = val;
+                mutated = true;
             }
+        }
+        if mutated {
+            self.ps_const_gen += 1;
         }
     }
 
@@ -418,31 +484,46 @@ impl DeviceState {
     }
 
     pub fn apply_state_block(&mut self, sb: &StateBlockData) {
+        let mut rs_mutated = false;
         for (&rs, &val) in &sb.render_states {
             if (rs as usize) < NUM_RENDER_STATES {
-                self.render_states[rs as usize] = val;
+                let slot = &mut self.render_states[rs as usize];
+                if *slot != val {
+                    *slot = val;
+                    rs_mutated = true;
+                }
             }
+        }
+        if rs_mutated {
+            self.render_state_gen += 1;
         }
         for (&(stage, tss), &val) in &sb.tss {
             if (stage as usize) < NUM_TEXTURE_STAGES && (tss as usize) < NUM_TSS_SLOTS {
                 self.texture_stage_states[stage as usize][tss as usize] = val;
             }
         }
-        for (&ts, &mat) in &sb.transforms {
-            self.transforms.insert(ts, mat);
+        if !sb.transforms.is_empty() {
+            for (&ts, &mat) in &sb.transforms {
+                self.transforms.insert(ts, mat);
+            }
+            self.transforms_gen += 1;
         }
         if let Some(vp) = sb.viewport {
             self.viewport = vp;
         }
         if let Some(mat) = sb.material {
             self.material = mat;
+            self.material_gen += 1;
         }
-        for (&idx, &slot) in &sb.lights {
-            let idx_usize = idx as usize;
-            if idx_usize >= self.lights.len() {
-                self.lights.resize(idx_usize + 1, LightSlot::default());
+        if !sb.lights.is_empty() {
+            for (&idx, &slot) in &sb.lights {
+                let idx_usize = idx as usize;
+                if idx_usize >= self.lights.len() {
+                    self.lights.resize(idx_usize + 1, LightSlot::default());
+                }
+                self.lights[idx_usize] = slot;
             }
-            self.lights[idx_usize] = slot;
+            self.lights_gen += 1;
         }
         for (&idx, &plane) in &sb.clip_planes {
             if (idx as usize) < NUM_CLIP_PLANES {
@@ -468,15 +549,25 @@ impl DeviceState {
         if let Some(ps) = sb.pixel_shader {
             self.current_pixel_shader = ps;
         }
+        let mut vs_mutated = false;
         for (&reg, &val) in &sb.vs_constants {
             if (reg as usize) < NUM_VS_CONSTANTS {
                 self.vs_constants[reg as usize] = val;
+                vs_mutated = true;
             }
         }
+        if vs_mutated {
+            self.vs_const_gen += 1;
+        }
+        let mut ps_mutated = false;
         for (&reg, &val) in &sb.ps_constants {
             if (reg as usize) < NUM_PS_CONSTANTS {
                 self.ps_constants[reg as usize] = val;
+                ps_mutated = true;
             }
+        }
+        if ps_mutated {
+            self.ps_const_gen += 1;
         }
     }
 
@@ -705,4 +796,60 @@ fn mul_matrix_4x4(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dirty_generation_counters_track_mutations_and_reset() {
+        let mut s = DeviceState::new(640, 480, true);
+        assert_eq!(s.transforms_gen(), 1);
+        assert_eq!(s.render_state_gen(), 1);
+        assert_eq!(s.lights_gen(), 1);
+        assert_eq!(s.material_gen(), 1);
+        assert_eq!(s.vs_const_gen(), 1);
+        assert_eq!(s.ps_const_gen(), 1);
+
+        s.set_transform(D3DTS_WORLD, IDENTITY_MATRIX_4X4);
+        assert_eq!(s.transforms_gen(), 2);
+        s.multiply_transform(D3DTS_WORLD, IDENTITY_MATRIX_4X4);
+        assert_eq!(s.transforms_gen(), 3);
+
+        let cur_zen = s.get_render_state(D3DRS_ZENABLE);
+        s.set_render_state(D3DRS_ZENABLE, cur_zen);
+        assert_eq!(s.render_state_gen(), 1);
+        s.set_render_state(D3DRS_ZENABLE, cur_zen ^ 1);
+        assert_eq!(s.render_state_gen(), 2);
+
+        s.set_light(0, D3dLight8::default());
+        assert_eq!(s.lights_gen(), 2);
+        s.light_enable(0, true);
+        assert_eq!(s.lights_gen(), 3);
+
+        s.set_material(D3dMaterial8::default());
+        assert_eq!(s.material_gen(), 2);
+
+        s.set_vs_constants(0, &[[1.0, 2.0, 3.0, 4.0]]);
+        assert_eq!(s.vs_const_gen(), 2);
+        s.set_ps_constants(0, &[[0.5, 0.5, 0.5, 1.0]]);
+        assert_eq!(s.ps_const_gen(), 2);
+
+        let sb = s.snapshot_state_block(D3DSBT_ALL).unwrap();
+        s.apply_state_block(&sb);
+        assert_eq!(s.transforms_gen(), 4);
+        assert_eq!(s.lights_gen(), 4);
+        assert_eq!(s.material_gen(), 3);
+        assert_eq!(s.vs_const_gen(), 3);
+        assert_eq!(s.ps_const_gen(), 3);
+
+        s.reset(800, 600, true);
+        assert!(s.transforms_gen() > 4);
+        assert!(s.render_state_gen() > 2);
+        assert!(s.lights_gen() > 4);
+        assert!(s.material_gen() > 3);
+        assert!(s.vs_const_gen() > 3);
+        assert!(s.ps_const_gen() > 3);
+    }
 }

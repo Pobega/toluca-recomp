@@ -2,7 +2,7 @@ use std::any::Any;
 
 use crate::shader_asm::VertexDeclElement;
 use crate::state::DeviceState;
-use crate::texture::PreparedTextureUpload;
+use crate::texture::{DecodedRgba8, PreparedTextureUpload};
 use crate::types::D3dRect;
 
 #[derive(Default)]
@@ -24,6 +24,16 @@ pub trait RenderBackend {
     fn on_device_reset(&mut self, width: u32, height: u32, format: u32, windowed: bool);
     fn on_clear(&mut self, flags: u32, color: u32, z: f32, stencil: u32, rects: &[D3dRect]);
     fn on_texture_upload(&mut self, tex_handle: u32, level: u32, upload: &PreparedTextureUpload);
+    fn on_texture_sub_upload(
+        &mut self,
+        _tex_handle: u32,
+        _level: u32,
+        _x: u32,
+        _y: u32,
+        _upload: &DecodedRgba8,
+    ) -> bool {
+        false
+    }
     fn on_texture_destroy(&mut self, tex_handle: u32);
     fn on_vb_upload(&mut self, vb_handle: u32, data: &[u8], fvf: u32, usage: u32);
     fn on_vb_sub_upload(

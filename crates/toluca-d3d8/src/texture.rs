@@ -2,7 +2,7 @@ use crate::types::{
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_DXT1,
     D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_L8, D3DFMT_P8, D3DFMT_R5G6B5,
     D3DFMT_R8G8B8, D3DFMT_V8U8, D3DFMT_X1R5G5B5, D3DFMT_X4R4G4B4, D3DFMT_X8R8G8B8,
-    surface_row_pitch,
+    format_bytes_per_pixel, surface_row_pitch,
 };
 
 const DXT_BLOCK_DIM: u32 = 4;
@@ -385,6 +385,205 @@ fn convert_uncompressed_pixel(
     }
 }
 
+fn build_p8_lut(palette: Option<&[[u8; 4]; 256]>) -> [[u8; 4]; 256] {
+    let mut lut = [[0u8; 4]; 256];
+    if let Some(pal) = palette {
+        let uses_alpha = palette_has_nonzero_alpha(pal);
+        for (dst, &entry) in lut.iter_mut().zip(pal.iter()) {
+            let a = if uses_alpha { entry[3] } else { 255 };
+            *dst = [entry[0], entry[1], entry[2], a];
+        }
+    } else {
+        for (i, dst) in lut.iter_mut().enumerate() {
+            let v = i as u8;
+            *dst = [v, v, v, 255];
+        }
+    }
+    lut
+}
+
+fn check_rect_bounds(
+    src: &[u8],
+    effective_pitch: usize,
+    ry: usize,
+    rh: usize,
+    row_end_byte: usize,
+) -> Result<(), String> {
+    if rh == 0 {
+        return Ok(());
+    }
+    let last_row_end = (ry + rh - 1) * effective_pitch + row_end_byte;
+    if last_row_end > src.len() {
+        return Err(format!(
+            "surface buffer too small: need {last_row_end} bytes, got {}",
+            src.len()
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn convert_surface_rect_to_rgba8(
+    format: u32,
+    pitch: u32,
+    src: &[u8],
+    rx: u32,
+    ry: u32,
+    rw: u32,
+    rh: u32,
+    palette: Option<&[[u8; 4]; 256]>,
+) -> Result<DecodedRgba8, String> {
+    let mut pixels = vec![0u8; (rw as usize) * (rh as usize) * RGBA8_BPP];
+    if rw == 0 || rh == 0 {
+        return Ok(DecodedRgba8 {
+            width: rw,
+            height: rh,
+            pixels,
+        });
+    }
+
+    let bpp = format_bytes_per_pixel(format)
+        .ok_or_else(|| format!("unsupported D3DFORMAT 0x{format:08x} for RGBA8 conversion"))?
+        as usize;
+    let rx_usize = rx as usize;
+    let ry_usize = ry as usize;
+    let rw_usize = rw as usize;
+    let rh_usize = rh as usize;
+    let row_end_byte = (rx_usize + rw_usize) * bpp;
+    let min_row_bytes = surface_row_pitch(format, rx + rw) as usize;
+    let effective_pitch = (pitch as usize).max(min_row_bytes);
+    check_rect_bounds(src, effective_pitch, ry_usize, rh_usize, row_end_byte)?;
+
+    let out_stride = rw_usize * RGBA8_BPP;
+    let src_x_off = rx_usize * bpp;
+    let src_span = rw_usize * bpp;
+
+    match format {
+        D3DFMT_A8R8G8B8 => {
+            for dy in 0..rh_usize {
+                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (px, dst) in row.chunks_exact(4).zip(out_row.chunks_exact_mut(4)) {
+                    dst[0] = px[2];
+                    dst[1] = px[1];
+                    dst[2] = px[0];
+                    dst[3] = px[3];
+                }
+            }
+        }
+        D3DFMT_X8R8G8B8 => {
+            for dy in 0..rh_usize {
+                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (px, dst) in row.chunks_exact(4).zip(out_row.chunks_exact_mut(4)) {
+                    dst[0] = px[2];
+                    dst[1] = px[1];
+                    dst[2] = px[0];
+                    dst[3] = 255;
+                }
+            }
+        }
+        D3DFMT_A4R4G4B4 => {
+            for dy in 0..rh_usize {
+                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (px, dst) in row.chunks_exact(2).zip(out_row.chunks_exact_mut(4)) {
+                    let val = u16::from_le_bytes([px[0], px[1]]);
+                    dst[0] = (((val >> 8) & 0xF) as u8) * 17;
+                    dst[1] = (((val >> 4) & 0xF) as u8) * 17;
+                    dst[2] = ((val & 0xF) as u8) * 17;
+                    dst[3] = (((val >> 12) & 0xF) as u8) * 17;
+                }
+            }
+        }
+        D3DFMT_R5G6B5 => {
+            for dy in 0..rh_usize {
+                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (px, dst) in row.chunks_exact(2).zip(out_row.chunks_exact_mut(4)) {
+                    let val = u16::from_le_bytes([px[0], px[1]]);
+                    let rgb = rgb565_to_rgb8(val);
+                    dst[0] = rgb[0];
+                    dst[1] = rgb[1];
+                    dst[2] = rgb[2];
+                    dst[3] = 255;
+                }
+            }
+        }
+        D3DFMT_A1R5G5B5 => {
+            for dy in 0..rh_usize {
+                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (px, dst) in row.chunks_exact(2).zip(out_row.chunks_exact_mut(4)) {
+                    let val = u16::from_le_bytes([px[0], px[1]]);
+                    dst[0] = expand_5bit(((val >> 10) & 0x1F) as u8);
+                    dst[1] = expand_5bit(((val >> 5) & 0x1F) as u8);
+                    dst[2] = expand_5bit((val & 0x1F) as u8);
+                    dst[3] = if (val & 0x8000) == 0 { 0 } else { 255 };
+                }
+            }
+        }
+        D3DFMT_P8 => {
+            let lut = build_p8_lut(palette);
+            for dy in 0..rh_usize {
+                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (&idx, dst) in row.iter().zip(out_row.chunks_exact_mut(4)) {
+                    dst.copy_from_slice(&lut[idx as usize]);
+                }
+            }
+        }
+        D3DFMT_A8 => {
+            for dy in 0..rh_usize {
+                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (&alpha, dst) in row.iter().zip(out_row.chunks_exact_mut(4)) {
+                    dst[0] = 255;
+                    dst[1] = 255;
+                    dst[2] = 255;
+                    dst[3] = alpha;
+                }
+            }
+        }
+        D3DFMT_L8 => {
+            for dy in 0..rh_usize {
+                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (&lum, dst) in row.iter().zip(out_row.chunks_exact_mut(4)) {
+                    dst[0] = lum;
+                    dst[1] = lum;
+                    dst[2] = lum;
+                    dst[3] = 255;
+                }
+            }
+        }
+        _ => {
+            let pal_uses_alpha = palette.is_some_and(palette_has_nonzero_alpha);
+            for dy in 0..rh_usize {
+                let row_start = (ry_usize + dy) * effective_pitch;
+                let row = &src[row_start..row_start + row_end_byte];
+                let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                for (dx, dst) in out_row.chunks_exact_mut(4).enumerate() {
+                    let rgba = convert_uncompressed_pixel(
+                        format,
+                        row,
+                        rx_usize + dx,
+                        palette,
+                        pal_uses_alpha,
+                    )?;
+                    dst.copy_from_slice(&rgba);
+                }
+            }
+        }
+    }
+
+    Ok(DecodedRgba8 {
+        width: rw,
+        height: rh,
+        pixels,
+    })
+}
+
 pub fn convert_surface_to_rgba8(
     format: u32,
     width: u32,
@@ -402,41 +601,7 @@ pub fn convert_surface_to_rgba8(
         _ => {}
     }
 
-    let mut pixels = vec![0u8; (width as usize) * (height as usize) * RGBA8_BPP];
-    if width == 0 || height == 0 {
-        return Ok(DecodedRgba8 {
-            width,
-            height,
-            pixels,
-        });
-    }
-
-    let min_row_bytes = surface_row_pitch(format, width) as usize;
-    let effective_pitch = (pitch as usize).max(min_row_bytes);
-    let pal_uses_alpha = palette.is_some_and(palette_has_nonzero_alpha);
-
-    for y in 0..height as usize {
-        let row_start = y * effective_pitch;
-        let row_end = row_start + min_row_bytes;
-        if row_end > src.len() {
-            return Err(format!(
-                "surface buffer too small: need {row_end} bytes, got {}",
-                src.len()
-            ));
-        }
-        let row = &src[row_start..row_end];
-        for x in 0..width as usize {
-            let rgba = convert_uncompressed_pixel(format, row, x, palette, pal_uses_alpha)?;
-            let out_idx = (y * (width as usize) + x) * RGBA8_BPP;
-            pixels[out_idx..out_idx + RGBA8_BPP].copy_from_slice(&rgba);
-        }
-    }
-
-    Ok(DecodedRgba8 {
-        width,
-        height,
-        pixels,
-    })
+    convert_surface_rect_to_rgba8(format, pitch, src, 0, 0, width, height, palette)
 }
 
 fn downsample_rgba8_half(img: &DecodedRgba8) -> DecodedRgba8 {
@@ -519,4 +684,74 @@ pub fn prepare_texture_upload(
     Ok(PreparedTextureUpload::Rgba8(clamp_rgba8_to_max_size(
         decoded, limit,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slice_rgba_rect(full: &DecodedRgba8, rx: u32, ry: u32, rw: u32, rh: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity((rw * rh * 4) as usize);
+        let full_stride = (full.width * 4) as usize;
+        let rect_stride = (rw * 4) as usize;
+        let x_off = (rx * 4) as usize;
+        for dy in 0..rh as usize {
+            let start = ((ry as usize) + dy) * full_stride + x_off;
+            out.extend_from_slice(&full.pixels[start..start + rect_stride]);
+        }
+        out
+    }
+
+    #[test]
+    fn convert_surface_rect_matches_full_surface_slice() {
+        let (w, h) = (8u32, 6u32);
+        let (rx, ry, rw, rh) = (2u32, 1u32, 4u32, 3u32);
+
+        let argb_pitch = w * 4;
+        let argb_src: Vec<u8> = (0..(argb_pitch * h))
+            .map(|i| ((i * 37 + 13) & 0xFF) as u8)
+            .collect();
+        let full_argb =
+            convert_surface_to_rgba8(D3DFMT_A8R8G8B8, w, h, argb_pitch, &argb_src, None).unwrap();
+        let rect_argb =
+            convert_surface_rect_to_rgba8(D3DFMT_A8R8G8B8, argb_pitch, &argb_src, rx, ry, rw, rh, None)
+                .unwrap();
+        assert_eq!(rect_argb.width, rw);
+        assert_eq!(rect_argb.height, rh);
+        assert_eq!(rect_argb.pixels, slice_rgba_rect(&full_argb, rx, ry, rw, rh));
+
+        let a4_pitch = w * 2;
+        let a4_src: Vec<u8> = (0..(a4_pitch * h))
+            .map(|i| ((i * 53 + 7) & 0xFF) as u8)
+            .collect();
+        let full_a4 =
+            convert_surface_to_rgba8(D3DFMT_A4R4G4B4, w, h, a4_pitch, &a4_src, None).unwrap();
+        let rect_a4 =
+            convert_surface_rect_to_rgba8(D3DFMT_A4R4G4B4, a4_pitch, &a4_src, rx, ry, rw, rh, None)
+                .unwrap();
+        assert_eq!(rect_a4.pixels, slice_rgba_rect(&full_a4, rx, ry, rw, rh));
+
+        let mut palette = [[0u8; 4]; 256];
+        for (i, entry) in palette.iter_mut().enumerate() {
+            *entry = [i as u8, 255 - i as u8, (i as u8).wrapping_mul(3), (i as u8) | 1];
+        }
+        let p8_pitch = w;
+        let p8_src: Vec<u8> = (0..(p8_pitch * h))
+            .map(|i| ((i * 19 + 5) & 0xFF) as u8)
+            .collect();
+        let full_p8 =
+            convert_surface_to_rgba8(D3DFMT_P8, w, h, p8_pitch, &p8_src, Some(&palette)).unwrap();
+        let rect_p8 = convert_surface_rect_to_rgba8(
+            D3DFMT_P8,
+            p8_pitch,
+            &p8_src,
+            rx,
+            ry,
+            rw,
+            rh,
+            Some(&palette),
+        )
+        .unwrap();
+        assert_eq!(rect_p8.pixels, slice_rgba_rect(&full_p8, rx, ry, rw, rh));
+    }
 }

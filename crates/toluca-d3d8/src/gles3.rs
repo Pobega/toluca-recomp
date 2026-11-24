@@ -22,7 +22,7 @@ use crate::texture::PreparedTextureUpload;
 use crate::types::{
     D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL,
     D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCMP_NEVER,
-    D3DCMP_NOTEQUAL, D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5,
+    D3DCMP_NOTEQUAL, D3DCULL_CW, D3DCULL_NONE, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5,
     D3DFMT_INDEX32, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_POSITION_MASK, D3DFVF_PSIZE,
     D3DFVF_SPECULAR, D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT, D3DFVF_XYZ, D3DFVF_XYZB1,
     D3DFVF_XYZB5, D3DFVF_XYZRHW, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST,
@@ -64,6 +64,11 @@ const ASPECT_EPSILON: f64 = 1e-4;
 const ASPECT_RATIO_4_3: f64 = 4.0 / 3.0;
 const ASPECT_RATIO_16_9: f64 = 16.0 / 9.0;
 const CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(3);
+const PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const STREAMING_VBO_INIT_BYTES: usize = 512 * 1024;
+const STREAMING_IBO_INIT_BYTES: usize = 128 * 1024;
+const STREAMING_ALIGN_BYTES: usize = 16;
+const MAX_VERTEX_ATTRIBS: u32 = 16;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum AspectMode {
@@ -190,6 +195,7 @@ const GL_EXTENSIONS: GLenum = 0x1F03;
 
 const GL_ARRAY_BUFFER: GLenum = 0x8892;
 const GL_ELEMENT_ARRAY_BUFFER: GLenum = 0x8893;
+const GL_STREAM_DRAW: GLenum = 0x88E0;
 const GL_STATIC_DRAW: GLenum = 0x88E4;
 const GL_DYNAMIC_DRAW: GLenum = 0x88E8;
 
@@ -510,16 +516,170 @@ struct GlTexture {
 
 struct GlBuffer {
     id: GLuint,
-    data: Vec<u8>,
+    byte_len: usize,
     fvf: u32,
     format: u32,
     gl_usage: GLenum,
 }
 
+struct StreamingGlBuffer {
+    id: GLuint,
+    target: GLenum,
+    capacity: usize,
+    offset: usize,
+    init_capacity: usize,
+    used_this_frame: bool,
+}
+
+impl StreamingGlBuffer {
+    fn new(gl: &Gles3Functions, target: GLenum, init_capacity: usize) -> Self {
+        let mut id = 0;
+        unsafe {
+            (gl.gl_gen_buffers)(1, &mut id);
+        }
+        Self {
+            id,
+            target,
+            capacity: 0,
+            offset: 0,
+            init_capacity,
+            used_this_frame: false,
+        }
+    }
+
+    fn append(&mut self, gl: &Gles3Functions, data: &[u8]) -> usize {
+        let aligned = (self.offset + (STREAMING_ALIGN_BYTES - 1)) & !(STREAMING_ALIGN_BYTES - 1);
+        unsafe {
+            (gl.gl_bind_buffer)(self.target, self.id);
+        }
+        let write_offset = if self.capacity == 0 || aligned + data.len() > self.capacity {
+            let new_cap = self
+                .capacity
+                .max(data.len().next_power_of_two())
+                .max(self.init_capacity);
+            self.capacity = new_cap;
+            unsafe {
+                (gl.gl_buffer_data)(
+                    self.target,
+                    self.capacity as GLsizeiptr,
+                    std::ptr::null(),
+                    GL_STREAM_DRAW,
+                );
+            }
+            self.offset = 0;
+            0
+        } else {
+            aligned
+        };
+        unsafe {
+            (gl.gl_buffer_sub_data)(
+                self.target,
+                write_offset as GLintptr,
+                data.len() as GLsizeiptr,
+                data.as_ptr().cast(),
+            );
+        }
+        self.offset = write_offset + data.len();
+        self.used_this_frame = true;
+        write_offset
+    }
+
+    fn reset_frame(&mut self, gl: &Gles3Functions) {
+        if !self.used_this_frame {
+            return;
+        }
+        self.offset = 0;
+        self.used_this_frame = false;
+        if self.capacity > 0 {
+            unsafe {
+                (gl.gl_bind_buffer)(self.target, self.id);
+                (gl.gl_buffer_data)(
+                    self.target,
+                    self.capacity as GLsizeiptr,
+                    std::ptr::null(),
+                    GL_STREAM_DRAW,
+                );
+                (gl.gl_bind_buffer)(self.target, 0);
+            }
+        }
+    }
+}
+
+struct PerfStats {
+    enabled: bool,
+    last_log: Instant,
+    frames: u32,
+    draws: u32,
+    up_draws: u32,
+    tex_full: u32,
+    tex_sub: u32,
+    vb_up: u32,
+    ib_up: u32,
+}
+
+impl PerfStats {
+    fn new(now: Instant) -> Self {
+        let enabled = std::env::var_os("TOLUCA_PERF")
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        Self {
+            enabled,
+            last_log: now,
+            frames: 0,
+            draws: 0,
+            up_draws: 0,
+            tex_full: 0,
+            tex_sub: 0,
+            vb_up: 0,
+            ib_up: 0,
+        }
+    }
+
+    fn on_present(&mut self, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        self.frames += 1;
+        let elapsed = now.duration_since(self.last_log);
+        if elapsed >= PERF_LOG_INTERVAL {
+            let secs = elapsed.as_secs_f64().max(0.001);
+            let fps = f64::from(self.frames) / secs;
+            eprintln!(
+                "[toluca-perf] fps={fps:.1} frames={} draws={} up_draws={} tex_full={} tex_sub={} vb_up={} ib_up={}",
+                self.frames, self.draws, self.up_draws, self.tex_full, self.tex_sub, self.vb_up, self.ib_up
+            );
+            self.last_log = now;
+            self.frames = 0;
+            self.draws = 0;
+            self.up_draws = 0;
+            self.tex_full = 0;
+            self.tex_sub = 0;
+            self.vb_up = 0;
+            self.ib_up = 0;
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
 struct GlStateCache {
     current_program: Option<GLuint>,
     active_tex_unit: Option<u32>,
     bound_textures: [Option<GLuint>; MAX_FFP_STAGES],
+    bound_fbo: Option<GLuint>,
+    viewport: Option<(GLint, GLint, GLsizei, GLsizei)>,
+    depth_test: Option<bool>,
+    depth_mask: Option<GLboolean>,
+    depth_func: Option<GLenum>,
+    blend_enable: Option<bool>,
+    blend_func: Option<(GLenum, GLenum)>,
+    blend_op: Option<GLenum>,
+    cull_mode: Option<u32>,
+    color_mask: Option<u32>,
+    stencil_enable: Option<bool>,
+    stencil_state: Option<(GLenum, GLint, u32, GLenum, GLenum, GLenum, u32)>,
+    bound_vao: Option<GLuint>,
+    enabled_attribs_mask: Option<u16>,
+    last_render_state_gen: Option<u64>,
+    last_viewport: Option<(u32, u32, u32, u32)>,
 }
 
 impl Default for GlStateCache {
@@ -528,6 +688,22 @@ impl Default for GlStateCache {
             current_program: None,
             active_tex_unit: None,
             bound_textures: [None; MAX_FFP_STAGES],
+            bound_fbo: None,
+            viewport: None,
+            depth_test: None,
+            depth_mask: None,
+            depth_func: None,
+            blend_enable: None,
+            blend_func: None,
+            blend_op: None,
+            cull_mode: None,
+            color_mask: None,
+            stencil_enable: None,
+            stencil_state: None,
+            bound_vao: None,
+            enabled_attribs_mask: None,
+            last_render_state_gen: None,
+            last_viewport: None,
         }
     }
 }
@@ -585,6 +761,190 @@ impl GlStateCache {
             }
         }
     }
+
+    fn bind_framebuffer(&mut self, gl: &Gles3Functions, fbo: GLuint) {
+        if self.bound_fbo != Some(fbo) {
+            unsafe {
+                (gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, fbo);
+            }
+            self.bound_fbo = Some(fbo);
+        }
+    }
+
+    fn set_viewport(&mut self, gl: &Gles3Functions, x: GLint, y: GLint, w: GLsizei, h: GLsizei) {
+        let rect = (x, y, w, h);
+        if self.viewport != Some(rect) {
+            unsafe {
+                (gl.gl_viewport)(x, y, w, h);
+            }
+            self.viewport = Some(rect);
+        }
+    }
+
+    fn bind_vertex_array(&mut self, gl: &Gles3Functions, vao: GLuint) {
+        if self.bound_vao != Some(vao) {
+            unsafe {
+                (gl.gl_bind_vertex_array)(vao);
+            }
+            self.bound_vao = Some(vao);
+        }
+    }
+
+    fn set_depth_mask(&mut self, gl: &Gles3Functions, mask: GLboolean) {
+        if self.depth_mask != Some(mask) {
+            unsafe {
+                (gl.gl_depth_mask)(mask);
+            }
+            self.depth_mask = Some(mask);
+        }
+    }
+
+    fn set_color_mask(&mut self, gl: &Gles3Functions, cw: u32) {
+        let masked = cw & 0xF;
+        if self.color_mask != Some(masked) {
+            unsafe {
+                (gl.gl_color_mask)(
+                    u8::from((masked & 0x1) != 0),
+                    u8::from((masked & 0x2) != 0),
+                    u8::from((masked & 0x4) != 0),
+                    u8::from((masked & 0x8) != 0),
+                );
+            }
+            self.color_mask = Some(masked);
+        }
+    }
+
+    fn ensure_attribs_initialized(&mut self, gl: &Gles3Functions) -> u16 {
+        if let Some(mask) = self.enabled_attribs_mask {
+            return mask;
+        }
+        unsafe {
+            for attr in 0..MAX_VERTEX_ATTRIBS {
+                (gl.gl_disable_vertex_attrib_array)(attr);
+            }
+        }
+        self.enabled_attribs_mask = Some(0);
+        0
+    }
+
+    fn finish_attribs(&mut self, gl: &Gles3Functions, prev_mask: u16, new_mask: u16) {
+        let to_disable = prev_mask & !new_mask;
+        if to_disable != 0 {
+            for bit in 0..MAX_VERTEX_ATTRIBS {
+                if (to_disable & (1u16 << bit)) != 0 {
+                    unsafe {
+                        (gl.gl_disable_vertex_attrib_array)(bit);
+                    }
+                }
+            }
+        }
+        self.enabled_attribs_mask = Some(new_mask);
+    }
+
+    fn apply_render_states(&mut self, gl: &Gles3Functions, state: &DeviceState) {
+        let z_enable = state.get_render_state(D3DRS_ZENABLE) != 0;
+        if self.depth_test != Some(z_enable) {
+            unsafe {
+                if z_enable {
+                    (gl.gl_enable)(GL_DEPTH_TEST);
+                } else {
+                    (gl.gl_disable)(GL_DEPTH_TEST);
+                }
+            }
+            self.depth_test = Some(z_enable);
+        }
+        let z_write = u8::from(state.get_render_state(D3DRS_ZWRITEENABLE) != 0);
+        self.set_depth_mask(gl, z_write);
+        let z_func = map_cmp_func(state.get_render_state(D3DRS_ZFUNC));
+        if self.depth_func != Some(z_func) {
+            unsafe {
+                (gl.gl_depth_func)(z_func);
+            }
+            self.depth_func = Some(z_func);
+        }
+
+        let blend_enable = state.get_render_state(D3DRS_ALPHABLENDENABLE) != 0;
+        if self.blend_enable != Some(blend_enable) {
+            unsafe {
+                if blend_enable {
+                    (gl.gl_enable)(GL_BLEND);
+                } else {
+                    (gl.gl_disable)(GL_BLEND);
+                }
+            }
+            self.blend_enable = Some(blend_enable);
+        }
+        if blend_enable {
+            let src_blend = map_blend_factor(state.get_render_state(D3DRS_SRCBLEND));
+            let dst_blend = map_blend_factor(state.get_render_state(D3DRS_DESTBLEND));
+            let blend_op = map_blend_op(state.get_render_state(D3DRS_BLENDOP));
+            if self.blend_func != Some((src_blend, dst_blend)) {
+                unsafe {
+                    (gl.gl_blend_func_separate)(src_blend, dst_blend, src_blend, dst_blend);
+                }
+                self.blend_func = Some((src_blend, dst_blend));
+            }
+            if self.blend_op != Some(blend_op) {
+                unsafe {
+                    (gl.gl_blend_equation_separate)(blend_op, blend_op);
+                }
+                self.blend_op = Some(blend_op);
+            }
+        }
+
+        let cull_mode = state.get_render_state(D3DRS_CULLMODE);
+        if self.cull_mode != Some(cull_mode) {
+            unsafe {
+                if self.cull_mode.is_none() {
+                    (gl.gl_front_face)(GL_CCW);
+                }
+                match cull_mode {
+                    D3DCULL_NONE => (gl.gl_disable)(GL_CULL_FACE),
+                    D3DCULL_CW => {
+                        (gl.gl_enable)(GL_CULL_FACE);
+                        (gl.gl_cull_face)(GL_FRONT);
+                    }
+                    _ => {
+                        (gl.gl_enable)(GL_CULL_FACE);
+                        (gl.gl_cull_face)(GL_BACK);
+                    }
+                }
+            }
+            self.cull_mode = Some(cull_mode);
+        }
+
+        self.set_color_mask(gl, state.get_render_state(D3DRS_COLORWRITEENABLE));
+
+        let stencil_enable = state.get_render_state(D3DRS_STENCILENABLE) != 0;
+        if self.stencil_enable != Some(stencil_enable) {
+            unsafe {
+                if stencil_enable {
+                    (gl.gl_enable)(GL_STENCIL_TEST);
+                } else {
+                    (gl.gl_disable)(GL_STENCIL_TEST);
+                }
+            }
+            self.stencil_enable = Some(stencil_enable);
+        }
+        if stencil_enable {
+            let s_func = map_cmp_func(state.get_render_state(D3DRS_STENCILFUNC));
+            let s_ref = state.get_render_state(D3DRS_STENCILREF) as GLint;
+            let s_mask = state.get_render_state(D3DRS_STENCILMASK);
+            let s_fail = map_stencil_op(state.get_render_state(D3DRS_STENCILFAIL));
+            let s_zfail = map_stencil_op(state.get_render_state(D3DRS_STENCILZFAIL));
+            let s_pass = map_stencil_op(state.get_render_state(D3DRS_STENCILPASS));
+            let s_wmask = state.get_render_state(D3DRS_STENCILWRITEMASK);
+            let tuple = (s_func, s_ref, s_mask, s_fail, s_zfail, s_pass, s_wmask);
+            if self.stencil_state != Some(tuple) {
+                unsafe {
+                    (gl.gl_stencil_func)(s_func, s_ref, s_mask);
+                    (gl.gl_stencil_op)(s_fail, s_zfail, s_pass);
+                    (gl.gl_stencil_mask)(s_wmask);
+                }
+                self.stencil_state = Some(tuple);
+            }
+        }
+    }
 }
 
 struct CompiledProgram {
@@ -616,6 +976,13 @@ struct CompiledProgram {
     u_light_atten: [GLint; MAX_FFP_LIGHTS],
     u_vc: GLint,
     u_pc: GLint,
+    last_transforms_gen: u64,
+    last_lights_gen: u64,
+    last_material_gen: u64,
+    last_vs_const_gen: u64,
+    last_ps_const_gen: u64,
+    last_render_state_gen: u64,
+    last_viewport: Option<(u32, u32, u32, u32)>,
 }
 
 struct ProgramEntry {
@@ -638,8 +1005,8 @@ pub struct Gles3Backend {
     present_tex_loc: GLint,
     present_vao: GLuint,
     draw_vao: GLuint,
-    up_vbo: GLuint,
-    up_ibo: GLuint,
+    up_vbo: StreamingGlBuffer,
+    up_ibo: StreamingGlBuffer,
     textures: HashMap<u32, GlTexture>,
     vbos: HashMap<u32, GlBuffer>,
     ibos: HashMap<u32, GlBuffer>,
@@ -654,6 +1021,7 @@ pub struct Gles3Backend {
     last_cache_change: Instant,
     last_cache_save: Instant,
     aspect_mode: AspectMode,
+    perf: PerfStats,
     pub draw_calls: u64,
     pub present_calls: u64,
 }
@@ -674,14 +1042,12 @@ impl Gles3Backend {
 
         let mut present_vao = 0;
         let mut draw_vao = 0;
-        let mut up_vbo = 0;
-        let mut up_ibo = 0;
         unsafe {
             (gl.gl_gen_vertex_arrays)(1, &mut present_vao);
             (gl.gl_gen_vertex_arrays)(1, &mut draw_vao);
-            (gl.gl_gen_buffers)(1, &mut up_vbo);
-            (gl.gl_gen_buffers)(1, &mut up_ibo);
         }
+        let up_vbo = StreamingGlBuffer::new(&gl, GL_ARRAY_BUFFER, STREAMING_VBO_INIT_BYTES);
+        let up_ibo = StreamingGlBuffer::new(&gl, GL_ELEMENT_ARRAY_BUFFER, STREAMING_IBO_INIT_BYTES);
 
         let now = Instant::now();
         let mut recipe_cache = ShaderRecipeCache::new();
@@ -718,6 +1084,7 @@ impl Gles3Backend {
             last_cache_change: now,
             last_cache_save: now,
             aspect_mode: AspectMode::default(),
+            perf: PerfStats::new(now),
             draw_calls: 0,
             present_calls: 0,
         };
@@ -813,9 +1180,7 @@ impl Gles3Backend {
         let w = width.max(1);
         let h = height.max(1);
         if self.fbo != 0 && self.fbo_width == w && self.fbo_height == h {
-            unsafe {
-                (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, self.fbo);
-            }
+            self.state_cache.bind_framebuffer(&self.gl, self.fbo);
             return;
         }
 
@@ -858,7 +1223,9 @@ impl Gles3Backend {
             (self.gl.gl_bind_renderbuffer)(GL_RENDERBUFFER, 0);
 
             (self.gl.gl_gen_framebuffers)(1, &mut fbo);
-            (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, fbo);
+        }
+        self.state_cache.bind_framebuffer(&self.gl, fbo);
+        unsafe {
             (self.gl.gl_framebuffer_texture2d)(
                 GL_FRAMEBUFFER,
                 GL_COLOR_ATTACHMENT0,
@@ -877,8 +1244,8 @@ impl Gles3Backend {
             if status != GL_FRAMEBUFFER_COMPLETE {
                 eprintln!("[gles3] offscreen FBO incomplete: 0x{status:04x}");
             }
-            (self.gl.gl_viewport)(0, 0, w as GLsizei, h as GLsizei);
         }
+        self.state_cache.set_viewport(&self.gl, 0, 0, w as GLsizei, h as GLsizei);
 
         self.fbo = fbo;
         self.fbo_color_tex = color_tex;
@@ -890,6 +1257,9 @@ impl Gles3Backend {
     fn destroy_fbo(&mut self) {
         unsafe {
             if self.fbo != 0 {
+                if self.state_cache.bound_fbo == Some(self.fbo) {
+                    self.state_cache.bound_fbo = None;
+                }
                 (self.gl.gl_delete_framebuffers)(1, &self.fbo);
                 self.fbo = 0;
             }
@@ -980,6 +1350,9 @@ impl Gles3Backend {
                     (self.gl.gl_uniform1i)(loc, stage as GLint);
                 }
             }
+            if compiled.u_y_flip >= 0 {
+                (self.gl.gl_uniform1f)(compiled.u_y_flip, -1.0);
+            }
         }
 
         let is_new_recipe = self.recipe_cache.insert(recipe.clone());
@@ -1069,37 +1442,50 @@ impl Gles3Backend {
             }
         };
 
-        unsafe {
-            (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, self.fbo);
-            apply_render_states(&self.gl, state, self.fbo_height);
+        self.state_cache.bind_framebuffer(&self.gl, self.fbo);
+        let vp = &state.viewport;
+        let cur_vp = (vp.x, vp.y, vp.width.max(1), vp.height.max(1));
+        if self.state_cache.last_viewport != Some(cur_vp) {
+            self.state_cache.set_viewport(
+                &self.gl,
+                vp.x as GLint,
+                vp.y as GLint,
+                cur_vp.2 as GLsizei,
+                cur_vp.3 as GLsizei,
+            );
+            self.state_cache.last_viewport = Some(cur_vp);
         }
+        let rs_gen = state.render_state_gen();
+        if self.state_cache.last_render_state_gen != Some(rs_gen) {
+            self.state_cache.apply_render_states(&self.gl, state);
+            self.state_cache.last_render_state_gen = Some(rs_gen);
+        }
+
         bind_textures(&self.gl, &mut self.textures, &mut self.state_cache, state);
         let prog_id = self.programs[prog_idx].compiled.program;
         self.state_cache.use_program(&self.gl, prog_id);
 
-        let view = state.get_transform(D3DTS_VIEW);
-        let inv_view = if self.programs[prog_idx].compiled.u_inv_view >= 0 {
-            if self.last_view.as_ref() != Some(&view) {
-                self.last_inv_view = invert_4x4(&view);
-                self.last_view = Some(view);
-            }
-            Some(&self.last_inv_view)
-        } else {
-            None
-        };
         unsafe {
             upload_uniforms(
                 &self.gl,
-                &self.programs[prog_idx].compiled,
+                &mut self.programs[prog_idx].compiled,
                 state,
-                &view,
-                inv_view,
+                cur_vp,
+                &mut self.last_view,
+                &mut self.last_inv_view,
             );
         }
         Some(prog_idx)
     }
 
-    fn setup_fvf_attributes(&self, fvf: u32, stride: u32, base_byte_offset: usize) {
+    fn setup_fvf_attributes(
+        &self,
+        fvf: u32,
+        stride: u32,
+        base_byte_offset: usize,
+        prev_mask: u16,
+        new_mask: &mut u16,
+    ) {
         let mut offset = base_byte_offset;
         let pos_mask = fvf & D3DFVF_POSITION_MASK;
         let pos_floats = match pos_mask {
@@ -1109,7 +1495,7 @@ impl Gles3Backend {
             _ => 0,
         };
         if pos_floats > 0 {
-            enable_attrib(
+            enable_attrib_cached(
                 &self.gl,
                 ATTR_POS,
                 pos_floats.min(4),
@@ -1117,18 +1503,30 @@ impl Gles3Backend {
                 GL_FALSE,
                 stride,
                 offset,
+                prev_mask,
+                new_mask,
             );
             offset += (pos_floats as usize) * 4;
         }
         if (fvf & D3DFVF_NORMAL) != 0 {
-            enable_attrib(&self.gl, ATTR_NORMAL, 3, GL_FLOAT, GL_FALSE, stride, offset);
+            enable_attrib_cached(
+                &self.gl,
+                ATTR_NORMAL,
+                3,
+                GL_FLOAT,
+                GL_FALSE,
+                stride,
+                offset,
+                prev_mask,
+                new_mask,
+            );
             offset += 12;
         }
         if (fvf & D3DFVF_PSIZE) != 0 {
             offset += 4;
         }
         if (fvf & D3DFVF_DIFFUSE) != 0 {
-            enable_attrib(
+            enable_attrib_cached(
                 &self.gl,
                 ATTR_DIFFUSE,
                 4,
@@ -1136,11 +1534,13 @@ impl Gles3Backend {
                 GL_TRUE,
                 stride,
                 offset,
+                prev_mask,
+                new_mask,
             );
             offset += 4;
         }
         if (fvf & D3DFVF_SPECULAR) != 0 {
-            enable_attrib(
+            enable_attrib_cached(
                 &self.gl,
                 ATTR_SPECULAR,
                 4,
@@ -1148,13 +1548,15 @@ impl Gles3Backend {
                 GL_TRUE,
                 stride,
                 offset,
+                prev_mask,
+                new_mask,
             );
             offset += 4;
         }
         let tex_count = ((fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT).min(4);
         for t in 0..tex_count {
             let comps = fvf_texcoord_floats(fvf, t) as i32;
-            enable_attrib(
+            enable_attrib_cached(
                 &self.gl,
                 ATTR_TEX0 + t,
                 comps,
@@ -1162,6 +1564,8 @@ impl Gles3Backend {
                 GL_FALSE,
                 stride,
                 offset,
+                prev_mask,
+                new_mask,
             );
             offset += (comps as usize) * 4;
         }
@@ -1171,18 +1575,20 @@ impl Gles3Backend {
         &self,
         decl: &[VertexDeclElement],
         state: &DeviceState,
-        up_override: Option<(GLuint, u32)>,
+        up_override: Option<(GLuint, u32, usize)>,
         base_vertex_offset: usize,
+        prev_mask: u16,
+        new_mask: &mut u16,
     ) {
         for elem in decl {
-            let (gl_id, stride) = if elem.stream == 0 {
-                if let Some((up_vbo, up_stride)) = up_override {
-                    (up_vbo, up_stride)
+            let (gl_id, stride, stream_base_byte) = if elem.stream == 0 {
+                if let Some((up_vbo, up_stride, up_byte_off)) = up_override {
+                    (up_vbo, up_stride, up_byte_off)
                 } else if let Some(b) = state.streams[0] {
                     let Some(vb) = self.vbos.get(&b.vb_handle) else {
                         continue;
                     };
-                    (vb.id, b.stride)
+                    (vb.id, b.stride, 0)
                 } else {
                     continue;
                 }
@@ -1190,7 +1596,7 @@ impl Gles3Backend {
                 let Some(vb) = self.vbos.get(&b.vb_handle) else {
                     continue;
                 };
-                (vb.id, b.stride)
+                (vb.id, b.stride, 0)
             } else {
                 continue;
             };
@@ -1210,9 +1616,10 @@ impl Gles3Backend {
             unsafe {
                 (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, gl_id);
             }
-            let offset =
-                usize::from(elem.byte_offset) + base_vertex_offset.saturating_mul(stride as usize);
-            enable_attrib(
+            let offset = stream_base_byte
+                + usize::from(elem.byte_offset)
+                + base_vertex_offset.saturating_mul(stride as usize);
+            enable_attrib_cached(
                 &self.gl,
                 u32::from(elem.register),
                 comps,
@@ -1220,36 +1627,44 @@ impl Gles3Backend {
                 normalized,
                 stride,
                 offset,
+                prev_mask,
+                new_mask,
             );
         }
     }
 
     fn bind_vertex_attributes(
-        &self,
+        &mut self,
         state: &DeviceState,
         shaders: &ActiveShaders<'_>,
-        up_override: Option<(GLuint, u32)>,
+        up_override: Option<(GLuint, u32, usize)>,
         base_vertex_offset: usize,
     ) -> bool {
-        unsafe {
-            (self.gl.gl_bind_vertex_array)(self.draw_vao);
-            for attr in 0..16 {
-                (self.gl.gl_disable_vertex_attrib_array)(attr);
-            }
-        }
+        self.state_cache.bind_vertex_array(&self.gl, self.draw_vao);
+        let prev_mask = self.state_cache.ensure_attribs_initialized(&self.gl);
+        let mut new_mask = 0u16;
 
         if let Some(decl) = shaders.vs_parsed_decl {
-            self.setup_decl_attributes(decl, state, up_override, base_vertex_offset);
+            self.setup_decl_attributes(
+                decl,
+                state,
+                up_override,
+                base_vertex_offset,
+                prev_mask,
+                &mut new_mask,
+            );
+            self.state_cache.finish_attribs(&self.gl, prev_mask, new_mask);
             return true;
         }
 
         let fvf = state.current_vertex_shader;
-        if let Some((up_vbo, stride)) = up_override {
+        if let Some((up_vbo, stride, up_byte_off)) = up_override {
             unsafe {
                 (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, up_vbo);
             }
-            let offset = base_vertex_offset.saturating_mul(stride as usize);
-            self.setup_fvf_attributes(fvf, stride, offset);
+            let offset = up_byte_off + base_vertex_offset.saturating_mul(stride as usize);
+            self.setup_fvf_attributes(fvf, stride, offset, prev_mask, &mut new_mask);
+            self.state_cache.finish_attribs(&self.gl, prev_mask, new_mask);
             return true;
         }
 
@@ -1265,7 +1680,8 @@ impl Gles3Backend {
             (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, vb.id);
         }
         let offset = base_vertex_offset.saturating_mul(stride as usize);
-        self.setup_fvf_attributes(effective_fvf, stride, offset);
+        self.setup_fvf_attributes(effective_fvf, stride, offset, prev_mask, &mut new_mask);
+        self.state_cache.finish_attribs(&self.gl, prev_mask, new_mask);
         true
     }
 }
@@ -1288,11 +1704,11 @@ impl Drop for Gles3Backend {
             if self.draw_vao != 0 {
                 (self.gl.gl_delete_vertex_arrays)(1, &self.draw_vao);
             }
-            if self.up_vbo != 0 {
-                (self.gl.gl_delete_buffers)(1, &self.up_vbo);
+            if self.up_vbo.id != 0 {
+                (self.gl.gl_delete_buffers)(1, &self.up_vbo.id);
             }
-            if self.up_ibo != 0 {
-                (self.gl.gl_delete_buffers)(1, &self.up_ibo);
+            if self.up_ibo.id != 0 {
+                (self.gl.gl_delete_buffers)(1, &self.up_ibo.id);
             }
             for tex in self.textures.values() {
                 (self.gl.gl_delete_textures)(1, &tex.id);
@@ -1351,10 +1767,12 @@ impl RenderBackend for Gles3Backend {
         }
 
         let [r, g, b, a] = d3dcolor_to_rgba_f32(color);
+        self.state_cache.bind_framebuffer(&self.gl, self.fbo);
+        self.state_cache.set_color_mask(&self.gl, 0xF);
+        self.state_cache.set_depth_mask(&self.gl, GL_TRUE);
+        self.state_cache.stencil_state = None;
+        self.state_cache.last_render_state_gen = None;
         unsafe {
-            (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, self.fbo);
-            (self.gl.gl_color_mask)(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-            (self.gl.gl_depth_mask)(GL_TRUE);
             (self.gl.gl_stencil_mask)(0xFF);
             (self.gl.gl_clear_color)(r, g, b, a);
             (self.gl.gl_clear_depthf)(z);
@@ -1512,6 +1930,50 @@ impl RenderBackend for Gles3Backend {
             }
         }
         self.state_cache.bind_texture(&self.gl, 0, 0);
+        self.perf.tex_full += 1;
+    }
+
+    fn on_texture_sub_upload(
+        &mut self,
+        tex_handle: u32,
+        level: u32,
+        x: u32,
+        y: u32,
+        upload: &crate::texture::DecodedRgba8,
+    ) -> bool {
+        let Some(tex) = self.textures.get(&tex_handle) else {
+            return false;
+        };
+        let Some(&(tw, th, fmt)) = tex.levels.get(&level) else {
+            return false;
+        };
+        if fmt != GL_RGBA8
+            || upload.width == 0
+            || upload.height == 0
+            || x + upload.width > tw
+            || y + upload.height > th
+        {
+            return false;
+        }
+        let tex_id = tex.id;
+        self.state_cache.bind_texture_active(&self.gl, 0, tex_id);
+        unsafe {
+            (self.gl.gl_pixel_storei)(GL_UNPACK_ALIGNMENT, 1);
+            (self.gl.gl_tex_sub_image2d)(
+                GL_TEXTURE_2D,
+                level as GLint,
+                x as GLint,
+                y as GLint,
+                upload.width as GLsizei,
+                upload.height as GLsizei,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                upload.pixels.as_ptr().cast(),
+            );
+        }
+        self.state_cache.bind_texture(&self.gl, 0, 0);
+        self.perf.tex_sub += 1;
+        true
     }
 
     fn on_texture_destroy(&mut self, tex_handle: u32) {
@@ -1531,7 +1993,7 @@ impl RenderBackend for Gles3Backend {
             }
             GlBuffer {
                 id,
-                data: Vec::new(),
+                byte_len: 0,
                 fvf,
                 format: 0,
                 gl_usage: 0,
@@ -1539,6 +2001,7 @@ impl RenderBackend for Gles3Backend {
         });
         entry.fvf = fvf;
         upload_gl_buffer(&self.gl, entry, GL_ARRAY_BUFFER, data, usage);
+        self.perf.vb_up += 1;
     }
 
     fn on_vb_sub_upload(
@@ -1561,6 +2024,7 @@ impl RenderBackend for Gles3Backend {
                 sub_data,
                 usage,
             ) {
+                self.perf.vb_up += 1;
                 return;
             }
         }
@@ -1583,7 +2047,7 @@ impl RenderBackend for Gles3Backend {
             }
             GlBuffer {
                 id,
-                data: Vec::new(),
+                byte_len: 0,
                 fvf: 0,
                 format,
                 gl_usage: 0,
@@ -1591,6 +2055,7 @@ impl RenderBackend for Gles3Backend {
         });
         entry.format = format;
         upload_gl_buffer(&self.gl, entry, GL_ELEMENT_ARRAY_BUFFER, data, usage);
+        self.perf.ib_up += 1;
     }
 
     fn on_ib_sub_upload(
@@ -1613,6 +2078,7 @@ impl RenderBackend for Gles3Backend {
                 sub_data,
                 usage,
             ) {
+                self.perf.ib_up += 1;
                 return;
             }
         }
@@ -1652,6 +2118,7 @@ impl RenderBackend for Gles3Backend {
             (self.gl.gl_draw_arrays)(gl_mode, start_vertex as GLint, vtx_count as GLsizei);
         }
         self.draw_calls += 1;
+        self.perf.draws += 1;
     }
 
     fn on_draw_indexed_primitive(
@@ -1677,7 +2144,7 @@ impl RenderBackend for Gles3Backend {
         let Some((ib_id, ib_format, ib_len)) = self
             .ibos
             .get(&ib_handle)
-            .map(|b| (b.id, b.format, b.data.len()))
+            .map(|b| (b.id, b.format, b.byte_len))
         else {
             return;
         };
@@ -1710,6 +2177,7 @@ impl RenderBackend for Gles3Backend {
             );
         }
         self.draw_calls += 1;
+        self.perf.draws += 1;
     }
 
     fn on_draw_primitive_up(
@@ -1731,22 +2199,17 @@ impl RenderBackend for Gles3Backend {
         if self.bind_pipeline_and_uniforms(state, shaders).is_none() {
             return;
         }
-        unsafe {
-            (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, self.up_vbo);
-            (self.gl.gl_buffer_data)(
-                GL_ARRAY_BUFFER,
-                vertex_data.len() as GLsizeiptr,
-                vertex_data.as_ptr().cast(),
-                GL_DYNAMIC_DRAW,
-            );
-        }
-        if !self.bind_vertex_attributes(state, shaders, Some((self.up_vbo, stride)), 0) {
+        let vbo_offset = self.up_vbo.append(&self.gl, vertex_data);
+        let up_vbo_id = self.up_vbo.id;
+        if !self.bind_vertex_attributes(state, shaders, Some((up_vbo_id, stride, vbo_offset)), 0) {
             return;
         }
         unsafe {
             (self.gl.gl_draw_arrays)(gl_mode, 0, vtx_count as GLsizei);
         }
         self.draw_calls += 1;
+        self.perf.draws += 1;
+        self.perf.up_draws += 1;
     }
 
     fn on_draw_indexed_primitive_up(
@@ -1772,16 +2235,9 @@ impl RenderBackend for Gles3Backend {
         if self.bind_pipeline_and_uniforms(state, shaders).is_none() {
             return;
         }
-        unsafe {
-            (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, self.up_vbo);
-            (self.gl.gl_buffer_data)(
-                GL_ARRAY_BUFFER,
-                vertex_data.len() as GLsizeiptr,
-                vertex_data.as_ptr().cast(),
-                GL_DYNAMIC_DRAW,
-            );
-        }
-        if !self.bind_vertex_attributes(state, shaders, Some((self.up_vbo, stride)), 0) {
+        let vbo_offset = self.up_vbo.append(&self.gl, vertex_data);
+        let up_vbo_id = self.up_vbo.id;
+        if !self.bind_vertex_attributes(state, shaders, Some((up_vbo_id, stride, vbo_offset)), 0) {
             return;
         }
         let gl_idx_type = if index_format == D3DFMT_INDEX32 {
@@ -1789,17 +2245,18 @@ impl RenderBackend for Gles3Backend {
         } else {
             GL_UNSIGNED_SHORT
         };
+        let ibo_offset = self.up_ibo.append(&self.gl, index_data);
         unsafe {
-            (self.gl.gl_bind_buffer)(GL_ELEMENT_ARRAY_BUFFER, self.up_ibo);
-            (self.gl.gl_buffer_data)(
-                GL_ELEMENT_ARRAY_BUFFER,
-                index_data.len() as GLsizeiptr,
-                index_data.as_ptr().cast(),
-                GL_DYNAMIC_DRAW,
+            (self.gl.gl_draw_elements)(
+                gl_mode,
+                idx_count as GLsizei,
+                gl_idx_type,
+                ibo_offset as *const c_void,
             );
-            (self.gl.gl_draw_elements)(gl_mode, idx_count as GLsizei, gl_idx_type, std::ptr::null());
         }
         self.draw_calls += 1;
+        self.perf.draws += 1;
+        self.perf.up_draws += 1;
     }
 
     fn on_present(&mut self) {
@@ -1823,8 +2280,8 @@ impl RenderBackend for Gles3Backend {
             self.aspect_mode,
         );
 
+        self.state_cache.bind_framebuffer(&self.gl, 0);
         unsafe {
-            (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, 0);
             (self.gl.gl_disable)(GL_DEPTH_TEST);
             (self.gl.gl_disable)(GL_CULL_FACE);
             (self.gl.gl_disable)(GL_BLEND);
@@ -1849,12 +2306,22 @@ impl RenderBackend for Gles3Backend {
 
         self.present_target.swap_buffers();
         self.state_cache.invalidate_all();
-
         unsafe {
-            (self.gl.gl_bind_framebuffer)(GL_FRAMEBUFFER, self.fbo);
-            (self.gl.gl_viewport)(0, 0, self.fbo_width as GLsizei, self.fbo_height as GLsizei);
+            (self.gl.gl_bind_vertex_array)(0);
         }
+        self.up_vbo.reset_frame(&self.gl);
+        self.up_ibo.reset_frame(&self.gl);
 
+        self.state_cache.bind_framebuffer(&self.gl, self.fbo);
+        self.state_cache.set_viewport(
+            &self.gl,
+            0,
+            0,
+            self.fbo_width as GLsizei,
+            self.fbo_height as GLsizei,
+        );
+
+        self.perf.on_present(Instant::now());
         self.flush_recipe_cache_if_needed();
     }
 }
@@ -1903,9 +2370,8 @@ fn upload_gl_buffer(
         GL_STATIC_DRAW
     };
     let can_sub_data =
-        !data.is_empty() && entry.data.len() == data.len() && entry.gl_usage == gl_usage;
-    entry.data.clear();
-    entry.data.extend_from_slice(data);
+        !data.is_empty() && entry.byte_len == data.len() && entry.gl_usage == gl_usage;
+    entry.byte_len = data.len();
     entry.gl_usage = gl_usage;
     unsafe {
         (gl.gl_bind_buffer)(target, entry.id);
@@ -1933,13 +2399,12 @@ fn upload_gl_buffer_sub(
         GL_STATIC_DRAW
     };
     if sub_data.is_empty()
-        || entry.data.len() != full_len
+        || entry.byte_len != full_len
         || entry.gl_usage != gl_usage
-        || offset.saturating_add(sub_data.len()) > entry.data.len()
+        || offset.saturating_add(sub_data.len()) > entry.byte_len
     {
         return false;
     }
-    entry.data[offset..offset + sub_data.len()].copy_from_slice(sub_data);
     unsafe {
         (gl.gl_bind_buffer)(target, entry.id);
         (gl.gl_buffer_sub_data)(
@@ -2292,93 +2757,13 @@ impl CompiledProgram {
             u_light_atten,
             u_vc: get_uniform_loc(gl, program, "u_vc"),
             u_pc: get_uniform_loc(gl, program, "u_pc"),
-        }
-    }
-}
-
-unsafe fn apply_render_states(gl: &Gles3Functions, state: &DeviceState, fbo_height: u32) {
-    let vp = &state.viewport;
-    let vp_w = vp.width.max(1) as GLsizei;
-    let vp_h = vp.height.max(1) as GLsizei;
-    let _ = fbo_height;
-    unsafe {
-        (gl.gl_viewport)(vp.x as GLint, vp.y as GLint, vp_w, vp_h);
-    }
-
-    let z_enable = state.get_render_state(D3DRS_ZENABLE) != 0;
-    let z_write = state.get_render_state(D3DRS_ZWRITEENABLE) != 0;
-    let z_func = map_cmp_func(state.get_render_state(D3DRS_ZFUNC));
-    unsafe {
-        if z_enable {
-            (gl.gl_enable)(GL_DEPTH_TEST);
-        } else {
-            (gl.gl_disable)(GL_DEPTH_TEST);
-        }
-        (gl.gl_depth_mask)(u8::from(z_write));
-        (gl.gl_depth_func)(z_func);
-    }
-
-    let blend_enable = state.get_render_state(D3DRS_ALPHABLENDENABLE) != 0;
-    let src_blend = map_blend_factor(state.get_render_state(D3DRS_SRCBLEND));
-    let dst_blend = map_blend_factor(state.get_render_state(D3DRS_DESTBLEND));
-    let blend_op = map_blend_op(state.get_render_state(D3DRS_BLENDOP));
-    unsafe {
-        if blend_enable {
-            (gl.gl_enable)(GL_BLEND);
-            (gl.gl_blend_func_separate)(src_blend, dst_blend, src_blend, dst_blend);
-            (gl.gl_blend_equation_separate)(blend_op, blend_op);
-        } else {
-            (gl.gl_disable)(GL_BLEND);
-        }
-    }
-
-    let cull_mode = state.get_render_state(D3DRS_CULLMODE);
-    unsafe {
-        (gl.gl_front_face)(GL_CCW);
-        match cull_mode {
-            D3DCULL_NONE => (gl.gl_disable)(GL_CULL_FACE),
-            D3DCULL_CW => {
-                (gl.gl_enable)(GL_CULL_FACE);
-                (gl.gl_cull_face)(GL_FRONT);
-            }
-            D3DCULL_CCW => {
-                (gl.gl_enable)(GL_CULL_FACE);
-                (gl.gl_cull_face)(GL_BACK);
-            }
-            _ => {
-                (gl.gl_enable)(GL_CULL_FACE);
-                (gl.gl_cull_face)(GL_BACK);
-            }
-        }
-    }
-
-    let cw = state.get_render_state(D3DRS_COLORWRITEENABLE);
-    unsafe {
-        (gl.gl_color_mask)(
-            u8::from((cw & 0x1) != 0),
-            u8::from((cw & 0x2) != 0),
-            u8::from((cw & 0x4) != 0),
-            u8::from((cw & 0x8) != 0),
-        );
-    }
-
-    let stencil_enable = state.get_render_state(D3DRS_STENCILENABLE) != 0;
-    unsafe {
-        if stencil_enable {
-            (gl.gl_enable)(GL_STENCIL_TEST);
-            (gl.gl_stencil_func)(
-                map_cmp_func(state.get_render_state(D3DRS_STENCILFUNC)),
-                state.get_render_state(D3DRS_STENCILREF) as GLint,
-                state.get_render_state(D3DRS_STENCILMASK),
-            );
-            (gl.gl_stencil_op)(
-                map_stencil_op(state.get_render_state(D3DRS_STENCILFAIL)),
-                map_stencil_op(state.get_render_state(D3DRS_STENCILZFAIL)),
-                map_stencil_op(state.get_render_state(D3DRS_STENCILPASS)),
-            );
-            (gl.gl_stencil_mask)(state.get_render_state(D3DRS_STENCILWRITEMASK));
-        } else {
-            (gl.gl_disable)(GL_STENCIL_TEST);
+            last_transforms_gen: 0,
+            last_lights_gen: 0,
+            last_material_gen: 0,
+            last_vs_const_gen: 0,
+            last_ps_const_gen: 0,
+            last_render_state_gen: 0,
+            last_viewport: None,
         }
     }
 }
@@ -2439,125 +2824,170 @@ fn bind_textures(
 
 unsafe fn upload_uniforms(
     gl: &Gles3Functions,
-    prog: &CompiledProgram,
+    prog: &mut CompiledProgram,
     state: &DeviceState,
-    view: &[f32; 16],
-    inv_view: Option<&[f32; 16]>,
+    cur_vp: (u32, u32, u32, u32),
+    last_view: &mut Option<[f32; 16]>,
+    last_inv_view: &mut [f32; 16],
 ) {
-    let world = state.get_transform(D3DTS_WORLD);
-    let proj = state.get_transform(D3DTS_PROJECTION);
-    unsafe {
-        if prog.u_world >= 0 {
-            (gl.gl_uniform_matrix4fv)(prog.u_world, 1, GL_FALSE, world.as_ptr());
-        }
-        if prog.u_view >= 0 {
-            (gl.gl_uniform_matrix4fv)(prog.u_view, 1, GL_FALSE, view.as_ptr());
-        }
-        if let Some(inv) = inv_view {
+    let tf_gen = state.transforms_gen();
+    if prog.last_transforms_gen != tf_gen {
+        let world = state.get_transform(D3DTS_WORLD);
+        let view = state.get_transform(D3DTS_VIEW);
+        let proj = state.get_transform(D3DTS_PROJECTION);
+        unsafe {
+            if prog.u_world >= 0 {
+                (gl.gl_uniform_matrix4fv)(prog.u_world, 1, GL_FALSE, world.as_ptr());
+            }
+            if prog.u_view >= 0 {
+                (gl.gl_uniform_matrix4fv)(prog.u_view, 1, GL_FALSE, view.as_ptr());
+            }
             if prog.u_inv_view >= 0 {
-                (gl.gl_uniform_matrix4fv)(prog.u_inv_view, 1, GL_FALSE, inv.as_ptr());
+                if last_view.as_ref() != Some(&view) {
+                    *last_inv_view = invert_4x4(&view);
+                    *last_view = Some(view);
+                }
+                (gl.gl_uniform_matrix4fv)(prog.u_inv_view, 1, GL_FALSE, last_inv_view.as_ptr());
+            }
+            if prog.u_proj >= 0 {
+                (gl.gl_uniform_matrix4fv)(prog.u_proj, 1, GL_FALSE, proj.as_ptr());
+            }
+            for (i, &loc) in prog.u_tex_mats.iter().enumerate() {
+                if loc >= 0 {
+                    let mat = state.get_transform(D3DTS_TEXTURE0 + i as u32);
+                    (gl.gl_uniform_matrix4fv)(loc, 1, GL_FALSE, mat.as_ptr());
+                }
             }
         }
-        if prog.u_proj >= 0 {
-            (gl.gl_uniform_matrix4fv)(prog.u_proj, 1, GL_FALSE, proj.as_ptr());
-        }
-        for (i, &loc) in prog.u_tex_mats.iter().enumerate() {
-            if loc >= 0 {
-                let mat = state.get_transform(D3DTS_TEXTURE0 + i as u32);
-                (gl.gl_uniform_matrix4fv)(loc, 1, GL_FALSE, mat.as_ptr());
-            }
-        }
+        prog.last_transforms_gen = tf_gen;
+    }
+
+    if prog.last_viewport != Some(cur_vp) {
         if prog.u_viewport >= 0 {
-            (gl.gl_uniform4f)(
-                prog.u_viewport,
-                state.viewport.x as f32,
-                state.viewport.y as f32,
-                state.viewport.width.max(1) as f32,
-                state.viewport.height.max(1) as f32,
-            );
-        }
-        if prog.u_y_flip >= 0 {
-            (gl.gl_uniform1f)(prog.u_y_flip, -1.0);
-        }
-        if prog.u_ambient >= 0 {
-            let [r, g, b, a] = d3dcolor_to_rgba_f32(state.get_render_state(D3DRS_AMBIENT));
-            (gl.gl_uniform4f)(prog.u_ambient, r, g, b, a);
-        }
-        set_vec4(gl, prog.u_mat_diffuse, state.material.diffuse);
-        set_vec4(gl, prog.u_mat_ambient, state.material.ambient);
-        set_vec4(gl, prog.u_mat_specular, state.material.specular);
-        set_vec4(gl, prog.u_mat_emissive, state.material.emissive);
-        if prog.u_mat_power >= 0 {
-            (gl.gl_uniform1f)(prog.u_mat_power, state.material.power);
-        }
-        if prog.u_fog_params >= 0 {
-            let start = f32::from_bits(state.get_render_state(D3DRS_FOGSTART));
-            let end = f32::from_bits(state.get_render_state(D3DRS_FOGEND));
-            let density = f32::from_bits(state.get_render_state(D3DRS_FOGDENSITY));
-            (gl.gl_uniform4f)(prog.u_fog_params, start, end, density, 0.0);
-        }
-        if prog.u_fog_color >= 0 {
-            let [r, g, b, a] = d3dcolor_to_rgba_f32(state.get_render_state(D3DRS_FOGCOLOR));
-            (gl.gl_uniform4f)(prog.u_fog_color, r, g, b, a);
-        }
-        if prog.u_alpha_ref >= 0 {
-            let aref = (state.get_render_state(D3DRS_ALPHAREF) & 0xFF) as f32 / 255.0;
-            (gl.gl_uniform1f)(prog.u_alpha_ref, aref);
-        }
-        if prog.u_tfactor >= 0 {
-            let [r, g, b, a] = d3dcolor_to_rgba_f32(state.get_render_state(D3DRS_TEXTUREFACTOR));
-            (gl.gl_uniform4f)(prog.u_tfactor, r, g, b, a);
-        }
-
-        for (i, slot) in state.lights.iter().take(MAX_FFP_LIGHTS).enumerate() {
-            if !slot.enabled {
-                continue;
+            unsafe {
+                (gl.gl_uniform4f)(
+                    prog.u_viewport,
+                    cur_vp.0 as f32,
+                    cur_vp.1 as f32,
+                    cur_vp.2 as f32,
+                    cur_vp.3 as f32,
+                );
             }
-            let l = &slot.light;
-            set_vec4(
-                gl,
-                prog.u_light_pos[i],
-                [l.position[0], l.position[1], l.position[2], 1.0],
-            );
-            set_vec4(
-                gl,
-                prog.u_light_dir[i],
-                [l.direction[0], l.direction[1], l.direction[2], 0.0],
-            );
-            set_vec4(gl, prog.u_light_diffuse[i], l.diffuse);
-            set_vec4(gl, prog.u_light_ambient[i], l.ambient);
-            set_vec4(gl, prog.u_light_specular[i], l.specular);
-            set_vec4(
-                gl,
-                prog.u_light_params[i],
-                [
-                    l.range,
-                    l.falloff,
-                    (l.theta * 0.5).cos(),
-                    (l.phi * 0.5).cos(),
-                ],
-            );
-            set_vec4(
-                gl,
-                prog.u_light_atten[i],
-                [l.attenuation0, l.attenuation1, l.attenuation2, 0.0],
-            );
         }
+        prog.last_viewport = Some(cur_vp);
+    }
 
+    let rs_gen = state.render_state_gen();
+    if prog.last_render_state_gen != rs_gen {
+        unsafe {
+            if prog.u_ambient >= 0 {
+                let [r, g, b, a] = d3dcolor_to_rgba_f32(state.get_render_state(D3DRS_AMBIENT));
+                (gl.gl_uniform4f)(prog.u_ambient, r, g, b, a);
+            }
+            if prog.u_fog_params >= 0 {
+                let start = f32::from_bits(state.get_render_state(D3DRS_FOGSTART));
+                let end = f32::from_bits(state.get_render_state(D3DRS_FOGEND));
+                let density = f32::from_bits(state.get_render_state(D3DRS_FOGDENSITY));
+                (gl.gl_uniform4f)(prog.u_fog_params, start, end, density, 0.0);
+            }
+            if prog.u_fog_color >= 0 {
+                let [r, g, b, a] = d3dcolor_to_rgba_f32(state.get_render_state(D3DRS_FOGCOLOR));
+                (gl.gl_uniform4f)(prog.u_fog_color, r, g, b, a);
+            }
+            if prog.u_alpha_ref >= 0 {
+                let aref = (state.get_render_state(D3DRS_ALPHAREF) & 0xFF) as f32 / 255.0;
+                (gl.gl_uniform1f)(prog.u_alpha_ref, aref);
+            }
+            if prog.u_tfactor >= 0 {
+                let [r, g, b, a] =
+                    d3dcolor_to_rgba_f32(state.get_render_state(D3DRS_TEXTUREFACTOR));
+                (gl.gl_uniform4f)(prog.u_tfactor, r, g, b, a);
+            }
+        }
+        prog.last_render_state_gen = rs_gen;
+    }
+
+    let mat_gen = state.material_gen();
+    if prog.last_material_gen != mat_gen {
+        unsafe {
+            set_vec4(gl, prog.u_mat_diffuse, state.material.diffuse);
+            set_vec4(gl, prog.u_mat_ambient, state.material.ambient);
+            set_vec4(gl, prog.u_mat_specular, state.material.specular);
+            set_vec4(gl, prog.u_mat_emissive, state.material.emissive);
+            if prog.u_mat_power >= 0 {
+                (gl.gl_uniform1f)(prog.u_mat_power, state.material.power);
+            }
+        }
+        prog.last_material_gen = mat_gen;
+    }
+
+    let lights_gen = state.lights_gen();
+    if prog.last_lights_gen != lights_gen {
+        unsafe {
+            for (i, slot) in state.lights.iter().take(MAX_FFP_LIGHTS).enumerate() {
+                if !slot.enabled {
+                    continue;
+                }
+                let l = &slot.light;
+                set_vec4(
+                    gl,
+                    prog.u_light_pos[i],
+                    [l.position[0], l.position[1], l.position[2], 1.0],
+                );
+                set_vec4(
+                    gl,
+                    prog.u_light_dir[i],
+                    [l.direction[0], l.direction[1], l.direction[2], 0.0],
+                );
+                set_vec4(gl, prog.u_light_diffuse[i], l.diffuse);
+                set_vec4(gl, prog.u_light_ambient[i], l.ambient);
+                set_vec4(gl, prog.u_light_specular[i], l.specular);
+                set_vec4(
+                    gl,
+                    prog.u_light_params[i],
+                    [
+                        l.range,
+                        l.falloff,
+                        (l.theta * 0.5).cos(),
+                        (l.phi * 0.5).cos(),
+                    ],
+                );
+                set_vec4(
+                    gl,
+                    prog.u_light_atten[i],
+                    [l.attenuation0, l.attenuation1, l.attenuation2, 0.0],
+                );
+            }
+        }
+        prog.last_lights_gen = lights_gen;
+    }
+
+    let vc_gen = state.vs_const_gen();
+    if prog.last_vs_const_gen != vc_gen {
         if prog.u_vc >= 0 {
-            (gl.gl_uniform4fv)(
-                prog.u_vc,
-                state.vs_constants.len() as GLsizei,
-                state.vs_constants.as_ptr().cast(),
-            );
+            unsafe {
+                (gl.gl_uniform4fv)(
+                    prog.u_vc,
+                    state.vs_constants.len() as GLsizei,
+                    state.vs_constants.as_ptr().cast(),
+                );
+            }
         }
+        prog.last_vs_const_gen = vc_gen;
+    }
+
+    let pc_gen = state.ps_const_gen();
+    if prog.last_ps_const_gen != pc_gen {
         if prog.u_pc >= 0 {
-            (gl.gl_uniform4fv)(
-                prog.u_pc,
-                state.ps_constants.len() as GLsizei,
-                state.ps_constants.as_ptr().cast(),
-            );
+            unsafe {
+                (gl.gl_uniform4fv)(
+                    prog.u_pc,
+                    state.ps_constants.len() as GLsizei,
+                    state.ps_constants.as_ptr().cast(),
+                );
+            }
         }
+        prog.last_ps_const_gen = pc_gen;
     }
 }
 
@@ -2569,7 +2999,8 @@ unsafe fn set_vec4(gl: &Gles3Functions, loc: GLint, v: [f32; 4]) {
     }
 }
 
-fn enable_attrib(
+#[allow(clippy::too_many_arguments)]
+fn enable_attrib_cached(
     gl: &Gles3Functions,
     location: GLuint,
     components: GLint,
@@ -2577,9 +3008,19 @@ fn enable_attrib(
     normalized: GLboolean,
     stride: u32,
     offset: usize,
+    prev_mask: u16,
+    new_mask: &mut u16,
 ) {
+    if location < MAX_VERTEX_ATTRIBS {
+        let bit = 1u16 << location;
+        *new_mask |= bit;
+        if (prev_mask & bit) == 0 {
+            unsafe {
+                (gl.gl_enable_vertex_attrib_array)(location);
+            }
+        }
+    }
     unsafe {
-        (gl.gl_enable_vertex_attrib_array)(location);
         (gl.gl_vertex_attrib_pointer)(
             location,
             components,

@@ -12,4 +12,6 @@ pub use runtime::{
     ImportHandler, ImportKey, ImportRegistry, RunOutcome, Runtime, RuntimeContext, RuntimeError,
     TrapInfo,
 };
-pub use win32::{Win32Config, Win32State, register_all_win32, register_kernel32_and_msvcrt};
+pub use win32::{
+    ScriptedKeyEvent, Win32Config, Win32State, register_all_win32, register_kernel32_and_msvcrt,
+};

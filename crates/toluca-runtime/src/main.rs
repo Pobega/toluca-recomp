@@ -3,7 +3,10 @@ use std::process::ExitCode;
 
 use toluca_core::cpu::ExitReason;
 use toluca_d3d8::Gles3Backend;
-use toluca_runtime::{ImportRegistry, Runtime, TrapInfo, Win32Config, register_all_win32};
+use toluca_runtime::win32::dinput8::parse_script_keys;
+use toluca_runtime::{
+    ImportRegistry, Runtime, ScriptedKeyEvent, TrapInfo, Win32Config, register_all_win32,
+};
 
 struct CliArgs {
     exe_path: PathBuf,
@@ -12,6 +15,7 @@ struct CliArgs {
     shader_cache: Option<PathBuf>,
     max_frames: Option<u64>,
     dump_frame: Option<PathBuf>,
+    script_keys: Vec<ScriptedKeyEvent>,
     headless: bool,
     trace_imports: bool,
     trace_d3d8: bool,
@@ -52,6 +56,7 @@ fn main() -> ExitCode {
         max_frames: opts.max_frames,
         command_line: exe_name.clone(),
         exe_name,
+        script_keys: opts.script_keys,
     };
 
     let mut registry = ImportRegistry::new();
@@ -175,6 +180,7 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut shader_cache: Option<PathBuf> = None;
     let mut max_frames: Option<u64> = None;
     let mut dump_frame: Option<PathBuf> = None;
+    let mut script_keys: Vec<ScriptedKeyEvent> = Vec::new();
     let mut headless = false;
     let mut trace_imports = false;
     let mut trace_d3d8 = false;
@@ -206,6 +212,17 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
                 let val = args.get(idx)?;
                 dump_frame = Some(PathBuf::from(val));
             }
+            "--script-keys" => {
+                idx += 1;
+                let val = args.get(idx)?;
+                match parse_script_keys(val) {
+                    Ok(mut parsed) => script_keys.append(&mut parsed),
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return None;
+                    }
+                }
+            }
             _ if arg.starts_with('-') => {
                 eprintln!("Unknown option: {arg}");
                 return None;
@@ -226,6 +243,7 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         shader_cache,
         max_frames,
         dump_frame,
+        script_keys,
         headless,
         trace_imports,
         trace_d3d8,
@@ -236,6 +254,6 @@ fn print_usage(args: &[String]) {
     let bin = args.first().map(String::as_str).unwrap_or("toluca-runtime");
     eprintln!("Usage:");
     eprintln!(
-        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--headless] [--trace-imports] [--trace-d3d8]"
+        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--script-keys <SPEC>] [--headless] [--trace-imports] [--trace-d3d8]"
     );
 }

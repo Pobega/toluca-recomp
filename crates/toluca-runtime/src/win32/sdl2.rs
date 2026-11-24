@@ -1,8 +1,10 @@
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::path::Path;
 
 use toluca_d3d8::{GlGetProcAddrFn, PresentTarget};
 
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
+const SDL_INIT_GAMECONTROLLER: u32 = 0x0000_2000;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000;
 const SDL_WINDOW_OPENGL: u32 = 0x0000_0002;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
@@ -20,13 +22,50 @@ const SDL_QUIT: u32 = 0x100;
 const SDL_WINDOWEVENT: u32 = 0x200;
 const SDL_KEYDOWN: u32 = 0x300;
 const SDL_KEYUP: u32 = 0x301;
+const SDL_MOUSEWHEEL: u32 = 0x403;
+const SDL_CONTROLLERDEVICEADDED: u32 = 0x653;
+const SDL_CONTROLLERDEVICEREMOVED: u32 = 0x654;
+
+const SDL_MOUSEWHEEL_FLIPPED: u32 = 1;
 
 const SDL_WINDOWEVENT_FOCUS_GAINED: u8 = 12;
 const SDL_WINDOWEVENT_FOCUS_LOST: u8 = 13;
 const SDL_WINDOWEVENT_CLOSE: u8 = 14;
 
+const SDL_EVENT_OFF_CDEVICE_WHICH: usize = 8;
 const SDL_EVENT_OFF_WINDOW_EVENT: usize = 12;
 const SDL_EVENT_OFF_SCANCODE: usize = 16;
+const SDL_EVENT_OFF_WHEEL_Y: usize = 20;
+const SDL_EVENT_OFF_WHEEL_DIRECTION: usize = 24;
+
+pub const SDL_SCANCODE_COUNT: usize = 512;
+pub const SDL_GAMEPAD_AXIS_COUNT: usize = 6;
+pub const SDL_GAMEPAD_BUTTON_COUNT: usize = 16;
+const SDL_TRIGGER_DIGITAL_THRESHOLD: i16 = 8192;
+const DI_POV_CENTERED: u32 = 0xFFFF_FFFF;
+
+const SDL_CONTROLLER_BUTTON_A: i32 = 0;
+const SDL_CONTROLLER_BUTTON_B: i32 = 1;
+const SDL_CONTROLLER_BUTTON_X: i32 = 2;
+const SDL_CONTROLLER_BUTTON_Y: i32 = 3;
+const SDL_CONTROLLER_BUTTON_BACK: i32 = 4;
+const SDL_CONTROLLER_BUTTON_GUIDE: i32 = 5;
+const SDL_CONTROLLER_BUTTON_START: i32 = 6;
+const SDL_CONTROLLER_BUTTON_LEFTSTICK: i32 = 7;
+const SDL_CONTROLLER_BUTTON_RIGHTSTICK: i32 = 8;
+const SDL_CONTROLLER_BUTTON_LEFTSHOULDER: i32 = 9;
+const SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: i32 = 10;
+const SDL_CONTROLLER_BUTTON_DPAD_UP: i32 = 11;
+const SDL_CONTROLLER_BUTTON_DPAD_DOWN: i32 = 12;
+const SDL_CONTROLLER_BUTTON_DPAD_LEFT: i32 = 13;
+const SDL_CONTROLLER_BUTTON_DPAD_RIGHT: i32 = 14;
+
+const SDL_CONTROLLER_AXIS_LEFTX: i32 = 0;
+const SDL_CONTROLLER_AXIS_LEFTY: i32 = 1;
+const SDL_CONTROLLER_AXIS_RIGHTX: i32 = 2;
+const SDL_CONTROLLER_AXIS_RIGHTY: i32 = 3;
+const SDL_CONTROLLER_AXIS_TRIGGERLEFT: i32 = 4;
+const SDL_CONTROLLER_AXIS_TRIGGERRIGHT: i32 = 5;
 
 const SDL_SCANCODE_A: i32 = 4;
 const SDL_SCANCODE_Z: i32 = 29;
@@ -77,8 +116,26 @@ impl SdlEventBuf {
         }
     }
 
+    fn read_i32(&self, offset: usize) -> i32 {
+        i32::from_ne_bytes([
+            self.raw[offset],
+            self.raw[offset + 1],
+            self.raw[offset + 2],
+            self.raw[offset + 3],
+        ])
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        u32::from_ne_bytes([
+            self.raw[offset],
+            self.raw[offset + 1],
+            self.raw[offset + 2],
+            self.raw[offset + 3],
+        ])
+    }
+
     fn event_type(&self) -> u32 {
-        u32::from_ne_bytes([self.raw[0], self.raw[1], self.raw[2], self.raw[3]])
+        self.read_u32(0)
     }
 
     fn window_event_id(&self) -> u8 {
@@ -86,8 +143,20 @@ impl SdlEventBuf {
     }
 
     fn scancode(&self) -> i32 {
-        let o = SDL_EVENT_OFF_SCANCODE;
-        i32::from_ne_bytes([self.raw[o], self.raw[o + 1], self.raw[o + 2], self.raw[o + 3]])
+        self.read_i32(SDL_EVENT_OFF_SCANCODE)
+    }
+
+    fn cdevice_which(&self) -> i32 {
+        self.read_i32(SDL_EVENT_OFF_CDEVICE_WHICH)
+    }
+
+    fn wheel_y(&self) -> i32 {
+        let y = self.read_i32(SDL_EVENT_OFF_WHEEL_Y);
+        if self.read_u32(SDL_EVENT_OFF_WHEEL_DIRECTION) == SDL_MOUSEWHEEL_FLIPPED {
+            y.saturating_neg()
+        } else {
+            y
+        }
     }
 }
 
@@ -101,7 +170,48 @@ pub enum SdlTranslatedEvent {
     WindowClose,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GamepadSnapshot {
+    pub axes: [i16; SDL_GAMEPAD_AXIS_COUNT],
+    pub dpad_hat: u32,
+    pub buttons: [bool; SDL_GAMEPAD_BUTTON_COUNT],
+}
+
+impl Default for GamepadSnapshot {
+    fn default() -> Self {
+        Self {
+            axes: [0; SDL_GAMEPAD_AXIS_COUNT],
+            dpad_hat: DI_POV_CENTERED,
+            buttons: [false; SDL_GAMEPAD_BUTTON_COUNT],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SdlInputSnapshot {
+    pub key_scancodes: [bool; SDL_SCANCODE_COUNT],
+    pub mouse_dx: i32,
+    pub mouse_dy: i32,
+    pub mouse_dz: i32,
+    pub mouse_buttons: u32,
+    pub gamepad: Option<GamepadSnapshot>,
+}
+
+impl Default for SdlInputSnapshot {
+    fn default() -> Self {
+        Self {
+            key_scancodes: [false; SDL_SCANCODE_COUNT],
+            mouse_dx: 0,
+            mouse_dy: 0,
+            mouse_dz: 0,
+            mouse_buttons: 0,
+            gamepad: None,
+        }
+    }
+}
+
 type SdlInitFn = unsafe extern "C" fn(flags: u32) -> i32;
+type SdlInitSubSystemFn = unsafe extern "C" fn(flags: u32) -> i32;
 type SdlQuitSubSystemFn = unsafe extern "C" fn(flags: u32);
 type SdlCreateWindowFn =
     unsafe extern "C" fn(title: *const c_char, x: i32, y: i32, w: i32, h: i32, flags: u32) -> *mut c_void;
@@ -110,6 +220,32 @@ type SdlShowWindowFn = unsafe extern "C" fn(window: *mut c_void);
 type SdlHideWindowFn = unsafe extern "C" fn(window: *mut c_void);
 type SdlShowCursorFn = unsafe extern "C" fn(toggle: i32) -> i32;
 type SdlPollEventFn = unsafe extern "C" fn(event: *mut SdlEventBuf) -> i32;
+type SdlPumpEventsFn = unsafe extern "C" fn();
+type SdlGetKeyboardStateFn = unsafe extern "C" fn(numkeys: *mut i32) -> *const u8;
+type SdlGetMouseStateFn = unsafe extern "C" fn(x: *mut i32, y: *mut i32) -> u32;
+type SdlNumJoysticksFn = unsafe extern "C" fn() -> i32;
+type SdlIsGameControllerFn = unsafe extern "C" fn(joystick_index: i32) -> i32;
+type SdlGameControllerOpenFn = unsafe extern "C" fn(joystick_index: i32) -> *mut c_void;
+type SdlGameControllerCloseFn = unsafe extern "C" fn(gamecontroller: *mut c_void);
+type SdlGameControllerUpdateFn = unsafe extern "C" fn();
+type SdlGameControllerGetButtonFn =
+    unsafe extern "C" fn(gamecontroller: *mut c_void, button: i32) -> u8;
+type SdlGameControllerGetAxisFn =
+    unsafe extern "C" fn(gamecontroller: *mut c_void, axis: i32) -> i16;
+type SdlGameControllerRumbleFn = unsafe extern "C" fn(
+    gamecontroller: *mut c_void,
+    low_frequency_rumble: u16,
+    high_frequency_rumble: u16,
+    duration_ms: u32,
+) -> i32;
+type SdlGameControllerNameFn = unsafe extern "C" fn(gamecontroller: *mut c_void) -> *const c_char;
+type SdlGameControllerFromInstanceIdFn = unsafe extern "C" fn(joyid: i32) -> *mut c_void;
+type SdlGameControllerAddMappingsFromFileFn = unsafe extern "C" fn(file: *const c_char) -> i32;
+type SdlGameControllerAddMappingsFromRwFn =
+    unsafe extern "C" fn(rw: *mut c_void, freerw: i32) -> i32;
+type SdlRwFromFileFn =
+    unsafe extern "C" fn(file: *const c_char, mode: *const c_char) -> *mut c_void;
+
 type SdlGlSetAttributeFn = unsafe extern "C" fn(attr: i32, value: i32) -> i32;
 type SdlGlCreateContextFn = unsafe extern "C" fn(window: *mut c_void) -> *mut c_void;
 type SdlGlDeleteContextFn = unsafe extern "C" fn(context: *mut c_void);
@@ -148,12 +284,30 @@ impl PresentTarget for SdlPresentTarget {
 pub struct Sdl2WindowBackend {
     lib_handle: *mut c_void,
     quit_subsystem: SdlQuitSubSystemFn,
+    init_subsystem_fn: Option<SdlInitSubSystemFn>,
     create_window_fn: SdlCreateWindowFn,
     destroy_window_fn: SdlDestroyWindowFn,
     show_window_fn: SdlShowWindowFn,
     hide_window_fn: SdlHideWindowFn,
     show_cursor_fn: SdlShowCursorFn,
     poll_event_fn: SdlPollEventFn,
+    pump_events_fn: Option<SdlPumpEventsFn>,
+    get_keyboard_state_fn: Option<SdlGetKeyboardStateFn>,
+    get_rel_mouse_state_fn: Option<SdlGetMouseStateFn>,
+    get_mouse_state_fn: Option<SdlGetMouseStateFn>,
+    num_joysticks_fn: Option<SdlNumJoysticksFn>,
+    is_game_controller_fn: Option<SdlIsGameControllerFn>,
+    gc_open_fn: Option<SdlGameControllerOpenFn>,
+    gc_close_fn: Option<SdlGameControllerCloseFn>,
+    gc_update_fn: Option<SdlGameControllerUpdateFn>,
+    gc_get_button_fn: Option<SdlGameControllerGetButtonFn>,
+    gc_get_axis_fn: Option<SdlGameControllerGetAxisFn>,
+    gc_rumble_fn: Option<SdlGameControllerRumbleFn>,
+    gc_name_fn: Option<SdlGameControllerNameFn>,
+    gc_from_instance_id_fn: Option<SdlGameControllerFromInstanceIdFn>,
+    gc_add_mappings_from_file_fn: Option<SdlGameControllerAddMappingsFromFileFn>,
+    gc_add_mappings_from_rw_fn: Option<SdlGameControllerAddMappingsFromRwFn>,
+    rw_from_file_fn: Option<SdlRwFromFileFn>,
     gl_set_attr_fn: Option<SdlGlSetAttributeFn>,
     gl_create_context_fn: Option<SdlGlCreateContextFn>,
     gl_delete_context_fn: Option<SdlGlDeleteContextFn>,
@@ -164,6 +318,10 @@ pub struct Sdl2WindowBackend {
     gl_set_swap_interval_fn: Option<SdlGlSetSwapIntervalFn>,
     gl_contexts: Vec<*mut c_void>,
     windows: Vec<*mut c_void>,
+    gamecontroller_inited: bool,
+    active_controller: Option<*mut c_void>,
+    key_scancodes: [bool; SDL_SCANCODE_COUNT],
+    mouse_wheel_delta: i32,
 }
 
 impl Sdl2WindowBackend {
@@ -206,40 +364,226 @@ impl Sdl2WindowBackend {
             return None;
         };
 
-        if unsafe { init_fn(SDL_INIT_VIDEO) } != 0 {
-            unsafe { libc::dlclose(lib_handle) };
-            return None;
+        let init_subsystem_fn = load_sym::<SdlInitSubSystemFn>(lib_handle, c"SDL_InitSubSystem");
+        let mut gamecontroller_inited = unsafe { init_fn(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) } == 0;
+        if !gamecontroller_inited {
+            if unsafe { init_fn(SDL_INIT_VIDEO) } != 0 {
+                unsafe { libc::dlclose(lib_handle) };
+                return None;
+            }
+            if let Some(init_sub) = init_subsystem_fn {
+                gamecontroller_inited = unsafe { init_sub(SDL_INIT_GAMECONTROLLER) } == 0;
+            }
         }
 
-        let gl_set_attr_fn = load_sym::<SdlGlSetAttributeFn>(lib_handle, c"SDL_GL_SetAttribute");
-        let gl_create_context_fn = load_sym::<SdlGlCreateContextFn>(lib_handle, c"SDL_GL_CreateContext");
-        let gl_delete_context_fn = load_sym::<SdlGlDeleteContextFn>(lib_handle, c"SDL_GL_DeleteContext");
-        let gl_make_current_fn = load_sym::<SdlGlMakeCurrentFn>(lib_handle, c"SDL_GL_MakeCurrent");
-        let gl_swap_window_fn = load_sym::<SdlGlSwapWindowFn>(lib_handle, c"SDL_GL_SwapWindow");
-        let gl_get_proc_addr_fn = load_sym::<GlGetProcAddrFn>(lib_handle, c"SDL_GL_GetProcAddress");
-        let gl_drawable_size_fn = load_sym::<SdlGlGetDrawableSizeFn>(lib_handle, c"SDL_GL_GetDrawableSize");
-        let gl_set_swap_interval_fn = load_sym::<SdlGlSetSwapIntervalFn>(lib_handle, c"SDL_GL_SetSwapInterval");
-
-        Some(Self {
+        let mut backend = Self {
             lib_handle,
             quit_subsystem,
+            init_subsystem_fn,
             create_window_fn,
             destroy_window_fn,
             show_window_fn,
             hide_window_fn,
             show_cursor_fn,
             poll_event_fn,
-            gl_set_attr_fn,
-            gl_create_context_fn,
-            gl_delete_context_fn,
-            gl_make_current_fn,
-            gl_swap_window_fn,
-            gl_get_proc_addr_fn,
-            gl_drawable_size_fn,
-            gl_set_swap_interval_fn,
+            pump_events_fn: load_sym::<SdlPumpEventsFn>(lib_handle, c"SDL_PumpEvents"),
+            get_keyboard_state_fn: load_sym::<SdlGetKeyboardStateFn>(lib_handle, c"SDL_GetKeyboardState"),
+            get_rel_mouse_state_fn: load_sym::<SdlGetMouseStateFn>(
+                lib_handle,
+                c"SDL_GetRelativeMouseState",
+            ),
+            get_mouse_state_fn: load_sym::<SdlGetMouseStateFn>(lib_handle, c"SDL_GetMouseState"),
+            num_joysticks_fn: load_sym::<SdlNumJoysticksFn>(lib_handle, c"SDL_NumJoysticks"),
+            is_game_controller_fn: load_sym::<SdlIsGameControllerFn>(
+                lib_handle,
+                c"SDL_IsGameController",
+            ),
+            gc_open_fn: load_sym::<SdlGameControllerOpenFn>(lib_handle, c"SDL_GameControllerOpen"),
+            gc_close_fn: load_sym::<SdlGameControllerCloseFn>(lib_handle, c"SDL_GameControllerClose"),
+            gc_update_fn: load_sym::<SdlGameControllerUpdateFn>(
+                lib_handle,
+                c"SDL_GameControllerUpdate",
+            ),
+            gc_get_button_fn: load_sym::<SdlGameControllerGetButtonFn>(
+                lib_handle,
+                c"SDL_GameControllerGetButton",
+            ),
+            gc_get_axis_fn: load_sym::<SdlGameControllerGetAxisFn>(
+                lib_handle,
+                c"SDL_GameControllerGetAxis",
+            ),
+            gc_rumble_fn: load_sym::<SdlGameControllerRumbleFn>(
+                lib_handle,
+                c"SDL_GameControllerRumble",
+            ),
+            gc_name_fn: load_sym::<SdlGameControllerNameFn>(lib_handle, c"SDL_GameControllerName"),
+            gc_from_instance_id_fn: load_sym::<SdlGameControllerFromInstanceIdFn>(
+                lib_handle,
+                c"SDL_GameControllerFromInstanceID",
+            ),
+            gc_add_mappings_from_file_fn: load_sym::<SdlGameControllerAddMappingsFromFileFn>(
+                lib_handle,
+                c"SDL_GameControllerAddMappingsFromFile",
+            ),
+            gc_add_mappings_from_rw_fn: load_sym::<SdlGameControllerAddMappingsFromRwFn>(
+                lib_handle,
+                c"SDL_GameControllerAddMappingsFromRW",
+            ),
+            rw_from_file_fn: load_sym::<SdlRwFromFileFn>(lib_handle, c"SDL_RWFromFile"),
+            gl_set_attr_fn: load_sym::<SdlGlSetAttributeFn>(lib_handle, c"SDL_GL_SetAttribute"),
+            gl_create_context_fn: load_sym::<SdlGlCreateContextFn>(
+                lib_handle,
+                c"SDL_GL_CreateContext",
+            ),
+            gl_delete_context_fn: load_sym::<SdlGlDeleteContextFn>(
+                lib_handle,
+                c"SDL_GL_DeleteContext",
+            ),
+            gl_make_current_fn: load_sym::<SdlGlMakeCurrentFn>(lib_handle, c"SDL_GL_MakeCurrent"),
+            gl_swap_window_fn: load_sym::<SdlGlSwapWindowFn>(lib_handle, c"SDL_GL_SwapWindow"),
+            gl_get_proc_addr_fn: load_sym::<GlGetProcAddrFn>(lib_handle, c"SDL_GL_GetProcAddress"),
+            gl_drawable_size_fn: load_sym::<SdlGlGetDrawableSizeFn>(
+                lib_handle,
+                c"SDL_GL_GetDrawableSize",
+            ),
+            gl_set_swap_interval_fn: load_sym::<SdlGlSetSwapIntervalFn>(
+                lib_handle,
+                c"SDL_GL_SetSwapInterval",
+            ),
             gl_contexts: Vec::new(),
             windows: Vec::new(),
-        })
+            gamecontroller_inited,
+            active_controller: None,
+            key_scancodes: [false; SDL_SCANCODE_COUNT],
+            mouse_wheel_delta: 0,
+        };
+
+        if backend.gamecontroller_inited {
+            backend.load_controller_mapping_files();
+            backend.open_first_controller();
+        }
+
+        Some(backend)
+    }
+
+    fn load_controller_mapping_files(&self) {
+        if let Some(path) = std::env::var_os("SDL_GAMECONTROLLERCONFIG_FILE") {
+            let path = Path::new(&path);
+            if path.is_file() {
+                self.add_mappings_from_file(path);
+            }
+        }
+        let cwd_db = Path::new("gamecontrollerdb.txt");
+        if cwd_db.is_file() {
+            self.add_mappings_from_file(cwd_db);
+        }
+    }
+
+    fn add_mappings_from_file(&self, path: &Path) {
+        let Some(path_str) = path.to_str() else {
+            return;
+        };
+        let Ok(c_path) = CString::new(path_str) else {
+            return;
+        };
+        if let Some(add_file) = self.gc_add_mappings_from_file_fn {
+            unsafe {
+                add_file(c_path.as_ptr());
+            }
+            return;
+        }
+        // SDL2 defines SDL_GameControllerAddMappingsFromFile as a macro over RWFromFile.
+        if let (Some(add_rw), Some(rw_from_file)) =
+            (self.gc_add_mappings_from_rw_fn, self.rw_from_file_fn)
+        {
+            let rw = unsafe { rw_from_file(c_path.as_ptr(), c"rb".as_ptr()) };
+            if !rw.is_null() {
+                unsafe {
+                    add_rw(rw, 1);
+                }
+            }
+        }
+    }
+
+    fn open_first_controller(&mut self) {
+        if self.active_controller.is_some() {
+            return;
+        }
+        let Some(num_joysticks) = self.num_joysticks_fn else {
+            return;
+        };
+        let count = unsafe { num_joysticks() };
+        for index in 0..count {
+            if self.try_open_controller_at(index) {
+                break;
+            }
+        }
+    }
+
+    fn try_open_controller_at(&mut self, device_index: i32) -> bool {
+        if self.active_controller.is_some() {
+            return false;
+        }
+        let Some(is_gc) = self.is_game_controller_fn else {
+            return false;
+        };
+        let Some(open_gc) = self.gc_open_fn else {
+            return false;
+        };
+        if unsafe { is_gc(device_index) } == 0 {
+            return false;
+        }
+        let ctrl = unsafe { open_gc(device_index) };
+        if ctrl.is_null() {
+            return false;
+        }
+        self.active_controller = Some(ctrl);
+        true
+    }
+
+    fn handle_controller_removed(&mut self, instance_id: i32) {
+        let Some(active) = self.active_controller else {
+            return;
+        };
+        let matches_active = match self.gc_from_instance_id_fn {
+            Some(from_id) => unsafe { from_id(instance_id) == active },
+            None => true,
+        };
+        if !matches_active {
+            return;
+        }
+        if let Some(close_gc) = self.gc_close_fn {
+            unsafe {
+                close_gc(active);
+            }
+        }
+        self.active_controller = None;
+        self.open_first_controller();
+    }
+
+    pub fn has_controller(&self) -> bool {
+        self.active_controller.is_some()
+    }
+
+    pub fn controller_name(&self) -> Option<String> {
+        let ctrl = self.active_controller?;
+        let name_fn = self.gc_name_fn?;
+        let ptr = unsafe { name_fn(ctrl) };
+        if ptr.is_null() {
+            return None;
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        Some(cstr.to_string_lossy().into_owned())
+    }
+
+    pub fn init_controller_subsystem(&mut self) -> bool {
+        if self.gamecontroller_inited {
+            return true;
+        }
+        if let Some(init_sub) = self.init_subsystem_fn {
+            self.gamecontroller_inited = unsafe { init_sub(SDL_INIT_GAMECONTROLLER) } == 0;
+        }
+        self.gamecontroller_inited
     }
 
     pub fn primary_window(&self) -> Option<*mut c_void> {
@@ -366,14 +710,31 @@ impl Sdl2WindowBackend {
             match buf.event_type() {
                 SDL_QUIT => events.push(SdlTranslatedEvent::Quit),
                 SDL_KEYDOWN => {
-                    if let Some(vk) = scancode_to_vk(buf.scancode()) {
+                    let sc = buf.scancode();
+                    if (0..SDL_SCANCODE_COUNT as i32).contains(&sc) {
+                        self.key_scancodes[sc as usize] = true;
+                    }
+                    if let Some(vk) = scancode_to_vk(sc) {
                         events.push(SdlTranslatedEvent::KeyDown(vk));
                     }
                 }
                 SDL_KEYUP => {
-                    if let Some(vk) = scancode_to_vk(buf.scancode()) {
+                    let sc = buf.scancode();
+                    if (0..SDL_SCANCODE_COUNT as i32).contains(&sc) {
+                        self.key_scancodes[sc as usize] = false;
+                    }
+                    if let Some(vk) = scancode_to_vk(sc) {
                         events.push(SdlTranslatedEvent::KeyUp(vk));
                     }
+                }
+                SDL_MOUSEWHEEL => {
+                    self.mouse_wheel_delta = self.mouse_wheel_delta.saturating_add(buf.wheel_y());
+                }
+                SDL_CONTROLLERDEVICEADDED => {
+                    self.try_open_controller_at(buf.cdevice_which());
+                }
+                SDL_CONTROLLERDEVICEREMOVED => {
+                    self.handle_controller_removed(buf.cdevice_which());
                 }
                 SDL_WINDOWEVENT => match buf.window_event_id() {
                     SDL_WINDOWEVENT_FOCUS_GAINED => events.push(SdlTranslatedEvent::FocusGained),
@@ -386,10 +747,150 @@ impl Sdl2WindowBackend {
         }
         events
     }
+
+    pub fn poll_input_snapshot(&mut self) -> SdlInputSnapshot {
+        if let Some(pump) = self.pump_events_fn {
+            unsafe {
+                pump();
+            }
+        }
+
+        if let Some(get_kbd) = self.get_keyboard_state_fn {
+            let mut numkeys = 0i32;
+            let ptr = unsafe { get_kbd(&mut numkeys) };
+            if !ptr.is_null() && numkeys > 0 {
+                let count = (numkeys as usize).min(SDL_SCANCODE_COUNT);
+                let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
+                for (dst, &src) in self.key_scancodes[..count].iter_mut().zip(slice.iter()) {
+                    *dst = src != 0;
+                }
+            }
+        }
+
+        let mut mouse_dx = 0i32;
+        let mut mouse_dy = 0i32;
+        let mouse_buttons = if let Some(get_rel) = self.get_rel_mouse_state_fn {
+            unsafe { get_rel(&mut mouse_dx, &mut mouse_dy) }
+        } else if let Some(get_abs) = self.get_mouse_state_fn {
+            let mut x = 0i32;
+            let mut y = 0i32;
+            unsafe { get_abs(&mut x, &mut y) }
+        } else {
+            0
+        };
+        let mouse_dz = std::mem::take(&mut self.mouse_wheel_delta);
+
+        let gamepad = self.read_gamepad_snapshot();
+
+        SdlInputSnapshot {
+            key_scancodes: self.key_scancodes,
+            mouse_dx,
+            mouse_dy,
+            mouse_dz,
+            mouse_buttons,
+            gamepad,
+        }
+    }
+
+    fn read_gamepad_snapshot(&mut self) -> Option<GamepadSnapshot> {
+        let ctrl = self.active_controller?;
+        if let Some(update) = self.gc_update_fn {
+            unsafe {
+                update();
+            }
+        }
+
+        let mut axes = [0i16; SDL_GAMEPAD_AXIS_COUNT];
+        if let Some(get_axis) = self.gc_get_axis_fn {
+            let sdl_axes = [
+                SDL_CONTROLLER_AXIS_LEFTX,
+                SDL_CONTROLLER_AXIS_LEFTY,
+                SDL_CONTROLLER_AXIS_RIGHTX,
+                SDL_CONTROLLER_AXIS_RIGHTY,
+                SDL_CONTROLLER_AXIS_TRIGGERLEFT,
+                SDL_CONTROLLER_AXIS_TRIGGERRIGHT,
+            ];
+            for (dst, sdl_axis) in axes.iter_mut().zip(sdl_axes) {
+                *dst = unsafe { get_axis(ctrl, sdl_axis) };
+            }
+        }
+
+        let mut buttons = [false; SDL_GAMEPAD_BUTTON_COUNT];
+        let mut dpad_up = false;
+        let mut dpad_down = false;
+        let mut dpad_left = false;
+        let mut dpad_right = false;
+
+        if let Some(get_btn) = self.gc_get_button_fn {
+            let pressed = |btn: i32| unsafe { get_btn(ctrl, btn) != 0 };
+            buttons[0] = pressed(SDL_CONTROLLER_BUTTON_A);
+            buttons[1] = pressed(SDL_CONTROLLER_BUTTON_B);
+            buttons[2] = pressed(SDL_CONTROLLER_BUTTON_X);
+            buttons[3] = pressed(SDL_CONTROLLER_BUTTON_Y);
+            buttons[4] = pressed(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+            buttons[5] = pressed(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+            buttons[6] = pressed(SDL_CONTROLLER_BUTTON_BACK);
+            buttons[7] = pressed(SDL_CONTROLLER_BUTTON_START);
+            buttons[10] = pressed(SDL_CONTROLLER_BUTTON_LEFTSTICK);
+            buttons[11] = pressed(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+            buttons[12] = pressed(SDL_CONTROLLER_BUTTON_GUIDE);
+            dpad_up = pressed(SDL_CONTROLLER_BUTTON_DPAD_UP);
+            dpad_down = pressed(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+            dpad_left = pressed(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+            dpad_right = pressed(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+        }
+
+        buttons[8] = axes[4] > SDL_TRIGGER_DIGITAL_THRESHOLD;
+        buttons[9] = axes[5] > SDL_TRIGGER_DIGITAL_THRESHOLD;
+
+        Some(GamepadSnapshot {
+            axes,
+            dpad_hat: dpad_to_pov(dpad_up, dpad_down, dpad_left, dpad_right),
+            buttons,
+        })
+    }
+
+    pub fn set_controller_rumble(
+        &mut self,
+        low_freq: u16,
+        high_freq: u16,
+        duration_ms: u32,
+    ) -> bool {
+        let Some(ctrl) = self.active_controller else {
+            return false;
+        };
+        let Some(rumble_fn) = self.gc_rumble_fn else {
+            return false;
+        };
+        unsafe { rumble_fn(ctrl, low_freq, high_freq, duration_ms) == 0 }
+    }
+}
+
+pub fn dpad_to_pov(up: bool, down: bool, left: bool, right: bool) -> u32 {
+    let vert = i8::from(up) - i8::from(down);
+    let horiz = i8::from(right) - i8::from(left);
+    match (vert, horiz) {
+        (1, 0) => 0,
+        (1, 1) => 4500,
+        (0, 1) => 9000,
+        (-1, 1) => 13500,
+        (-1, 0) => 18000,
+        (-1, -1) => 22500,
+        (0, -1) => 27000,
+        (1, -1) => 31500,
+        _ => DI_POV_CENTERED,
+    }
 }
 
 impl Drop for Sdl2WindowBackend {
     fn drop(&mut self) {
+        if let Some(ctrl) = self.active_controller.take() {
+            if let Some(close_gc) = self.gc_close_fn {
+                unsafe {
+                    close_gc(ctrl);
+                }
+            }
+        }
         if let Some(del_ctx) = self.gl_delete_context_fn {
             while let Some(ctx) = self.gl_contexts.pop() {
                 unsafe {
@@ -403,6 +904,9 @@ impl Drop for Sdl2WindowBackend {
             }
         }
         unsafe {
+            if self.gamecontroller_inited {
+                (self.quit_subsystem)(SDL_INIT_GAMECONTROLLER);
+            }
             (self.quit_subsystem)(SDL_INIT_VIDEO);
             libc::dlclose(self.lib_handle);
         }
@@ -419,7 +923,7 @@ fn open_sdl2_library() -> Option<*mut c_void> {
     None
 }
 
-fn load_sym<F: Copy>(lib_handle: *mut c_void, name: &std::ffi::CStr) -> Option<F> {
+fn load_sym<F: Copy>(lib_handle: *mut c_void, name: &CStr) -> Option<F> {
     let ptr = unsafe { libc::dlsym(lib_handle, name.as_ptr()) };
     if ptr.is_null() {
         return None;
@@ -473,5 +977,19 @@ mod tests {
         assert_eq!(scancode_to_vk(SDL_SCANCODE_UP), Some(VK_UP));
         assert_eq!(scancode_to_vk(SDL_SCANCODE_LSHIFT), Some(VK_SHIFT));
         assert_eq!(scancode_to_vk(SDL_SCANCODE_RCTRL), Some(VK_CONTROL));
+    }
+
+    #[test]
+    fn dpad_to_pov_computes_all_eight_directions_and_centered() {
+        assert_eq!(dpad_to_pov(false, false, false, false), DI_POV_CENTERED);
+        assert_eq!(dpad_to_pov(true, true, false, false), DI_POV_CENTERED);
+        assert_eq!(dpad_to_pov(true, false, false, false), 0);
+        assert_eq!(dpad_to_pov(true, false, false, true), 4500);
+        assert_eq!(dpad_to_pov(false, false, false, true), 9000);
+        assert_eq!(dpad_to_pov(false, true, false, true), 13500);
+        assert_eq!(dpad_to_pov(false, true, false, false), 18000);
+        assert_eq!(dpad_to_pov(false, true, true, false), 22500);
+        assert_eq!(dpad_to_pov(false, false, true, false), 27000);
+        assert_eq!(dpad_to_pov(true, false, true, false), 31500);
     }
 }

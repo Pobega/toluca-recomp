@@ -196,10 +196,10 @@ impl ImportRegistry {
 }
 
 #[derive(Clone)]
-struct ResolvedImportSlot {
-    dll_name: String,
-    symbol: ImportSymbol,
-    handler: Option<ImportHandler>,
+pub(crate) struct ResolvedImportSlot {
+    pub(crate) dll_name: String,
+    pub(crate) symbol: ImportSymbol,
+    pub(crate) handler: Option<ImportHandler>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,10 +239,10 @@ pub struct RuntimeContext<'a> {
     pub active_host_tid: u64,
     pub host_start_instant: Instant,
     pub pe_image_base: GuestAddr,
-    code: &'a AotCodeImage,
-    imports: &'a mut Vec<ResolvedImportSlot>,
-    import_slot_map: &'a mut HashMap<ImportKey, usize>,
-    registry: &'a ImportRegistry,
+    pub(crate) code: &'a AotCodeImage,
+    pub(crate) imports: &'a mut Vec<ResolvedImportSlot>,
+    pub(crate) import_slot_map: &'a mut HashMap<ImportKey, usize>,
+    pub(crate) registry: &'a ImportRegistry,
     pub(crate) trap: &'a mut Option<TrapInfo>,
     pub(crate) pending_error: &'a mut Option<RuntimeError>,
 }

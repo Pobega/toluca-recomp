@@ -1,10 +1,13 @@
 pub mod d3d8;
+pub mod dinput8;
 pub mod extra_dlls;
 pub mod kernel32;
 pub mod msvcrt;
 pub mod path;
 pub mod sdl2;
 pub mod user32;
+
+pub use dinput8::ScriptedKeyEvent;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -70,6 +73,7 @@ pub struct Win32Config {
     pub max_frames: Option<u64>,
     pub command_line: String,
     pub exe_name: String,
+    pub script_keys: Vec<ScriptedKeyEvent>,
 }
 
 impl Default for Win32Config {
@@ -83,6 +87,7 @@ impl Default for Win32Config {
             max_frames: None,
             command_line: "sh2pc.exe".to_owned(),
             exe_name: "sh2pc.exe".to_owned(),
+            script_keys: Vec::new(),
         }
     }
 }
@@ -255,6 +260,7 @@ pub struct Win32State {
     c_files: HashMap<u32, CFileEntry>,
     pub mapped_views: HashMap<GuestAddr, usize>,
     pub d3d8: D3d8Context,
+    pub dinput8: dinput8::Dinput8State,
     pub window_mgr: WindowManager,
     pub d3d8_create_calls: Vec<u32>,
     pub d3d8_present_calls: u64,
@@ -283,6 +289,7 @@ impl Win32State {
     pub fn new(config: Win32Config) -> Self {
         let current_dir = config.game_root.clone();
         let headless = config.headless;
+        let dinput8 = dinput8::Dinput8State::new(&config.script_keys);
         let mut d3d8 = D3d8Context::new_null();
         d3d8.trace_d3d8 = config.trace_d3d8;
         Self {
@@ -297,6 +304,7 @@ impl Win32State {
             c_files: HashMap::new(),
             mapped_views: HashMap::new(),
             d3d8,
+            dinput8,
             window_mgr: WindowManager::new(headless),
             d3d8_create_calls: Vec::new(),
             d3d8_present_calls: 0,
@@ -448,6 +456,7 @@ pub fn register_all_win32(registry: &mut ImportRegistry) {
     register_kernel32_and_msvcrt(registry);
     user32::register_imports(registry);
     d3d8::register_imports(registry);
+    dinput8::register_imports(registry);
     extra_dlls::register_imports(registry);
 }
 

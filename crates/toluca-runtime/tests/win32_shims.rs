@@ -432,6 +432,7 @@ fn executes_kernel32_and_msvcrt_shims_end_to_end() {
         max_frames: None,
         command_line: "sh2pc.exe -test".to_owned(),
         exe_name: "sh2pc.exe".to_owned(),
+        script_keys: Vec::new(),
     };
     let mut rt = Runtime::load_from_bytes_with_config(pe_bytes, &ws.aot_path, registry, config)
         .unwrap();

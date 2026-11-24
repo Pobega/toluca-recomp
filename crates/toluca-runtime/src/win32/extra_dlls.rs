@@ -16,10 +16,7 @@ const MAX_STRING_BYTES: usize = 65536;
 const E_NOINTERFACE: u32 = 0x8000_4002;
 const E_FAIL: u32 = 0x8000_4005;
 const S_OK: u32 = 0;
-const DINPUT8_COM_DLL: &str = "__dinput8_com__";
 const DSOUND_COM_DLL: &str = "__dsound_com__";
-const DI8_VTABLE_SLOTS: usize = 8;
-const DIDEV8_VTABLE_SLOTS: usize = 32;
 const DS8_VTABLE_SLOTS: usize = 12;
 const DSB8_VTABLE_SLOTS: usize = 22;
 const DS3DLISTENER_VTABLE_SLOTS: usize = 18;
@@ -60,28 +57,9 @@ pub fn register_imports(registry: &mut ImportRegistry) {
     registry.register_name("advapi32.dll", "RegCloseKey", reg_close_key);
 
     registry.register_name("ole32.dll", "CoInitialize", co_initialize);
-    registry.register_name("dinput8.dll", "DirectInput8Create", direct_input_8_create);
     registry.register_ordinal("dsound.dll", 11, direct_sound_create_8);
     registry.register_name("dsound.dll", "DirectSoundCreate8", direct_sound_create_8);
     registry.register_name("dsound.dll", "DirectSoundCreate", direct_sound_create_8);
-
-    let di_com_entries: &[(&str, ImportHandler)] = &[
-        ("QueryInterface", di_query_interface),
-        ("AddRef", stdcall_one_1),
-        ("Release", stdcall_zero_1),
-        ("DI8_CreateDevice", di8_create_device),
-        ("DI8_EnumDevices", stdcall_zero_5),
-        ("DIDev8_GetDeviceState", didev8_get_device_state),
-        ("DIDev8_GetDeviceData", didev8_get_device_data),
-        ("Std0_1", stdcall_zero_1),
-        ("Std0_2", stdcall_zero_2),
-        ("Std0_3", stdcall_zero_3),
-        ("Std0_4", stdcall_zero_4),
-        ("Std0_5", stdcall_zero_5),
-    ];
-    for &(name, handler) in di_com_entries {
-        registry.register_name(DINPUT8_COM_DLL, name, handler);
-    }
 
     let ds_com_entries: &[(&str, ImportHandler)] = &[
         ("QueryInterface", ds_query_interface),
@@ -282,117 +260,6 @@ fn alloc_com_object(
     let obj = ctx.heap.alloc(ctx.arena, 4 + extra_bytes, true)?;
     ctx.arena.write_u32(obj, vtable)?;
     Ok(obj)
-}
-
-fn direct_input_8_create(
-    ctx: &mut RuntimeContext<'_>,
-    cpu: &mut GuestCpuState,
-) -> Result<(), RuntimeError> {
-    let ppv_out = peek_arg_u32(cpu, ctx.arena, 3)?;
-    if ppv_out == 0 {
-        return_stdcall(cpu, ctx.arena, 5, E_FAIL)?;
-        return Ok(());
-    }
-    const DI8_SLOTS: [&str; DI8_VTABLE_SLOTS] = [
-        "QueryInterface",
-        "AddRef",
-        "Release",
-        "DI8_CreateDevice",
-        "DI8_EnumDevices",
-        "Std0_2",
-        "Std0_3",
-        "Std0_4",
-    ];
-    let obj = alloc_com_object(ctx, DINPUT8_COM_DLL, &DI8_SLOTS, 0)?;
-    ctx.arena.write_u32(ppv_out, obj)?;
-    return_stdcall(cpu, ctx.arena, 5, S_OK)?;
-    Ok(())
-}
-
-fn di_query_interface(
-    ctx: &mut RuntimeContext<'_>,
-    cpu: &mut GuestCpuState,
-) -> Result<(), RuntimeError> {
-    let ppv = peek_arg_u32(cpu, ctx.arena, 2)?;
-    if ppv != 0 {
-        ctx.arena.write_u32(ppv, 0)?;
-    }
-    return_stdcall(cpu, ctx.arena, 3, E_NOINTERFACE)?;
-    Ok(())
-}
-
-fn di8_create_device(
-    ctx: &mut RuntimeContext<'_>,
-    cpu: &mut GuestCpuState,
-) -> Result<(), RuntimeError> {
-    let pp_dev = peek_arg_u32(cpu, ctx.arena, 2)?;
-    if pp_dev == 0 {
-        return_stdcall(cpu, ctx.arena, 4, E_FAIL)?;
-        return Ok(());
-    }
-    const DIDEV8_SLOTS: [&str; DIDEV8_VTABLE_SLOTS] = [
-        "QueryInterface",
-        "AddRef",
-        "Release",
-        "Std0_2",
-        "Std0_4",
-        "Std0_3",
-        "Std0_3",
-        "Std0_1",
-        "Std0_1",
-        "DIDev8_GetDeviceState",
-        "DIDev8_GetDeviceData",
-        "Std0_2",
-        "Std0_2",
-        "Std0_3",
-        "Std0_4",
-        "Std0_2",
-        "Std0_3",
-        "Std0_4",
-        "Std0_5",
-        "Std0_4",
-        "Std0_4",
-        "Std0_3",
-        "Std0_1",
-        "Std0_1",
-        "Std0_2",
-        "Std0_1",
-        "Std0_1",
-        "Std0_4",
-        "Std0_4",
-        "Std0_4",
-        "Std0_2",
-        "Std0_4",
-    ];
-    let dev_obj = alloc_com_object(ctx, DINPUT8_COM_DLL, &DIDEV8_SLOTS, 0)?;
-    ctx.arena.write_u32(pp_dev, dev_obj)?;
-    return_stdcall(cpu, ctx.arena, 4, S_OK)?;
-    Ok(())
-}
-
-fn didev8_get_device_state(
-    ctx: &mut RuntimeContext<'_>,
-    cpu: &mut GuestCpuState,
-) -> Result<(), RuntimeError> {
-    let cb_data = peek_arg_u32(cpu, ctx.arena, 1)?;
-    let lpv_data = peek_arg_u32(cpu, ctx.arena, 2)?;
-    if lpv_data != 0 && cb_data > 0 && cb_data <= 4096 {
-        ctx.arena.zero_range(lpv_data, cb_data as usize)?;
-    }
-    return_stdcall(cpu, ctx.arena, 3, S_OK)?;
-    Ok(())
-}
-
-fn didev8_get_device_data(
-    ctx: &mut RuntimeContext<'_>,
-    cpu: &mut GuestCpuState,
-) -> Result<(), RuntimeError> {
-    let pdw_inout = peek_arg_u32(cpu, ctx.arena, 3)?;
-    if pdw_inout != 0 {
-        ctx.arena.write_u32(pdw_inout, 0)?;
-    }
-    return_stdcall(cpu, ctx.arena, 5, S_OK)?;
-    Ok(())
 }
 
 fn alloc_ds3d_listener(ctx: &mut RuntimeContext<'_>) -> Result<GuestAddr, RuntimeError> {

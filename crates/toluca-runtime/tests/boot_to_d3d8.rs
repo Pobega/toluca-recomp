@@ -426,6 +426,7 @@ fn milestone_gate_boots_synthetic_pe_through_window_pump_to_direct3d_create8() {
         max_frames: None,
         command_line: "sh2pc.exe".to_owned(),
         exe_name: "sh2pc.exe".to_owned(),
+        script_keys: Vec::new(),
     };
 
     let mut rt = Runtime::load_from_bytes_with_config(pe_bytes, &tmp.aot_path, registry, config)

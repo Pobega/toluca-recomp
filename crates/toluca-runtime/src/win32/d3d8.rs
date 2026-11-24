@@ -180,6 +180,7 @@ pub fn dispatch_com_call(
             }
             if iface == ComInterfaceId::Direct3DDevice8 && method_idx == 15 {
                 ctx.win32.d3d8_present_calls += 1;
+                crate::win32::dinput8::sync_scripted_keys_for_frame(ctx);
                 if ctx
                     .win32
                     .config

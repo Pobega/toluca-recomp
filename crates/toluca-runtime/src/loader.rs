@@ -171,6 +171,41 @@ impl AotCodeImage {
         let base = self.code_base.map_or(0, |p| p.as_ptr() as usize);
         (base, base.saturating_add(self.code_len))
     }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        use toluca_core::aot::{AotHeader, SectionEntry};
+        Self {
+            manifest: AotManifest {
+                header: AotHeader {
+                    magic: *b"TLCA",
+                    format_version: 1,
+                    arch: 1,
+                    flags: 0,
+                    section_count: 0,
+                    source_sha1: [0; 20],
+                    entry_guest_va: 0,
+                    image_base: 0,
+                    payload_crc32: 0,
+                    total_file_size: 0,
+                    reserved: [0; 8],
+                },
+                code_section: SectionEntry {
+                    kind: 1,
+                    flags: 0,
+                    file_offset: 0,
+                    byte_len: 0,
+                    entry_count: 0,
+                    crc32: 0,
+                },
+                dispatch: Vec::new(),
+                relocations: Vec::new(),
+                imports: Vec::new(),
+            },
+            code_base: None,
+            code_len: 0,
+        }
+    }
 }
 
 impl Drop for AotCodeImage {

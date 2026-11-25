@@ -406,6 +406,27 @@ pub fn pin_current_thread_to_host_cores() {
     }
 }
 
+pub struct HostCoresGuard;
+
+impl HostCoresGuard {
+    pub fn new() -> Self {
+        pin_current_thread_to_host_cores();
+        Self
+    }
+}
+
+impl Default for HostCoresGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for HostCoresGuard {
+    fn drop(&mut self) {
+        pin_current_thread_to_guest_core();
+    }
+}
+
 pub fn apply_host_thread_priority(os_tid: libc::pid_t, win32_priority: i32) {
     #[cfg(target_os = "linux")]
     {
@@ -424,11 +445,12 @@ pub fn apply_host_thread_priority(os_tid: libc::pid_t, win32_priority: i32) {
             libc::sched_setscheduler(os_tid, libc::SCHED_OTHER, &param);
         }
         let nice = match win32_priority {
-            -14..=-2 => 15,
+            ..=-2 => 15,
             -1 => 5,
             0 => 0,
-            1 => -4,
-            _ => -10,
+            1 => -2,
+            2..=14 => -14,
+            15.. => -19,
         };
         unsafe {
             libc::setpriority(libc::PRIO_PROCESS, os_tid as libc::id_t, nice);

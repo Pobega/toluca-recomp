@@ -157,7 +157,11 @@ fn maybe_attach_gles3(ctx: &mut RuntimeContext<'_>, focus_hwnd: u32) {
     };
 
     let cache_path = ctx.win32.config.shader_cache_path.clone();
-    match Gles3Backend::new(Some(get_proc), present_target, cache_path) {
+    let backend_res = {
+        let _host_cores = crate::win32::HostCoresGuard::new();
+        Gles3Backend::new(Some(get_proc), present_target, cache_path)
+    };
+    match backend_res {
         Ok(mut backend) => {
             backend.set_aspect_mode(ctx.win32.config.aspect_mode);
             ctx.win32.d3d8.replace_backend(Box::new(backend));

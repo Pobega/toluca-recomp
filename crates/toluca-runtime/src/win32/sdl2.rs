@@ -456,20 +456,24 @@ impl Sdl2WindowBackend {
 
         let init_subsystem_fn = load_sym::<SdlInitSubSystemFn>(lib_handle, c"SDL_InitSubSystem");
         let mut gamecontroller_inited = false;
-        if no_gamepad {
-            if unsafe { init_fn(SDL_INIT_VIDEO) } != 0 {
-                unsafe { libc::dlclose(lib_handle) };
-                return None;
-            }
-        } else {
-            gamecontroller_inited = unsafe { init_fn(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) } == 0;
-            if !gamecontroller_inited {
+        {
+            let _host_cores = crate::win32::HostCoresGuard::new();
+            if no_gamepad {
                 if unsafe { init_fn(SDL_INIT_VIDEO) } != 0 {
                     unsafe { libc::dlclose(lib_handle) };
                     return None;
                 }
-                if let Some(init_sub) = init_subsystem_fn {
-                    gamecontroller_inited = unsafe { init_sub(SDL_INIT_GAMECONTROLLER) } == 0;
+            } else {
+                gamecontroller_inited =
+                    unsafe { init_fn(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) } == 0;
+                if !gamecontroller_inited {
+                    if unsafe { init_fn(SDL_INIT_VIDEO) } != 0 {
+                        unsafe { libc::dlclose(lib_handle) };
+                        return None;
+                    }
+                    if let Some(init_sub) = init_subsystem_fn {
+                        gamecontroller_inited = unsafe { init_sub(SDL_INIT_GAMECONTROLLER) } == 0;
+                    }
                 }
             }
         }
@@ -728,6 +732,7 @@ impl Sdl2WindowBackend {
         &mut self,
         window: *mut c_void,
     ) -> Option<(GlGetProcAddrFn, Box<dyn PresentTarget>)> {
+        let _host_cores = crate::win32::HostCoresGuard::new();
         if window.is_null() {
             return None;
         }
@@ -736,9 +741,7 @@ impl Sdl2WindowBackend {
         let swap_window = self.gl_swap_window_fn?;
         let get_proc = self.gl_get_proc_addr_fn?;
 
-        crate::win32::pin_current_thread_to_host_cores();
         let ctx = unsafe { create_ctx(window) };
-        crate::win32::pin_current_thread_to_guest_core();
         if ctx.is_null() {
             return None;
         }
@@ -780,6 +783,7 @@ impl Sdl2WindowBackend {
         height: i32,
         fullscreen: bool,
     ) -> Option<*mut c_void> {
+        let _host_cores = crate::win32::HostCoresGuard::new();
         self.configure_gles3_attributes();
         let c_title = CString::new(title).unwrap_or_else(|_| CString::new("toluca-runtime").unwrap());
         let w = width.max(1);
@@ -1014,6 +1018,7 @@ impl Sdl2WindowBackend {
         callback: SdlAudioCallback,
         userdata: T,
     ) -> Option<Sdl2AudioDevice> {
+        let _host_cores = crate::win32::HostCoresGuard::new();
         let open_fn = self.open_audio_device_fn?;
         let pause_fn = self.pause_audio_device_fn?;
         let close_fn = self.close_audio_device_fn?;
@@ -1039,7 +1044,6 @@ impl Sdl2WindowBackend {
             userdata: boxed,
         };
         let mut obtained = unsafe { std::mem::zeroed::<SdlAudioSpec>() };
-        crate::win32::pin_current_thread_to_host_cores();
         let dev_id = unsafe {
             open_fn(
                 std::ptr::null(),
@@ -1049,7 +1053,6 @@ impl Sdl2WindowBackend {
                 SDL_AUDIO_ALLOW_FREQUENCY_CHANGE,
             )
         };
-        crate::win32::pin_current_thread_to_guest_core();
         if dev_id == 0 {
             unsafe {
                 drop(Box::from_raw(boxed.cast::<T>()));

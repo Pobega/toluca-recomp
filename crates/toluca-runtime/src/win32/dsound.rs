@@ -237,6 +237,10 @@ impl DsoundMixer {
         self.aux_played_frames
     }
 
+    pub fn aux_queued_frames(&self) -> usize {
+        self.aux_pcm.len() / OUTPUT_CHANNELS
+    }
+
     pub fn output_sample_rate(&self) -> u32 {
         self.output_sample_rate
     }

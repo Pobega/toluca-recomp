@@ -1225,13 +1225,13 @@ fn should_wait_for_frame(
     if inst.sound_on {
         if let Ok(mixer) = mixer_mutex.lock() {
             let played = mixer.aux_played_frames();
-            if mixer.hardware_clocked && played > inst.start_audio_frames {
-                const ALSA_PERIODS_AHEAD: u64 = 2;
-                let latency_frames = u64::from(mixer.output_buffer_frames()) * ALSA_PERIODS_AHEAD;
-                let audible_frames =
-                    (played - inst.start_audio_frames).saturating_sub(latency_frames);
+            if mixer.hardware_clocked
+                && played > inst.start_audio_frames
+                && mixer.aux_queued_frames() > 0
+            {
+                let elapsed_frames = played - inst.start_audio_frames;
                 let rate = u128::from(mixer.output_sample_rate().max(1));
-                let elapsed_ns = u128::from(audible_frames) * 1_000_000_000 / rate;
+                let elapsed_ns = u128::from(elapsed_frames) * 1_000_000_000 / rate;
                 let target_ns = inst.header.frame_duration().as_nanos()
                     * u128::from(inst.frame_num.saturating_sub(1));
                 return elapsed_ns < target_ns;
@@ -1634,5 +1634,66 @@ mod tests {
 
         let (_, disabled) = select_audio_track(&hdr, &[], true);
         assert!(disabled.is_none());
+    }
+
+    #[test]
+    fn should_wait_for_frame_tracks_audio_clock_without_holdback_and_falls_back_when_drained() {
+        let header = BinkHeader {
+            magic: *b"BIKi",
+            file_size: 1024,
+            num_frames: 60,
+            largest_frame_size: 256,
+            width: 640,
+            height: 480,
+            fps_num: 30,
+            fps_den: 1,
+            video_flags: 0,
+            audio_tracks: vec![BinkAudioTrack {
+                track_id: 0,
+                sample_rate: 48_000,
+                channels: 2,
+            }],
+        };
+
+        let mixer_mutex = std::sync::Mutex::new(DsoundMixer::new());
+        {
+            let mut mixer = mixer_mutex.lock().unwrap();
+            mixer.hardware_clocked = true;
+            mixer.output_sample_rate = 48_000;
+            mixer.aux_played_frames = 5_799; // 4,799 frames past start (< 4,800 needed for frame 4 @ 30fps)
+            mixer.push_aux_pcm(&[1, 2], 48_000, 2);
+        }
+
+        let mut inst = BinkInstance {
+            header,
+            open_flags: 0,
+            frame_num: 4, // (4 - 1) * (1/30 s) = 100 ms = 4,800 frames @ 48 kHz
+            last_frame_num: 3,
+            paused: false,
+            sound_on: true,
+            selected_audio_track: None,
+            next_frame_due: Instant::now() + Duration::from_secs(5),
+            start_audio_frames: 1_000,
+            decoder: None,
+            current_frame: None,
+        };
+
+        // Steady state: 4,799 frames played -> waits; 4,800 frames played -> advances immediately (no 85ms holdback).
+        assert!(should_wait_for_frame(&inst, &mixer_mutex));
+        mixer_mutex.lock().unwrap().aux_played_frames = 5_800;
+        assert!(!should_wait_for_frame(&inst, &mixer_mutex));
+
+        // End-of-FMV: aux_pcm drained, audio clock behind frame_num -> falls back to next_frame_due without hanging.
+        {
+            let mut mixer = mixer_mutex.lock().unwrap();
+            mixer.clear_aux_pcm();
+            mixer.aux_played_frames = 1_100;
+            assert_eq!(mixer.aux_queued_frames(), 0);
+        }
+        inst.frame_num = 10;
+        inst.next_frame_due = Instant::now() - Duration::from_millis(1);
+        assert!(!should_wait_for_frame(&inst, &mixer_mutex));
+        inst.next_frame_due = Instant::now() + Duration::from_millis(50);
+        assert!(should_wait_for_frame(&inst, &mixer_mutex));
     }
 }

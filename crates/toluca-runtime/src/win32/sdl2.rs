@@ -75,7 +75,86 @@ const SDL_CONTROLLER_AXIS_TRIGGERLEFT: i32 = 4;
 const SDL_CONTROLLER_AXIS_TRIGGERRIGHT: i32 = 5;
 
 const SDL_SCANCODE_A: i32 = 4;
+const SDL_SCANCODE_L: usize = 15;
 const SDL_SCANCODE_Z: i32 = 29;
+
+// SH2 PC default DirectInput 8 gamepad button indices (0-based rgbButtons[]).
+const DI_BTN_ACTION: usize = 0;
+const DI_BTN_RUN: usize = 1;
+const DI_BTN_HEALTH: usize = 2;
+const DI_BTN_CANCEL: usize = 3;
+const DI_BTN_MAP: usize = 4;
+const DI_BTN_SEARCH: usize = 6;
+const DI_BTN_READY_WEAPON: usize = 7;
+const DI_BTN_INVENTORY: usize = 8;
+const DI_BTN_PAUSE: usize = 9;
+const DI_BTN_FLASHLIGHT: usize = 10;
+const DI_BTN_RELOAD: usize = 11;
+const DI_BTN_STEP_LEFT: usize = 12;
+const DI_BTN_STEP_RIGHT: usize = 13;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GamepadConfig {
+    pub disabled: bool,
+    pub nintendo_buttons: bool,
+    pub swap_shoulders: bool,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct RawGamepadButtons {
+    a: bool,
+    b: bool,
+    x: bool,
+    y: bool,
+    l1: bool,
+    r1: bool,
+    l2: bool,
+    r2: bool,
+    back: bool,
+    start: bool,
+    l3: bool,
+    r3: bool,
+}
+
+fn map_sh2_gamepad_inputs(
+    raw: RawGamepadButtons,
+    config: GamepadConfig,
+) -> ([bool; SDL_GAMEPAD_BUTTON_COUNT], bool) {
+    let (south, east, west, north) = if config.nintendo_buttons {
+        // Nintendo-labeled SDL2 controller mappings (e.g. ANBERNIC-keys) bind
+        // printed A/B/X/Y to SDL A/B/X/Y (East/South/North/West).
+        (raw.b, raw.a, raw.y, raw.x)
+    } else {
+        (raw.a, raw.b, raw.x, raw.y)
+    };
+
+    let (search, aim, step_left, step_right) = if config.swap_shoulders {
+        (raw.l1, raw.r1, raw.l2, raw.r2)
+    } else {
+        (raw.l2, raw.r2, raw.l1, raw.r1)
+    };
+
+    let mut buttons = [false; SDL_GAMEPAD_BUTTON_COUNT];
+    buttons[DI_BTN_ACTION] = south;
+    buttons[DI_BTN_CANCEL] = east;
+    buttons[DI_BTN_RUN] = west;
+    buttons[DI_BTN_MAP] = north && !aim;
+    buttons[DI_BTN_SEARCH] = search;
+    buttons[DI_BTN_READY_WEAPON] = aim;
+    buttons[DI_BTN_STEP_LEFT] = step_left;
+    buttons[DI_BTN_STEP_RIGHT] = step_right;
+    buttons[DI_BTN_INVENTORY] = raw.back;
+    buttons[DI_BTN_PAUSE] = raw.start;
+    buttons[DI_BTN_FLASHLIGHT] = raw.l3;
+    buttons[DI_BTN_HEALTH] = raw.r3;
+    buttons[DI_BTN_RELOAD] = aim && north;
+
+    // Pair East (Cancel) with keyboard DIK_L (Flashlight) so East restores PS2
+    // Circle behavior (Cancel in menus, Flashlight in gameplay) without opening
+    // the PC Esc menu or triggering SH2's Room 312 Cancel/Flashlight lock.
+    let synth_flashlight_key = east;
+    (buttons, synth_flashlight_key)
+}
 const SDL_SCANCODE_1: i32 = 30;
 const SDL_SCANCODE_9: i32 = 38;
 const SDL_SCANCODE_0: i32 = 39;
@@ -407,7 +486,7 @@ pub struct Sdl2WindowBackend {
     windows: Vec<*mut c_void>,
     window_sizes: std::collections::HashMap<usize, (u32, u32)>,
     audio_inited: bool,
-    no_gamepad: bool,
+    gamepad_config: GamepadConfig,
     gamecontroller_inited: bool,
     active_controller: Option<*mut c_void>,
     key_scancodes: [bool; SDL_SCANCODE_COUNT],
@@ -415,7 +494,7 @@ pub struct Sdl2WindowBackend {
 }
 
 impl Sdl2WindowBackend {
-    pub fn try_init(headless: bool, no_gamepad: bool) -> Option<Self> {
+    pub fn try_init(headless: bool, gamepad_config: GamepadConfig) -> Option<Self> {
         if headless {
             return None;
         }
@@ -458,7 +537,7 @@ impl Sdl2WindowBackend {
         let mut gamecontroller_inited = false;
         {
             let _host_cores = crate::win32::HostCoresGuard::new();
-            if no_gamepad {
+            if gamepad_config.disabled {
                 if unsafe { init_fn(SDL_INIT_VIDEO) } != 0 {
                     unsafe { libc::dlclose(lib_handle) };
                     return None;
@@ -569,14 +648,14 @@ impl Sdl2WindowBackend {
             windows: Vec::new(),
             window_sizes: std::collections::HashMap::new(),
             audio_inited: false,
-            no_gamepad,
+            gamepad_config,
             gamecontroller_inited,
             active_controller: None,
             key_scancodes: [false; SDL_SCANCODE_COUNT],
             mouse_wheel_delta: 0,
         };
 
-        if !backend.no_gamepad && backend.gamecontroller_inited {
+        if !backend.gamepad_config.disabled && backend.gamecontroller_inited {
             backend.load_controller_mapping_files();
             backend.open_first_controller();
         }
@@ -624,7 +703,7 @@ impl Sdl2WindowBackend {
     }
 
     fn open_first_controller(&mut self) {
-        if self.no_gamepad || self.active_controller.is_some() {
+        if self.gamepad_config.disabled || self.active_controller.is_some() {
             return;
         }
         let Some(num_joysticks) = self.num_joysticks_fn else {
@@ -639,7 +718,7 @@ impl Sdl2WindowBackend {
     }
 
     fn try_open_controller_at(&mut self, device_index: i32) -> bool {
-        if self.no_gamepad || self.active_controller.is_some() {
+        if self.gamepad_config.disabled || self.active_controller.is_some() {
             return false;
         }
         let Some(is_gc) = self.is_game_controller_fn else {
@@ -695,7 +774,7 @@ impl Sdl2WindowBackend {
     }
 
     pub fn init_controller_subsystem(&mut self) -> bool {
-        if self.no_gamepad {
+        if self.gamepad_config.disabled {
             return false;
         }
         if self.gamecontroller_inited {
@@ -928,10 +1007,14 @@ impl Sdl2WindowBackend {
         };
         let mouse_dz = std::mem::take(&mut self.mouse_wheel_delta);
 
-        let gamepad = self.read_gamepad_snapshot();
+        let (gamepad, synth_flashlight_key) = self.read_gamepad_snapshot();
+        let mut key_scancodes = self.key_scancodes;
+        if synth_flashlight_key {
+            key_scancodes[SDL_SCANCODE_L] = true;
+        }
 
         SdlInputSnapshot {
-            key_scancodes: self.key_scancodes,
+            key_scancodes,
             mouse_dx,
             mouse_dy,
             mouse_dz,
@@ -940,8 +1023,10 @@ impl Sdl2WindowBackend {
         }
     }
 
-    fn read_gamepad_snapshot(&mut self) -> Option<GamepadSnapshot> {
-        let ctrl = self.active_controller?;
+    fn read_gamepad_snapshot(&mut self) -> (Option<GamepadSnapshot>, bool) {
+        let Some(ctrl) = self.active_controller else {
+            return (None, false);
+        };
         if let Some(update) = self.gc_update_fn {
             unsafe {
                 update();
@@ -963,7 +1048,11 @@ impl Sdl2WindowBackend {
             }
         }
 
-        let mut buttons = [false; SDL_GAMEPAD_BUTTON_COUNT];
+        let mut raw = RawGamepadButtons {
+            l2: axes[4] > SDL_TRIGGER_DIGITAL_THRESHOLD,
+            r2: axes[5] > SDL_TRIGGER_DIGITAL_THRESHOLD,
+            ..RawGamepadButtons::default()
+        };
         let mut dpad_up = false;
         let mut dpad_down = false;
         let mut dpad_left = false;
@@ -971,31 +1060,33 @@ impl Sdl2WindowBackend {
 
         if let Some(get_btn) = self.gc_get_button_fn {
             let pressed = |btn: i32| unsafe { get_btn(ctrl, btn) != 0 };
-            buttons[0] = pressed(SDL_CONTROLLER_BUTTON_A);
-            buttons[1] = pressed(SDL_CONTROLLER_BUTTON_B);
-            buttons[2] = pressed(SDL_CONTROLLER_BUTTON_X);
-            buttons[3] = pressed(SDL_CONTROLLER_BUTTON_Y);
-            buttons[4] = pressed(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
-            buttons[5] = pressed(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
-            buttons[6] = pressed(SDL_CONTROLLER_BUTTON_BACK);
-            buttons[7] = pressed(SDL_CONTROLLER_BUTTON_START);
-            buttons[10] = pressed(SDL_CONTROLLER_BUTTON_LEFTSTICK);
-            buttons[11] = pressed(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+            raw.a = pressed(SDL_CONTROLLER_BUTTON_A);
+            raw.b = pressed(SDL_CONTROLLER_BUTTON_B);
+            raw.x = pressed(SDL_CONTROLLER_BUTTON_X);
+            raw.y = pressed(SDL_CONTROLLER_BUTTON_Y);
+            raw.l1 = pressed(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+            raw.r1 = pressed(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+            raw.back = pressed(SDL_CONTROLLER_BUTTON_BACK);
+            raw.start = pressed(SDL_CONTROLLER_BUTTON_START);
+            raw.l3 = pressed(SDL_CONTROLLER_BUTTON_LEFTSTICK);
+            raw.r3 = pressed(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
             dpad_up = pressed(SDL_CONTROLLER_BUTTON_DPAD_UP);
             dpad_down = pressed(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
             dpad_left = pressed(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
             dpad_right = pressed(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
         }
 
-        buttons[8] = axes[4] > SDL_TRIGGER_DIGITAL_THRESHOLD;
-        buttons[9] = axes[5] > SDL_TRIGGER_DIGITAL_THRESHOLD;
+        let (buttons, synth_flashlight_key) = map_sh2_gamepad_inputs(raw, self.gamepad_config);
         apply_dpad_to_left_stick(&mut axes, dpad_up, dpad_down, dpad_left, dpad_right);
 
-        Some(GamepadSnapshot {
-            axes,
-            dpad_hat: dpad_to_pov(dpad_up, dpad_down, dpad_left, dpad_right),
-            buttons,
-        })
+        (
+            Some(GamepadSnapshot {
+                axes,
+                dpad_hat: dpad_to_pov(dpad_up, dpad_down, dpad_left, dpad_right),
+                buttons,
+            }),
+            synth_flashlight_key,
+        )
     }
 
     pub fn set_controller_rumble(
@@ -1293,9 +1384,19 @@ mod tests {
 
     #[test]
     fn headless_returns_none_and_scancode_mapping_matches_win32_vk() {
-        assert!(Sdl2WindowBackend::try_init(true, false).is_none());
-        assert!(Sdl2WindowBackend::try_init(true, true).is_none());
+        assert!(Sdl2WindowBackend::try_init(true, GamepadConfig::default()).is_none());
+        assert!(
+            Sdl2WindowBackend::try_init(
+                true,
+                GamepadConfig {
+                    disabled: true,
+                    ..GamepadConfig::default()
+                }
+            )
+            .is_none()
+        );
         assert_eq!(scancode_to_vk(SDL_SCANCODE_A), Some(b'A'));
+        assert_eq!(scancode_to_vk(SDL_SCANCODE_L as i32), Some(b'L'));
         assert_eq!(scancode_to_vk(SDL_SCANCODE_Z), Some(b'Z'));
         assert_eq!(scancode_to_vk(SDL_SCANCODE_0), Some(b'0'));
         assert_eq!(scancode_to_vk(SDL_SCANCODE_1), Some(b'1'));
@@ -1332,5 +1433,82 @@ mod tests {
         apply_dpad_to_left_stick(&mut active_stick, false, true, true, false);
         assert_eq!(active_stick[0], 15000);
         assert_eq!(active_stick[1], -15000);
+    }
+
+    #[test]
+    fn map_sh2_gamepad_inputs_supports_standard_and_nintendo_clamshell_layouts() {
+        // Standard SDL2 (Xbox/PS positional) + PS2 shoulders.
+        let std_cfg = GamepadConfig::default();
+        let (btns, flash) = map_sh2_gamepad_inputs(
+            RawGamepadButtons {
+                a: true,
+                l1: true,
+                l2: true,
+                back: true,
+                start: true,
+                ..RawGamepadButtons::default()
+            },
+            std_cfg,
+        );
+        assert!(btns[DI_BTN_ACTION]);
+        assert!(btns[DI_BTN_STEP_LEFT]);
+        assert!(btns[DI_BTN_SEARCH]);
+        assert!(btns[DI_BTN_INVENTORY]);
+        assert!(btns[DI_BTN_PAUSE]);
+        assert!(!flash);
+
+        // East (SDL_B on Xbox/PS) asserts Cancel + synthetic DIK_L Flashlight.
+        let (btns, flash) = map_sh2_gamepad_inputs(
+            RawGamepadButtons {
+                b: true,
+                ..RawGamepadButtons::default()
+            },
+            std_cfg,
+        );
+        assert!(btns[DI_BTN_CANCEL]);
+        assert!(!btns[DI_BTN_ACTION]);
+        assert!(flash);
+
+        // Nintendo-labeled (ANBERNIC-keys) + clamshell swapped shoulders.
+        let rgsp_cfg = GamepadConfig {
+            disabled: false,
+            nintendo_buttons: true,
+            swap_shoulders: true,
+        };
+        let (btns, flash) = map_sh2_gamepad_inputs(
+            RawGamepadButtons {
+                a: true,  // physical East (A) -> Cancel + Flashlight
+                b: true,  // physical South (B) -> Action
+                x: true,  // physical North (X) -> Map (or Reload when Aim held)
+                y: true,  // physical West (Y) -> Run
+                l1: true, // Search View
+                l2: true, // Step Left
+                r2: true, // Step Right
+                ..RawGamepadButtons::default()
+            },
+            rgsp_cfg,
+        );
+        assert!(btns[DI_BTN_ACTION]);
+        assert!(btns[DI_BTN_CANCEL]);
+        assert!(flash);
+        assert!(btns[DI_BTN_RUN]);
+        assert!(btns[DI_BTN_MAP]);
+        assert!(btns[DI_BTN_SEARCH]);
+        assert!(btns[DI_BTN_STEP_LEFT]);
+        assert!(btns[DI_BTN_STEP_RIGHT]);
+        assert!(!btns[DI_BTN_RELOAD]);
+
+        // Aim (R1 on swapped shoulders) + North (X) -> Reload without opening Map.
+        let (btns, _) = map_sh2_gamepad_inputs(
+            RawGamepadButtons {
+                r1: true,
+                x: true,
+                ..RawGamepadButtons::default()
+            },
+            rgsp_cfg,
+        );
+        assert!(btns[DI_BTN_READY_WEAPON]);
+        assert!(btns[DI_BTN_RELOAD]);
+        assert!(!btns[DI_BTN_MAP]);
     }
 }

@@ -71,6 +71,8 @@ pub struct Win32Config {
     pub game_root: PathBuf,
     pub headless: bool,
     pub no_gamepad: bool,
+    pub nintendo_buttons: bool,
+    pub swap_shoulders: bool,
     pub trace_imports: bool,
     pub trace_d3d8: bool,
     pub shader_cache_path: Option<PathBuf>,
@@ -90,6 +92,8 @@ impl Default for Win32Config {
             game_root: PathBuf::from("."),
             headless: false,
             no_gamepad: false,
+            nintendo_buttons: false,
+            swap_shoulders: false,
             trace_imports: false,
             trace_d3d8: false,
             shader_cache_path: None,
@@ -729,7 +733,7 @@ pub struct WindowManager {
 }
 
 impl WindowManager {
-    pub fn new(headless: bool, no_gamepad: bool) -> Self {
+    pub fn new(headless: bool, gamepad_config: sdl2::GamepadConfig) -> Self {
         Self {
             registered_classes: HashMap::new(),
             class_atoms: HashMap::new(),
@@ -744,7 +748,7 @@ impl WindowManager {
             cursor_count: 0,
             current_cursor: 0,
             key_states: [false; 256],
-            sdl: sdl2::Sdl2WindowBackend::try_init(headless, no_gamepad),
+            sdl: sdl2::Sdl2WindowBackend::try_init(headless, gamepad_config),
         }
     }
 
@@ -802,7 +806,11 @@ impl Win32State {
     pub fn new(config: Win32Config) -> Self {
         let current_dir = config.game_root.clone();
         let headless = config.headless;
-        let no_gamepad = config.no_gamepad;
+        let gamepad_config = sdl2::GamepadConfig {
+            disabled: config.no_gamepad,
+            nintendo_buttons: config.nintendo_buttons,
+            swap_shoulders: config.swap_shoulders,
+        };
         let dinput8 = dinput8::Dinput8State::new(&config.script_keys);
         let dsound = dsound::DsoundState::new();
         let bink = binkw32::BinkState::new();
@@ -823,7 +831,7 @@ impl Win32State {
             dinput8,
             dsound,
             bink,
-            window_mgr: WindowManager::new(headless, no_gamepad),
+            window_mgr: WindowManager::new(headless, gamepad_config),
             d3d8_create_calls: Vec::new(),
             d3d8_present_calls: 0,
             exit_code: None,

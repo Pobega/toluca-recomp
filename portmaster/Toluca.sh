@@ -110,16 +110,24 @@ fi
 
 EXTRA_ARGS=()
 GPTOKEYB_KBD_CMD="${GPTOKEYB:-${GPTOKEYB2:-}}"
-GPTOKEYB_KILL_CMD="${GPTOKEYB2:-${GPTOKEYB:-}}"
-if [ "${TOLUCA_NATIVE_GAMEPAD:-0}" != "1" ] && [ -f "$GAMEDIR/toluca.gptk" ] && [ -n "$GPTOKEYB_KBD_CMD" ]; then
+GPTOKEYB_KILL_CMD="${GPTOKEYB:-${GPTOKEYB2:-}}"
+if [ "${TOLUCA_NATIVE_GAMEPAD:-1}" != "1" ] && [ -f "$GAMEDIR/toluca.gptk" ] && [ -n "$GPTOKEYB_KBD_CMD" ]; then
   export GT_REMAP_GPTK="$GAMEDIR/toluca.gptk"
   # shellcheck disable=SC2086
   $GPTOKEYB_KBD_CMD "toluca-runtime" -c "$GAMEDIR/toluca.gptk" &
   sleep 0.2
   EXTRA_ARGS+=(--no-gamepad)
-elif [ -n "$GPTOKEYB_KILL_CMD" ]; then
-  # shellcheck disable=SC2086
-  $GPTOKEYB_KILL_CMD "toluca-runtime" &
+else
+  if [ "${TOLUCA_NINTENDO_BUTTONS:-1}" = "1" ]; then
+    EXTRA_ARGS+=(--nintendo-buttons)
+  fi
+  if [ "${TOLUCA_SWAP_SHOULDERS:-1}" = "1" ]; then
+    EXTRA_ARGS+=(--swap-shoulders)
+  fi
+  if [ -n "$GPTOKEYB_KILL_CMD" ]; then
+    # shellcheck disable=SC2086
+    $GPTOKEYB_KILL_CMD "toluca-runtime" &
+  fi
 fi
 
 pm_platform_helper "$GAMEDIR/bin/toluca-runtime"

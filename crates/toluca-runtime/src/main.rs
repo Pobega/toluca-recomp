@@ -18,6 +18,8 @@ struct CliArgs {
     script_keys: Vec<ScriptedKeyEvent>,
     headless: bool,
     no_gamepad: bool,
+    nintendo_buttons: bool,
+    swap_shoulders: bool,
     trace_imports: bool,
     trace_d3d8: bool,
     fullscreen: bool,
@@ -64,6 +66,8 @@ fn main() -> ExitCode {
         game_root,
         headless: opts.headless,
         no_gamepad: opts.no_gamepad,
+        nintendo_buttons: opts.nintendo_buttons,
+        swap_shoulders: opts.swap_shoulders,
         trace_imports: opts.trace_imports,
         trace_d3d8: opts.trace_d3d8,
         shader_cache_path: shader_cache_path.clone(),
@@ -217,6 +221,8 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
     let mut script_keys: Vec<ScriptedKeyEvent> = Vec::new();
     let mut headless = false;
     let mut no_gamepad = false;
+    let mut nintendo_buttons = false;
+    let mut swap_shoulders = false;
     let mut trace_imports = false;
     let mut trace_d3d8 = false;
     let mut fullscreen = false;
@@ -230,6 +236,8 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         match arg {
             "--headless" => headless = true,
             "--no-gamepad" => no_gamepad = true,
+            "--nintendo-buttons" => nintendo_buttons = true,
+            "--swap-shoulders" => swap_shoulders = true,
             "--trace-imports" => trace_imports = true,
             "--trace-d3d8" => trace_d3d8 = true,
             "--fullscreen" => fullscreen = true,
@@ -306,6 +314,8 @@ fn parse_args(args: &[String]) -> Option<CliArgs> {
         script_keys,
         headless,
         no_gamepad,
+        nintendo_buttons,
+        swap_shoulders,
         trace_imports,
         trace_d3d8,
         fullscreen,
@@ -319,7 +329,7 @@ fn print_usage(args: &[String]) {
     let bin = args.first().map(String::as_str).unwrap_or("toluca-runtime");
     eprintln!("Usage:");
     eprintln!(
-        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--script-keys <SPEC>] [--fullscreen] [--width <W>] [--height <H>] [--aspect <4:3|16:9|stretch>] [--headless] [--no-gamepad] [--trace-imports] [--trace-d3d8]"
+        "  {bin} <exe-path> <aot-path> [--game-dir <dir>] [--shader-cache <path>] [--max-frames <N>] [--dump-frame <path.ppm>] [--script-keys <SPEC>] [--fullscreen] [--width <W>] [--height <H>] [--aspect <4:3|16:9|stretch>] [--headless] [--no-gamepad] [--nintendo-buttons] [--swap-shoulders] [--trace-imports] [--trace-d3d8]"
     );
 }
 
@@ -365,10 +375,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_supports_no_gamepad_flag() {
-        let args = to_args(&["toluca-runtime", "sh2pc.exe", "toluca.aot", "--no-gamepad"]);
+    fn parse_args_supports_gamepad_layout_flags() {
+        let args = to_args(&[
+            "toluca-runtime",
+            "sh2pc.exe",
+            "toluca.aot",
+            "--no-gamepad",
+            "--nintendo-buttons",
+            "--swap-shoulders",
+        ]);
         let parsed = parse_args(&args).unwrap();
         assert!(parsed.no_gamepad);
+        assert!(parsed.nintendo_buttons);
+        assert!(parsed.swap_shoulders);
     }
 
     #[test]

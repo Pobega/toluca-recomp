@@ -183,6 +183,7 @@ const SOFT_LIMIT_KNEE: f32 = 0.85;
 const DEFAULT_OUTPUT_BUFFER_FRAMES: u32 = 2048;
 pub const MAX_AUX_RATE_SKEW: f64 = 0.025;
 const AUX_RATE_UNITY_EPSILON: f64 = 1e-6;
+const NET_AUDIO_LATENCY_EXTRA_PERIODS: f64 = 0.5;
 
 pub struct DsoundMixer {
     pub buffers: HashMap<usize, DsoundBufferData>,
@@ -194,6 +195,7 @@ pub struct DsoundMixer {
     aux_play_frac: f64,
     aux_rate_ratio: f64,
     pub aux_played_frames: u64,
+    pub last_aux_popped_frames: u64,
     pub output_sample_rate: u32,
     output_buffer_frames: u32,
     mix_accum: Vec<f32>,
@@ -221,6 +223,7 @@ impl DsoundMixer {
             aux_play_frac: 0.0,
             aux_rate_ratio: 1.0,
             aux_played_frames: 0,
+            last_aux_popped_frames: 0,
             output_sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             output_buffer_frames: DEFAULT_OUTPUT_BUFFER_FRAMES,
             mix_accum: Vec::new(),
@@ -239,6 +242,7 @@ impl DsoundMixer {
         self.aux_resample_frac = 0.0;
         self.aux_play_frac = 0.0;
         self.aux_rate_ratio = 1.0;
+        self.last_aux_popped_frames = 0;
     }
 
     pub fn set_aux_rate_ratio(&mut self, ratio: f64) {
@@ -255,6 +259,28 @@ impl DsoundMixer {
 
     pub fn aux_played_frames(&self) -> u64 {
         self.aux_played_frames
+    }
+
+    pub fn estimated_audible_aux_sec(&self, start_audio_frames: u64, now: Instant) -> Option<f64> {
+        if !self.hardware_clocked
+            || self.aux_played_frames <= start_audio_frames
+            || self.aux_queued_frames() == 0
+        {
+            return None;
+        }
+        let rate = f64::from(self.output_sample_rate.max(1));
+        let buf_frames = f64::from(self.output_buffer_frames.max(1));
+        let period_sec = buf_frames / rate;
+        let elapsed_sec = now
+            .saturating_duration_since(self.last_advance)
+            .as_secs_f64()
+            .min(period_sec);
+        let played_since_start = (self.aux_played_frames - start_audio_frames) as f64;
+        let base_frames = played_since_start
+            - (self.last_aux_popped_frames as f64)
+            - NET_AUDIO_LATENCY_EXTRA_PERIODS * buf_frames;
+        let interp_frames = elapsed_sec * rate * self.aux_rate_ratio;
+        Some(((base_frames + interp_frames).max(0.0)) / rate)
     }
 
     pub fn aux_queued_frames(&self) -> usize {
@@ -490,10 +516,13 @@ impl DsoundMixer {
                 *slot += f32::from(aux) / 32_768.0;
                 popped_aux += 1;
             }
-            self.aux_played_frames += (popped_aux / OUTPUT_CHANNELS) as u64;
+            let popped_frames = (popped_aux / OUTPUT_CHANNELS) as u64;
+            self.aux_played_frames += popped_frames;
+            self.last_aux_popped_frames = popped_frames;
             return;
         }
 
+        let mut total_popped_frames = 0u64;
         for frame_out in 0..out_frames {
             if self.aux_pcm.len() < OUTPUT_CHANNELS {
                 break;
@@ -519,8 +548,11 @@ impl DsoundMixer {
             for _ in 0..(frames_to_pop * OUTPUT_CHANNELS) {
                 self.aux_pcm.pop_front();
             }
-            self.aux_played_frames += frames_to_pop as u64;
+            let popped_frames = frames_to_pop as u64;
+            self.aux_played_frames += popped_frames;
+            total_popped_frames += popped_frames;
         }
+        self.last_aux_popped_frames = total_popped_frames;
         if self.aux_pcm.len() < OUTPUT_CHANNELS {
             self.aux_play_frac = 0.0;
         }
@@ -2907,6 +2939,35 @@ mod tests {
         assert!(
             (1019..=1021).contains(&fast_played),
             "expected ~1020 frames consumed at 1.02x, got {fast_played}"
+        );
+    }
+
+    #[test]
+    fn estimated_audible_aux_sec_is_c0_continuous_across_callbacks() {
+        let mut mixer = DsoundMixer::new();
+        mixer.hardware_clocked = true;
+        mixer.output_sample_rate = 48_000;
+        let period_frames = mixer.output_buffer_frames() as usize; // 2048 frames
+        let period_dur = Duration::from_secs_f64(f64::from(mixer.output_buffer_frames()) / 48_000.0);
+
+        let pcm = vec![100i16; period_frames * 6 * OUTPUT_CHANNELS];
+        mixer.push_aux_pcm(&pcm, 48_000, 2);
+
+        let mut out = vec![0i16; period_frames * OUTPUT_CHANNELS];
+        // Callback 1 and Callback 2
+        mixer.mix_into(&mut out);
+        mixer.mix_into(&mut out);
+        let t_end_k = mixer.last_advance + period_dur;
+        let est_before = mixer.estimated_audible_aux_sec(0, t_end_k).unwrap();
+
+        // Callback 3 at the exact end of period K
+        mixer.mix_into(&mut out);
+        let t_start_k1 = mixer.last_advance;
+        let est_after = mixer.estimated_audible_aux_sec(0, t_start_k1).unwrap();
+
+        assert!(
+            (est_before - est_after).abs() < 1e-6,
+            "expected C0 continuity across 2048-frame callback: before={est_before:.6}s after={est_after:.6}s"
         );
     }
 }

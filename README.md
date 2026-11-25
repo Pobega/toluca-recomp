@@ -49,6 +49,16 @@ To compile and run locally on desktop:
 ./target/release/toluca-runtime "/path/to/Silent Hill 2/sh2pc.exe" /tmp/toluca_code.bin
 ```
 
+To package a self-contained clean-room desktop release zip (`dist/toluca-linux-x86_64.zip`):
+
+```bash
+# Build minimal Bink-only LGPL FFmpeg 7.1.1 shared libs into dist/x86_64/libs/
+./scripts/build-desktop-ffmpeg.sh
+
+# Package desktop launcher, stripped binaries, and FFmpeg libs (or: make package-desktop)
+./scripts/package-desktop.sh
+```
+
 ### Cross-Compiling for ARM64 & Generating a PortMaster Zip
 
 Requires `podman` or `docker` and `zip`. Builds run inside [`Containerfile.aarch64`](Containerfile.aarch64) (Debian Bullseye / glibc 2.31 baseline) and bundle minimal Bink-only LGPL FFmpeg 7.1.1 shared libraries.

@@ -8,7 +8,7 @@ NEXTUI_GAMEDIR ?= $(NEXTUI_DOTPORTS_DIR)/toluca
 DIST_BIN_DIR := dist/aarch64
 TOOLBOX_RUN := $(if $(wildcard /run/.containerenv),,toolbox run --container fedora-toolbox-44)
 
-.PHONY: all build test-aarch64 host test package push push-fast logs
+.PHONY: all build test-aarch64 host test package package-desktop push push-fast logs
 
 all: build
 
@@ -29,6 +29,12 @@ package:
 		bash scripts/build-aarch64.sh; \
 	fi
 	bash scripts/package-portmaster.sh
+
+package-desktop:
+	@if [ ! -f "target/release/toluca-recomp" ] || [ ! -f "target/release/toluca-runtime" ]; then \
+		$(TOOLBOX_RUN) cargo build --release -p toluca-recomp -p toluca-runtime; \
+	fi
+	bash scripts/package-desktop.sh
 
 # Push release files to a NextUI device over ADB without clobbering gamedata/ or toluca.conf.
 # Clears cached AOT/shader artifacts so PortMaster's patcher cleanly recompiles on next launch.

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PM_DIR="${REPO_ROOT}/portmaster"
 BIN_DIR="${REPO_ROOT}/dist/aarch64"
-OUT_ZIP="${REPO_ROOT}/dist/toluca-portmaster.zip"
+OUT_ZIP="${OUT_ZIP:-${REPO_ROOT}/dist/toluca-portmaster.zip}"
 
 for required in \
     "${PM_DIR}/Toluca.sh" \

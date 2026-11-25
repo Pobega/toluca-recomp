@@ -8,13 +8,17 @@ TARGET_TRIPLE="aarch64-unknown-linux-gnu"
 MAX_GLIBC_MINOR=31
 
 RUN_TESTS=0
+SKIP_IMAGE_BUILD="${TOLUCA_SKIP_IMAGE_BUILD:-0}"
 for arg in "$@"; do
     case "${arg}" in
         --test)
             RUN_TESTS=1
             ;;
+        --skip-image-build)
+            SKIP_IMAGE_BUILD=1
+            ;;
         -h|--help)
-            echo "Usage: $0 [--test]"
+            echo "Usage: $0 [--test] [--skip-image-build]"
             exit 0
             ;;
         *)
@@ -24,19 +28,38 @@ for arg in "$@"; do
     esac
 done
 
-if command -v podman >/dev/null 2>&1; then
-    ENGINE="podman"
-    ENGINE_RUN_ARGS=(--rm --userns=keep-id -v "${REPO_ROOT}:/work:Z")
-elif command -v docker >/dev/null 2>&1; then
-    ENGINE="docker"
-    ENGINE_RUN_ARGS=(--rm -u "$(id -u):$(id -g)" -v "${REPO_ROOT}:/work")
-else
-    echo "Error: neither podman nor docker is installed" >&2
+ENGINE="${CONTAINER_ENGINE:-}"
+if [[ -z "${ENGINE}" ]]; then
+    if command -v podman >/dev/null 2>&1; then
+        ENGINE="podman"
+    elif command -v docker >/dev/null 2>&1; then
+        ENGINE="docker"
+    else
+        echo "Error: neither podman nor docker is installed" >&2
+        exit 1
+    fi
+elif ! command -v "${ENGINE}" >/dev/null 2>&1; then
+    echo "Error: requested CONTAINER_ENGINE='${ENGINE}' is not installed" >&2
     exit 1
 fi
 
-echo "Building container image ${IMAGE_NAME} with ${ENGINE}..."
-"${ENGINE}" build -f "${REPO_ROOT}/Containerfile.aarch64" -t "${IMAGE_NAME}" "${REPO_ROOT}"
+case "${ENGINE}" in
+    podman)
+        ENGINE_RUN_ARGS=(--rm --userns=keep-id -v "${REPO_ROOT}:/work:Z")
+        ;;
+    docker)
+        ENGINE_RUN_ARGS=(--rm -u "$(id -u):$(id -g)" -v "${REPO_ROOT}:/work")
+        ;;
+    *)
+        echo "Error: unsupported CONTAINER_ENGINE='${ENGINE}' (expected podman or docker)" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "${SKIP_IMAGE_BUILD}" != "1" ]]; then
+    echo "Building container image ${IMAGE_NAME} with ${ENGINE}..."
+    "${ENGINE}" build -f "${REPO_ROOT}/Containerfile.aarch64" -t "${IMAGE_NAME}" "${REPO_ROOT}"
+fi
 
 mkdir -p "${REPO_ROOT}/dist/aarch64/libs" "${REPO_ROOT}/target/aarch64-container" "${REPO_ROOT}/portmaster/licenses"
 

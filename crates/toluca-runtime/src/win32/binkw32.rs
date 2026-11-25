@@ -750,15 +750,39 @@ pub fn planar_f32_to_interleaved_i16(channels: &[&[f32]], out: &mut Vec<i16>) {
     }
 }
 
+const BT601_Y_OFFSET: i32 = 16;
+const BT601_UV_OFFSET: i32 = 128;
+const BT601_Y_COEFF: i32 = 298;
+const BT601_RV_COEFF: i32 = 409;
+const BT601_GU_COEFF: i32 = -100;
+const BT601_GV_COEFF: i32 = -208;
+const BT601_BU_COEFF: i32 = 516;
+const BT601_ROUND: i32 = 128;
+const BT601_SHIFT: i32 = 8;
+
+#[inline]
+fn bt601_uv_terms(u: u8, v: u8) -> (i32, i32, i32) {
+    let d = i32::from(u) - BT601_UV_OFFSET;
+    let e = i32::from(v) - BT601_UV_OFFSET;
+    let r_uv = BT601_RV_COEFF * e + BT601_ROUND;
+    let g_uv = BT601_GU_COEFF * d + BT601_GV_COEFF * e + BT601_ROUND;
+    let b_uv = BT601_BU_COEFF * d + BT601_ROUND;
+    (r_uv, g_uv, b_uv)
+}
+
+#[inline]
+fn bt601_luma_apply(y: u8, r_uv: i32, g_uv: i32, b_uv: i32) -> (u8, u8, u8) {
+    let y_term = BT601_Y_COEFF * (i32::from(y) - BT601_Y_OFFSET);
+    let r = ((y_term + r_uv) >> BT601_SHIFT).clamp(0, 255) as u8;
+    let g = ((y_term + g_uv) >> BT601_SHIFT).clamp(0, 255) as u8;
+    let b = ((y_term + b_uv) >> BT601_SHIFT).clamp(0, 255) as u8;
+    (r, g, b)
+}
+
 #[inline]
 pub fn bt601_yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
-    let c = i32::from(y) - 16;
-    let d = i32::from(u) - 128;
-    let e = i32::from(v) - 128;
-    let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-    let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-    let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-    (r, g, b)
+    let (r_uv, g_uv, b_uv) = bt601_uv_terms(u, v);
+    bt601_luma_apply(y, r_uv, g_uv, b_uv)
 }
 
 fn surface_bpp(surface_type: u32) -> Option<usize> {
@@ -768,6 +792,12 @@ fn surface_bpp(surface_type: u32) -> Option<usize> {
         BINKSURFACE555 | BINKSURFACE565 | BINKSURFACE555R | BINKSURFACE565R => Some(2),
         _ => None,
     }
+}
+
+#[inline]
+fn pack_rgb565(r: u8, g: u8, b: u8) -> [u8; 2] {
+    let p = (u16::from(r >> 3) << 11) | (u16::from(g >> 2) << 5) | u16::from(b >> 3);
+    p.to_le_bytes()
 }
 
 fn write_pixel(dst: &mut [u8], surface_type: u32, r: u8, g: u8, b: u8, a: u8) {
@@ -807,8 +837,7 @@ fn write_pixel(dst: &mut [u8], surface_type: u32, r: u8, g: u8, b: u8, a: u8) {
             dst[2] = b;
         }
         BINKSURFACE565 => {
-            let p = (u16::from(r >> 3) << 11) | (u16::from(g >> 2) << 5) | u16::from(b >> 3);
-            dst[0..2].copy_from_slice(&p.to_le_bytes());
+            dst[0..2].copy_from_slice(&pack_rgb565(r, g, b));
         }
         BINKSURFACE555 => {
             let p = (u16::from(r >> 3) << 10) | (u16::from(g >> 3) << 5) | u16::from(b >> 3);
@@ -826,6 +855,109 @@ fn write_pixel(dst: &mut [u8], surface_type: u32, r: u8, g: u8, b: u8, a: u8) {
     }
 }
 
+#[inline]
+fn write_pixel_32<const R_FIRST: bool>(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
+    if R_FIRST {
+        dst[0] = r;
+        dst[1] = g;
+        dst[2] = b;
+        dst[3] = a;
+    } else {
+        dst[0] = b;
+        dst[1] = g;
+        dst[2] = r;
+        dst[3] = a;
+    }
+}
+
+fn convert_yuv_row_32<const R_FIRST: bool>(
+    y_row: &[u8],
+    u_row: &[u8],
+    v_row: &[u8],
+    a_row: Option<&[u8]>,
+    out_row: &mut [u8],
+) {
+    let uv_iter = u_row.iter().zip(v_row.iter());
+    if let Some(alpha) = a_row {
+        for (((yp, ap), (&u, &v)), dst) in y_row
+            .chunks_exact(2)
+            .zip(alpha.chunks_exact(2))
+            .zip(uv_iter)
+            .zip(out_row.chunks_exact_mut(8))
+        {
+            let (r_uv, g_uv, b_uv) = bt601_uv_terms(u, v);
+            let (r0, g0, b0) = bt601_luma_apply(yp[0], r_uv, g_uv, b_uv);
+            let (r1, g1, b1) = bt601_luma_apply(yp[1], r_uv, g_uv, b_uv);
+            write_pixel_32::<R_FIRST>(&mut dst[0..4], r0, g0, b0, ap[0]);
+            write_pixel_32::<R_FIRST>(&mut dst[4..8], r1, g1, b1, ap[1]);
+        }
+    } else {
+        for ((yp, (&u, &v)), dst) in y_row
+            .chunks_exact(2)
+            .zip(uv_iter)
+            .zip(out_row.chunks_exact_mut(8))
+        {
+            let (r_uv, g_uv, b_uv) = bt601_uv_terms(u, v);
+            let (r0, g0, b0) = bt601_luma_apply(yp[0], r_uv, g_uv, b_uv);
+            let (r1, g1, b1) = bt601_luma_apply(yp[1], r_uv, g_uv, b_uv);
+            write_pixel_32::<R_FIRST>(&mut dst[0..4], r0, g0, b0, 255);
+            write_pixel_32::<R_FIRST>(&mut dst[4..8], r1, g1, b1, 255);
+        }
+    }
+    if !y_row.len().is_multiple_of(2) {
+        let last = y_row.len() - 1;
+        let (r, g, b) = bt601_yuv_to_rgb(y_row[last], u_row[last / 2], v_row[last / 2]);
+        let a = a_row.map_or(255, |alpha| alpha[last]);
+        write_pixel_32::<R_FIRST>(&mut out_row[last * 4..last * 4 + 4], r, g, b, a);
+    }
+}
+
+fn convert_yuv_row_565(y_row: &[u8], u_row: &[u8], v_row: &[u8], out_row: &mut [u8]) {
+    for ((yp, (&u, &v)), dst) in y_row
+        .chunks_exact(2)
+        .zip(u_row.iter().zip(v_row.iter()))
+        .zip(out_row.chunks_exact_mut(4))
+    {
+        let (r_uv, g_uv, b_uv) = bt601_uv_terms(u, v);
+        let (r0, g0, b0) = bt601_luma_apply(yp[0], r_uv, g_uv, b_uv);
+        let (r1, g1, b1) = bt601_luma_apply(yp[1], r_uv, g_uv, b_uv);
+        dst[0..2].copy_from_slice(&pack_rgb565(r0, g0, b0));
+        dst[2..4].copy_from_slice(&pack_rgb565(r1, g1, b1));
+    }
+    if !y_row.len().is_multiple_of(2) {
+        let last = y_row.len() - 1;
+        let (r, g, b) = bt601_yuv_to_rgb(y_row[last], u_row[last / 2], v_row[last / 2]);
+        out_row[last * 2..last * 2 + 2].copy_from_slice(&pack_rgb565(r, g, b));
+    }
+}
+
+fn convert_yuv_row_generic(
+    y_row: &[u8],
+    u_row: &[u8],
+    v_row: &[u8],
+    surface_type: u32,
+    bpp: usize,
+    out_row: &mut [u8],
+) {
+    for ((yp, (&u, &v)), dst) in y_row
+        .chunks_exact(2)
+        .zip(u_row.iter().zip(v_row.iter()))
+        .zip(out_row.chunks_exact_mut(bpp * 2))
+    {
+        let (r_uv, g_uv, b_uv) = bt601_uv_terms(u, v);
+        let (r0, g0, b0) = bt601_luma_apply(yp[0], r_uv, g_uv, b_uv);
+        let (r1, g1, b1) = bt601_luma_apply(yp[1], r_uv, g_uv, b_uv);
+        write_pixel(&mut dst[..bpp], surface_type, r0, g0, b0, 255);
+        write_pixel(&mut dst[bpp..bpp * 2], surface_type, r1, g1, b1, 255);
+    }
+    if !y_row.len().is_multiple_of(2) {
+        let last = y_row.len() - 1;
+        let (r, g, b) = bt601_yuv_to_rgb(y_row[last], u_row[last / 2], v_row[last / 2]);
+        let off = last * bpp;
+        write_pixel(&mut out_row[off..off + bpp], surface_type, r, g, b, 255);
+    }
+}
+
 pub fn convert_yuv_row(
     frame: &DecodedVideoFrame,
     row: usize,
@@ -836,22 +968,31 @@ pub fn convert_yuv_row(
     let Some(bpp) = surface_bpp(surface_type) else {
         return;
     };
+    if copy_width == 0 {
+        return;
+    }
     let w = frame.width as usize;
     let cw = w.div_ceil(2);
     let y_base = row * w;
     let uv_base = (row / 2) * cw;
+    let uv_len = copy_width.div_ceil(2);
 
-    for col in 0..copy_width {
-        let y = frame.y[y_base + col];
-        let u = frame.u[uv_base + (col / 2)];
-        let v = frame.v[uv_base + (col / 2)];
-        let a = frame
-            .a
-            .as_ref()
-            .map_or(255, |alpha| alpha[y_base + col]);
-        let (r, g, b) = bt601_yuv_to_rgb(y, u, v);
-        let off = col * bpp;
-        write_pixel(&mut out_row[off..off + bpp], surface_type, r, g, b, a);
+    let y_row = &frame.y[y_base..y_base + copy_width];
+    let u_row = &frame.u[uv_base..uv_base + uv_len];
+    let v_row = &frame.v[uv_base..uv_base + uv_len];
+    let a_row = frame
+        .a
+        .as_deref()
+        .map(|alpha| &alpha[y_base..y_base + copy_width]);
+    let out_row = &mut out_row[..copy_width * bpp];
+
+    match surface_type {
+        BINKSURFACE32 => convert_yuv_row_32::<false>(y_row, u_row, v_row, None, out_row),
+        BINKSURFACE32A => convert_yuv_row_32::<false>(y_row, u_row, v_row, a_row, out_row),
+        BINKSURFACE32R => convert_yuv_row_32::<true>(y_row, u_row, v_row, None, out_row),
+        BINKSURFACE32RA => convert_yuv_row_32::<true>(y_row, u_row, v_row, a_row, out_row),
+        BINKSURFACE565 => convert_yuv_row_565(y_row, u_row, v_row, out_row),
+        _ => convert_yuv_row_generic(y_row, u_row, v_row, surface_type, bpp, out_row),
     }
 }
 
@@ -887,21 +1028,48 @@ pub fn copy_frame_to_guest_surface(
         return Ok(0);
     }
 
-    let mut row_buf = vec![0u8; max_cols * bpp];
+    let row_bytes = max_cols * bpp;
+    if target.pitch > 0 && target.y >= 0 && target.x >= 0 {
+        let pitch = target.pitch as usize;
+        let first_row = i64::from(target.dest)
+            + i64::from(target.y) * i64::from(target.pitch)
+            + i64::from(target.x) * (bpp as i64);
+        let total_span = (max_rows - 1) * pitch + row_bytes;
+        if first_row > 0
+            && u32::try_from(first_row).is_ok()
+            && (first_row as u64)
+                .checked_add(total_span as u64)
+                .is_some_and(|end| end <= u64::from(u32::MAX))
+        {
+            let dst_span = arena.write_slice_mut(first_row as GuestAddr, total_span)?;
+            for row in 0..max_rows {
+                let row_off = row * pitch;
+                convert_yuv_row(
+                    frame,
+                    row,
+                    max_cols,
+                    surface_type,
+                    &mut dst_span[row_off..row_off + row_bytes],
+                );
+            }
+            return Ok(0);
+        }
+    }
+
+    let dst_x_coord = i64::from(target.x).max(0);
     for row in 0..max_rows {
         let dst_y_coord = i64::from(target.y) + row as i64;
         if dst_y_coord < 0 || dst_y_coord >= i64::from(target.height) {
             continue;
         }
-        let dst_x_coord = i64::from(target.x).max(0);
         let row_addr = i64::from(target.dest)
             + dst_y_coord * i64::from(target.pitch)
             + dst_x_coord * (bpp as i64);
         if row_addr <= 0 || row_addr > i64::from(u32::MAX) {
             continue;
         }
-        convert_yuv_row(frame, row, max_cols, surface_type, &mut row_buf);
-        arena.write_bytes(row_addr as GuestAddr, &row_buf)?;
+        let dst_row = arena.write_slice_mut(row_addr as GuestAddr, row_bytes)?;
+        convert_yuv_row(frame, row, max_cols, surface_type, dst_row);
     }
     Ok(0)
 }
@@ -1922,6 +2090,179 @@ mod tests {
             (0.980..=0.990).contains(&inst.av_rate_ratio),
             "expected converged av_rate_ratio near 0.985, got {:.5}",
             inst.av_rate_ratio
+        );
+    }
+
+    #[test]
+    fn convert_yuv_row_matches_reference_all_formats_even_odd_and_alpha() {
+        let formats = [
+            BINKSURFACE24,
+            BINKSURFACE24R,
+            BINKSURFACE32,
+            BINKSURFACE32R,
+            BINKSURFACE32A,
+            BINKSURFACE32RA,
+            BINKSURFACE555R,
+            BINKSURFACE565R,
+            BINKSURFACE555,
+            BINKSURFACE565,
+        ];
+        for width in [6u32, 5u32] {
+            let height = 2u32;
+            let w = width as usize;
+            let cw = w.div_ceil(2);
+            let y: Vec<u8> = (0..(w * height as usize))
+                .map(|i| ((i * 29 + 16) & 0xFF) as u8)
+                .collect();
+            let u: Vec<u8> = (0..cw).map(|i| ((i * 53 + 64) & 0xFF) as u8).collect();
+            let v: Vec<u8> = (0..cw).map(|i| ((i * 71 + 192) & 0xFF) as u8).collect();
+            let alpha: Vec<u8> = (0..(w * height as usize))
+                .map(|i| ((i * 37 + 11) & 0xFF) as u8)
+                .collect();
+
+            for with_alpha in [false, true] {
+                let frame = DecodedVideoFrame {
+                    width,
+                    height,
+                    y: y.clone(),
+                    u: u.clone(),
+                    v: v.clone(),
+                    a: with_alpha.then(|| alpha.clone()),
+                };
+                for &surface_type in &formats {
+                    let bpp = surface_bpp(surface_type).unwrap();
+                    for row in 0..height as usize {
+                        let mut actual = vec![0xAAu8; w * bpp];
+                        convert_yuv_row(&frame, row, w, surface_type, &mut actual);
+
+                        let mut expected = vec![0xAAu8; w * bpp];
+                        let y_base = row * w;
+                        let uv_base = (row / 2) * cw;
+                        for col in 0..w {
+                            let (r, g, b) = bt601_yuv_to_rgb(
+                                frame.y[y_base + col],
+                                frame.u[uv_base + (col / 2)],
+                                frame.v[uv_base + (col / 2)],
+                            );
+                            let a = frame.a.as_ref().map_or(255, |ap| ap[y_base + col]);
+                            write_pixel(
+                                &mut expected[col * bpp..(col + 1) * bpp],
+                                surface_type,
+                                r,
+                                g,
+                                b,
+                                a,
+                            );
+                        }
+                        assert_eq!(
+                            actual, expected,
+                            "mismatch width={width} with_alpha={with_alpha} surface_type={surface_type} row={row}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_frame_to_guest_surface_handles_positive_negative_pitch_and_clipped_y() {
+        let frame = DecodedVideoFrame {
+            width: 3,
+            height: 3,
+            y: vec![
+                235, 16, 81, // row 0
+                145, 41, 200, // row 1
+                100, 150, 220, // row 2
+            ],
+            u: vec![128, 90, 200, 110],
+            v: vec![128, 240, 60, 170],
+            a: None,
+        };
+        let mut arena = GuestArena::new().unwrap();
+        arena.init_thread_environment(DEFAULT_IMAGE_BASE).unwrap();
+        let mut heap = GuestHeap::new();
+        let pitch = 24usize;
+        let surf = heap.alloc(&mut arena, pitch * 5, true).unwrap();
+
+        let mut expected_rows = [Vec::new(), Vec::new(), Vec::new()];
+        for (r, slot) in expected_rows.iter_mut().enumerate() {
+            *slot = vec![0u8; 3 * 4];
+            convert_yuv_row(&frame, r, 3, BINKSURFACE32, slot);
+        }
+
+        // Positive pitch with non-zero x/y offset (fast single-span path).
+        arena.write_bytes(surf, &vec![0x55u8; pitch * 5]).unwrap();
+        assert_eq!(
+            copy_frame_to_guest_surface(
+                &mut arena,
+                &frame,
+                GuestSurfaceTarget {
+                    dest: surf,
+                    pitch: pitch as i32,
+                    height: 5,
+                    x: 1,
+                    y: 1,
+                    flags: BINKSURFACE32,
+                },
+            )
+            .unwrap(),
+            0
+        );
+        for (r, exp) in expected_rows.iter().enumerate() {
+            let row_addr = surf + ((r + 1) * pitch + 4) as GuestAddr;
+            assert_eq!(arena.read_bytes(row_addr, 12).unwrap(), *exp);
+        }
+
+        // Negative pitch (bottom-up fallback path).
+        arena.write_bytes(surf, &vec![0x55u8; pitch * 5]).unwrap();
+        let bottom_row = surf + (3 * pitch) as GuestAddr;
+        assert_eq!(
+            copy_frame_to_guest_surface(
+                &mut arena,
+                &frame,
+                GuestSurfaceTarget {
+                    dest: bottom_row,
+                    pitch: -(pitch as i32),
+                    height: 4,
+                    x: 0,
+                    y: 0,
+                    flags: BINKSURFACE32,
+                },
+            )
+            .unwrap(),
+            0
+        );
+        for (r, exp) in expected_rows.iter().enumerate() {
+            let row_addr = bottom_row - (r * pitch) as GuestAddr;
+            assert_eq!(arena.read_bytes(row_addr, 12).unwrap(), *exp);
+        }
+
+        // Clipped negative y (top row clipped, bottom guest row left untouched).
+        arena.write_bytes(surf, &vec![0xAAu8; pitch * 3]).unwrap();
+        assert_eq!(
+            copy_frame_to_guest_surface(
+                &mut arena,
+                &frame,
+                GuestSurfaceTarget {
+                    dest: surf,
+                    pitch: pitch as i32,
+                    height: 3,
+                    x: 0,
+                    y: -1,
+                    flags: BINKSURFACE32,
+                },
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(arena.read_bytes(surf, 12).unwrap(), expected_rows[1]);
+        assert_eq!(
+            arena.read_bytes(surf + pitch as GuestAddr, 12).unwrap(),
+            expected_rows[2]
+        );
+        assert_eq!(
+            arena.read_bytes(surf + (2 * pitch) as GuestAddr, 12).unwrap(),
+            vec![0xAAu8; 12]
         );
     }
 }

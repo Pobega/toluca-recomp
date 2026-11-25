@@ -2638,7 +2638,9 @@ impl RenderBackend for Gles3Backend {
             self.fbo_height as GLsizei,
         );
 
-        self.perf.on_present(Instant::now());
+        if self.perf.enabled {
+            self.perf.on_present(Instant::now());
+        }
         self.flush_recipe_cache_if_needed();
     }
 }

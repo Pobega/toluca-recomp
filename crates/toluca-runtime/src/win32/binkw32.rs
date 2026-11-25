@@ -11,7 +11,7 @@ use toluca_core::cpu::GuestCpuState;
 use crate::arena::GuestArena;
 use crate::callconv::{peek_arg_i32, peek_arg_u32, return_stdcall};
 use crate::runtime::{ImportHandler, ImportRegistry, RuntimeContext, RuntimeError};
-use crate::win32::dsound::DsoundMixer;
+use crate::win32::dsound::{DsoundMixer, MAX_AUX_RATE_SKEW};
 
 const MAX_PATH_LEN: usize = 512;
 const BINK_STRUCT_ALLOC_BYTES: usize = 256;
@@ -19,6 +19,11 @@ const BINK_HEADER_MIN_BYTES: usize = 44;
 const BINK_AUDIO_STEREO_FLAG: u16 = 0x2000;
 #[allow(dead_code)]
 const BINK_FLAG_NOSKIP: u32 = 0x0008_0000;
+
+const AV_SYNC_KP: f64 = 0.36;
+const AV_SYNC_KI: f64 = 0.0324;
+const AV_SYNC_INTEGRAL_LIMIT: f64 = 1.0;
+const AV_SYNC_RATIO_SMOOTHING: f64 = 0.2;
 
 const BINKSURFACE_MASK: u32 = 0x0F;
 pub const BINKSURFACE24: u32 = 1;
@@ -911,6 +916,8 @@ struct BinkInstance {
     selected_audio_track: Option<BinkAudioTrack>,
     next_frame_due: Instant,
     start_audio_frames: u64,
+    av_err_integral: f64,
+    av_rate_ratio: f64,
     open_instant: Instant,
     first_frame_instant: Option<Instant>,
     wait_true: u32,
@@ -1075,11 +1082,12 @@ fn log_bink_perf(inst: &BinkInstance, mixer_mutex: &std::sync::Mutex<DsoundMixer
     let dec_ms = (inst.dec_ns as f64) / 1_000_000.0;
     let yuv_ms = (inst.yuv_ns as f64) / 1_000_000.0;
     eprintln!(
-        "[toluca-bink-perf] frame={}/{} open_ms={open_ms} play_ms={play_ms} vid_ms={vid_ms} aud_ms={aud_ms} aud_q_ms={aud_q_ms} wait_t={} wait_f={} dec_ms={dec_ms:.1} yuv_ms={yuv_ms:.1}",
+        "[toluca-bink-perf] frame={}/{} open_ms={open_ms} play_ms={play_ms} vid_ms={vid_ms} aud_ms={aud_ms} aud_q_ms={aud_q_ms} wait_t={} wait_f={} dec_ms={dec_ms:.1} yuv_ms={yuv_ms:.1} rate={:.4}",
         inst.frame_num,
         inst.header.num_frames,
         inst.wait_true,
         inst.wait_false,
+        inst.av_rate_ratio,
     );
 }
 
@@ -1155,6 +1163,8 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
             selected_audio_track,
             next_frame_due: now + frame_period,
             start_audio_frames,
+            av_err_integral: 0.0,
+            av_rate_ratio: 1.0,
             open_instant: now,
             first_frame_instant: None,
             wait_true: 0,
@@ -1172,15 +1182,18 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
 
 fn bink_close(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let bink_va = peek_arg_u32(cpu, ctx.arena, 0)?;
-    if let Some(inst) = ctx.win32.bink.instances.remove(&bink_va) {
+    if let Some(mut inst) = ctx.win32.bink.instances.remove(&bink_va) {
         if bink_perf_enabled() {
             log_bink_perf(&inst, &ctx.win32.dsound.mixer);
         }
+        inst.av_err_integral = 0.0;
+        inst.av_rate_ratio = 1.0;
         if let (Some(dec), Some(api)) = (inst.decoder, ctx.win32.bink.ffmpeg.as_ref()) {
             dec.close(api);
         }
         if let Ok(mut mixer) = ctx.win32.dsound.mixer.lock() {
             mixer.clear_aux_pcm();
+            mixer.set_aux_rate_ratio(1.0);
         }
         let _ = ctx.heap.free(ctx.arena, bink_va);
     }
@@ -1232,19 +1245,31 @@ fn bink_set_sound_on_off(
 ) -> Result<(), RuntimeError> {
     let bink_va = peek_arg_u32(cpu, ctx.arena, 0)?;
     let on_off = peek_arg_i32(cpu, ctx.arena, 1)?;
-    let (ret, turned_on) = if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
+    let (ret, turned_on, changed) = if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
         let was_on = inst.sound_on;
         inst.sound_on = on_off != 0;
-        (i32::from(inst.sound_on) as u32, !was_on && inst.sound_on)
+        let changed = was_on != inst.sound_on;
+        if changed {
+            inst.av_err_integral = 0.0;
+            inst.av_rate_ratio = 1.0;
+        }
+        (
+            i32::from(inst.sound_on) as u32,
+            !was_on && inst.sound_on,
+            changed,
+        )
     } else {
-        (0, false)
+        (0, false, false)
     };
-    if turned_on {
+    if turned_on || changed {
         if let Ok(mut mixer) = ctx.win32.dsound.mixer.lock() {
-            mixer.clear_aux_pcm();
-            if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
-                inst.start_audio_frames = mixer.aux_played_frames();
+            if turned_on {
+                mixer.clear_aux_pcm();
+                if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
+                    inst.start_audio_frames = mixer.aux_played_frames();
+                }
             }
+            mixer.set_aux_rate_ratio(1.0);
         }
     }
     return_stdcall(cpu, ctx.arena, 2, ret)?;
@@ -1346,14 +1371,17 @@ fn bink_do_frame(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
         ));
     }
 
-    if !decoded_aud.is_empty() && inst.sound_on {
+    if inst.sound_on {
         let track = inst
             .selected_audio_track
             .or_else(|| inst.header.audio_tracks.first().copied());
         let rate = track.map_or(DEFAULT_AUDIO_RATE, |t| u32::from(t.sample_rate.max(1)));
         let ch = track.map_or(DEFAULT_AUDIO_CHANNELS, |t| t.channels);
         if let Ok(mut mixer) = ctx.win32.dsound.mixer.lock() {
-            push_aux_to_mixer(&mut mixer, &decoded_aud, rate, ch);
+            if !decoded_aud.is_empty() {
+                push_aux_to_mixer(&mut mixer, &decoded_aud, rate, ch);
+            }
+            update_aux_rate_control(inst, &mut mixer);
         }
     }
 
@@ -1389,6 +1417,27 @@ fn push_aux_to_mixer(mixer: &mut DsoundMixer, samples: &[i16], rate: u32, channe
     mixer.push_aux_pcm(samples, rate, channels);
 }
 
+fn update_aux_rate_control(inst: &mut BinkInstance, mixer: &mut DsoundMixer) {
+    if !inst.sound_on || !mixer.hardware_clocked || mixer.aux_queued_frames() == 0 || inst.frame_num <= 1 {
+        return;
+    }
+    let played_frames = mixer.aux_played_frames().saturating_sub(inst.start_audio_frames);
+    if played_frames == 0 {
+        return;
+    }
+    let rate = f64::from(mixer.output_sample_rate().max(1));
+    let aud_sec = (played_frames as f64) / rate;
+    let dt = inst.header.frame_duration().as_secs_f64();
+    let vid_sec = dt * f64::from(inst.frame_num.saturating_sub(1));
+    let err_sec = aud_sec - vid_sec;
+    inst.av_err_integral =
+        (inst.av_err_integral + err_sec * dt).clamp(-AV_SYNC_INTEGRAL_LIMIT, AV_SYNC_INTEGRAL_LIMIT);
+    let target_ratio = (1.0 - AV_SYNC_KP * err_sec - AV_SYNC_KI * inst.av_err_integral)
+        .clamp(1.0 - MAX_AUX_RATE_SKEW, 1.0 + MAX_AUX_RATE_SKEW);
+    inst.av_rate_ratio += (target_ratio - inst.av_rate_ratio) * AV_SYNC_RATIO_SMOOTHING;
+    mixer.set_aux_rate_ratio(inst.av_rate_ratio);
+}
+
 fn bink_next_frame(
     ctx: &mut RuntimeContext<'_>,
     cpu: &mut GuestCpuState,
@@ -1397,13 +1446,16 @@ fn bink_next_frame(
     if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
         if inst.frame_num >= inst.header.num_frames {
             inst.frame_num = 1;
+            inst.av_err_integral = 0.0;
+            inst.av_rate_ratio = 1.0;
             if let (Some(dec), Some(api)) = (inst.decoder.as_mut(), ctx.win32.bink.ffmpeg.as_ref()) {
                 dec.rewind(api);
             }
-            if inst.sound_on {
-                if let Ok(mixer) = ctx.win32.dsound.mixer.lock() {
+            if let Ok(mut mixer) = ctx.win32.dsound.mixer.lock() {
+                if inst.sound_on {
                     inst.start_audio_frames = mixer.aux_played_frames();
                 }
+                mixer.set_aux_rate_ratio(1.0);
             }
         } else {
             inst.frame_num += 1;
@@ -1759,6 +1811,8 @@ mod tests {
             selected_audio_track: None,
             next_frame_due: Instant::now() + Duration::from_secs(5),
             start_audio_frames: 1_000,
+            av_err_integral: 0.0,
+            av_rate_ratio: 1.0,
             open_instant: Instant::now(),
             first_frame_instant: None,
             wait_true: 0,
@@ -1786,5 +1840,88 @@ mod tests {
         assert!(!should_wait_for_frame(&inst, &mixer_mutex));
         inst.next_frame_due = Instant::now() + Duration::from_millis(50);
         assert!(should_wait_for_frame(&inst, &mixer_mutex));
+    }
+
+    #[test]
+    fn update_aux_rate_control_tracks_fast_hardware_clock_without_drift() {
+        let header = BinkHeader {
+            magic: *b"BIKi",
+            file_size: 1024,
+            num_frames: 700,
+            largest_frame_size: 256,
+            width: 640,
+            height: 480,
+            fps_num: 30,
+            fps_den: 1,
+            video_flags: 0,
+            audio_tracks: vec![BinkAudioTrack {
+                track_id: 0,
+                sample_rate: 48_000,
+                channels: 2,
+            }],
+        };
+
+        let mut mixer = DsoundMixer::new();
+        mixer.hardware_clocked = true;
+        mixer.output_sample_rate = 48_000;
+        let pcm_chunk = vec![100i16; 1600 * 2];
+        for _ in 0..5 {
+            mixer.push_aux_pcm(&pcm_chunk, 48_000, 2);
+        }
+
+        let mut inst = BinkInstance {
+            header,
+            open_flags: 0,
+            frame_num: 1,
+            last_frame_num: 0,
+            paused: false,
+            sound_on: true,
+            selected_audio_track: None,
+            next_frame_due: Instant::now(),
+            start_audio_frames: 0,
+            av_err_integral: 0.0,
+            av_rate_ratio: 1.0,
+            open_instant: Instant::now(),
+            first_frame_instant: None,
+            wait_true: 0,
+            wait_false: 0,
+            dec_ns: 0,
+            yuv_ns: 0,
+            decoder: None,
+            current_frame: None,
+        };
+
+        let mut out_accum = 0.0f64;
+        let mut out_buf = Vec::new();
+        let mut final_err_ms = 0.0f64;
+        for _ in 0..600 {
+            inst.frame_num += 1;
+            mixer.push_aux_pcm(&pcm_chunk, 48_000, 2);
+            out_accum += 1600.0 * 1.0145;
+            let out_frames = out_accum.floor() as usize;
+            out_accum -= out_frames as f64;
+            out_buf.resize(out_frames * 2, 0);
+            mixer.mix_into(&mut out_buf);
+            update_aux_rate_control(&mut inst, &mut mixer);
+
+            let aud_ms = (mixer.aux_played_frames() as f64) * 1000.0 / 48_000.0;
+            let vid_ms = f64::from(inst.frame_num - 1) * 1000.0 / 30.0;
+            final_err_ms = (aud_ms - vid_ms).abs();
+            assert!(
+                final_err_ms < 50.0,
+                "A/V drift exceeded 50ms at frame {}: {final_err_ms:.2}ms",
+                inst.frame_num
+            );
+        }
+
+        assert!(
+            final_err_ms < 15.0,
+            "expected final A/V error < 15ms at frame 600, got {final_err_ms:.2}ms"
+        );
+        assert!(
+            (0.980..=0.990).contains(&inst.av_rate_ratio),
+            "expected converged av_rate_ratio near 0.985, got {:.5}",
+            inst.av_rate_ratio
+        );
     }
 }

@@ -181,6 +181,8 @@ impl DsoundBufferData {
 
 const SOFT_LIMIT_KNEE: f32 = 0.85;
 const DEFAULT_OUTPUT_BUFFER_FRAMES: u32 = 2048;
+pub const MAX_AUX_RATE_SKEW: f64 = 0.025;
+const AUX_RATE_UNITY_EPSILON: f64 = 1e-6;
 
 pub struct DsoundMixer {
     pub buffers: HashMap<usize, DsoundBufferData>,
@@ -189,6 +191,8 @@ pub struct DsoundMixer {
     pub deferred_listener: Ds3dListenerParams,
     pub aux_pcm: VecDeque<i16>,
     aux_resample_frac: f64,
+    aux_play_frac: f64,
+    aux_rate_ratio: f64,
     pub aux_played_frames: u64,
     pub output_sample_rate: u32,
     output_buffer_frames: u32,
@@ -214,6 +218,8 @@ impl DsoundMixer {
             deferred_listener: Ds3dListenerParams::default(),
             aux_pcm: VecDeque::new(),
             aux_resample_frac: 0.0,
+            aux_play_frac: 0.0,
+            aux_rate_ratio: 1.0,
             aux_played_frames: 0,
             output_sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             output_buffer_frames: DEFAULT_OUTPUT_BUFFER_FRAMES,
@@ -231,6 +237,20 @@ impl DsoundMixer {
     pub fn clear_aux_pcm(&mut self) {
         self.aux_pcm.clear();
         self.aux_resample_frac = 0.0;
+        self.aux_play_frac = 0.0;
+        self.aux_rate_ratio = 1.0;
+    }
+
+    pub fn set_aux_rate_ratio(&mut self, ratio: f64) {
+        self.aux_rate_ratio = if ratio.is_finite() {
+            ratio.clamp(1.0 - MAX_AUX_RATE_SKEW, 1.0 + MAX_AUX_RATE_SKEW)
+        } else {
+            1.0
+        };
+    }
+
+    pub fn aux_rate_ratio(&self) -> f64 {
+        self.aux_rate_ratio
     }
 
     pub fn aux_played_frames(&self) -> u64 {
@@ -431,15 +451,7 @@ impl DsoundMixer {
             }
         }
 
-        let mut popped_aux = 0usize;
-        for slot in self.mix_accum[..accum_len].iter_mut() {
-            let Some(aux) = self.aux_pcm.pop_front() else {
-                break;
-            };
-            *slot += f32::from(aux) / 32_768.0;
-            popped_aux += 1;
-        }
-        self.aux_played_frames += (popped_aux / OUTPUT_CHANNELS) as u64;
+        self.mix_aux_pcm(out_frames);
 
         for (dst, &sample) in out.iter_mut().zip(self.mix_accum[..accum_len].iter()) {
             let limited = soft_limit_sample(sample);
@@ -463,6 +475,54 @@ impl DsoundMixer {
                 self.buffers.len(),
                 self.aux_played_frames
             );
+        }
+    }
+
+    fn mix_aux_pcm(&mut self, out_frames: usize) {
+        let accum_len = out_frames * OUTPUT_CHANNELS;
+        if (self.aux_rate_ratio - 1.0).abs() < AUX_RATE_UNITY_EPSILON && self.aux_play_frac == 0.0
+        {
+            let mut popped_aux = 0usize;
+            for slot in self.mix_accum[..accum_len].iter_mut() {
+                let Some(aux) = self.aux_pcm.pop_front() else {
+                    break;
+                };
+                *slot += f32::from(aux) / 32_768.0;
+                popped_aux += 1;
+            }
+            self.aux_played_frames += (popped_aux / OUTPUT_CHANNELS) as u64;
+            return;
+        }
+
+        for frame_out in 0..out_frames {
+            if self.aux_pcm.len() < OUTPUT_CHANNELS {
+                break;
+            }
+            let l0 = f32::from(self.aux_pcm[0]);
+            let r0 = f32::from(self.aux_pcm[1]);
+            let (l1, r1) = if self.aux_pcm.len() >= 2 * OUTPUT_CHANNELS {
+                (f32::from(self.aux_pcm[2]), f32::from(self.aux_pcm[3]))
+            } else {
+                (l0, r0)
+            };
+            let t = self.aux_play_frac as f32;
+            let l = l0 + (l1 - l0) * t;
+            let r = r0 + (r1 - r0) * t;
+            let out_idx = frame_out * OUTPUT_CHANNELS;
+            self.mix_accum[out_idx] += l / 32_768.0;
+            self.mix_accum[out_idx + 1] += r / 32_768.0;
+
+            self.aux_play_frac += self.aux_rate_ratio;
+            let whole = self.aux_play_frac.floor() as usize;
+            self.aux_play_frac -= whole as f64;
+            let frames_to_pop = whole.min(self.aux_pcm.len() / OUTPUT_CHANNELS);
+            for _ in 0..(frames_to_pop * OUTPUT_CHANNELS) {
+                self.aux_pcm.pop_front();
+            }
+            self.aux_played_frames += frames_to_pop as u64;
+        }
+        if self.aux_pcm.len() < OUTPUT_CHANNELS {
+            self.aux_play_frac = 0.0;
         }
     }
 }
@@ -2791,5 +2851,62 @@ mod tests {
         out.fill(0);
         h.win32.dsound.mixer.lock().unwrap().mix_into(&mut out);
         assert!(out.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn aux_rate_ratio_adjusts_consumption_smoothly_and_clamps() {
+        let mut mixer = DsoundMixer::new();
+        mixer.set_aux_rate_ratio(0.5);
+        assert!((mixer.aux_rate_ratio() - (1.0 - MAX_AUX_RATE_SKEW)).abs() < 1e-12);
+        mixer.set_aux_rate_ratio(2.0);
+        assert!((mixer.aux_rate_ratio() - (1.0 + MAX_AUX_RATE_SKEW)).abs() < 1e-12);
+        mixer.set_aux_rate_ratio(f64::NAN);
+        assert_eq!(mixer.aux_rate_ratio(), 1.0);
+
+        let sine_frames = 2400usize;
+        let sine: Vec<i16> = (0..sine_frames)
+            .flat_map(|i| {
+                let phase = 2.0 * std::f64::consts::PI * 440.0 * (i as f64) / 48_000.0;
+                let s = (phase.sin() * 16_000.0).round() as i16;
+                [s, -s]
+            })
+            .collect();
+
+        mixer.push_aux_pcm(&sine, 48_000, 2);
+        mixer.set_aux_rate_ratio(0.98);
+        let mut rendered_slow = Vec::new();
+        let mut buf = [0i16; 250 * OUTPUT_CHANNELS];
+        for _ in 0..4 {
+            mixer.mix_into(&mut buf);
+            rendered_slow.extend_from_slice(&buf);
+        }
+        assert!(
+            (979..=981).contains(&mixer.aux_played_frames()),
+            "expected ~980 frames consumed at 0.98x, got {}",
+            mixer.aux_played_frames()
+        );
+        let max_step_l = rendered_slow
+            .chunks_exact(OUTPUT_CHANNELS)
+            .map(|c| c[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (i32::from(w[1]) - i32::from(w[0])).abs())
+            .max()
+            .unwrap();
+        assert!(max_step_l < 1100, "unexpected discontinuity: {max_step_l}");
+
+        mixer.clear_aux_pcm();
+        assert_eq!(mixer.aux_rate_ratio(), 1.0);
+        mixer.push_aux_pcm(&sine, 48_000, 2);
+        mixer.set_aux_rate_ratio(1.02);
+        let start_played = mixer.aux_played_frames();
+        for _ in 0..4 {
+            mixer.mix_into(&mut buf);
+        }
+        let fast_played = mixer.aux_played_frames() - start_played;
+        assert!(
+            (1019..=1021).contains(&fast_played),
+            "expected ~1020 frames consumed at 1.02x, got {fast_played}"
+        );
     }
 }

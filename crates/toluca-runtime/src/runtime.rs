@@ -1566,45 +1566,47 @@ unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u3
         return;
     }
 
-    if target_va == GUEST_RETURN_SENTINEL {
-        state.exit_reason = ExitReason::Halt as u32;
-        state.exit_detail = target_va;
-        return;
-    }
+    if target_va >= IMPORT_THUNK_BASE {
+        if target_va == GUEST_RETURN_SENTINEL {
+            state.exit_reason = ExitReason::Halt as u32;
+            state.exit_detail = target_va;
+            return;
+        }
 
-    if (IMPORT_THUNK_BASE..IMPORT_THUNK_END).contains(&target_va)
-        && (target_va - IMPORT_THUNK_BASE).is_multiple_of(THUNK_STRIDE)
-    {
-        let slot_idx = (target_va - IMPORT_THUNK_BASE) / THUNK_STRIDE;
-        with_locked_ctx(tctx, state, PerfCallKind::Import(slot_idx), |ctx, state| {
-            dispatch_import_slot(ctx, state, slot_idx);
-        });
-        return;
-    }
+        if (IMPORT_THUNK_BASE..IMPORT_THUNK_END).contains(&target_va)
+            && (target_va - IMPORT_THUNK_BASE).is_multiple_of(THUNK_STRIDE)
+        {
+            let slot_idx = (target_va - IMPORT_THUNK_BASE) / THUNK_STRIDE;
+            with_locked_ctx(tctx, state, PerfCallKind::Import(slot_idx), |ctx, state| {
+                dispatch_import_slot(ctx, state, slot_idx);
+            });
+            return;
+        }
 
-    if let Some((iface, method_idx)) = toluca_d3d8::decode_com_thunk(target_va) {
-        with_locked_ctx(
-            tctx,
-            state,
-            PerfCallKind::Com {
-                iface: iface as u32,
-                method: method_idx,
-            },
-            |ctx, state| {
-                crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_idx);
-            },
-        );
-        return;
-    }
+        if let Some((iface, method_idx)) = toluca_d3d8::decode_com_thunk(target_va) {
+            with_locked_ctx(
+                tctx,
+                state,
+                PerfCallKind::Com {
+                    iface: iface as u32,
+                    method: method_idx,
+                },
+                |ctx, state| {
+                    crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_idx);
+                },
+            );
+            return;
+        }
 
-    if (COM_THUNK_BASE..GUEST_THUNK_END).contains(&target_va) {
-        state.exit_reason = ExitReason::HostTrap as u32;
-        state.exit_detail = target_va;
-        tctx.trap = Some(TrapInfo::UnimplementedCom {
-            interface_id: 0,
-            method_index: 0,
-        });
-        return;
+        if (COM_THUNK_BASE..GUEST_THUNK_END).contains(&target_va) {
+            state.exit_reason = ExitReason::HostTrap as u32;
+            state.exit_detail = target_va;
+            tctx.trap = Some(TrapInfo::UnimplementedCom {
+                interface_id: 0,
+                method_index: 0,
+            });
+            return;
+        }
     }
 
     let adxm_action = tctx.shared.adxm_shim.as_ref().and_then(|shim| {

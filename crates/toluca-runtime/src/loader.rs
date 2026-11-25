@@ -6,9 +6,19 @@ use std::ptr::NonNull;
 
 use toluca_core::GuestAddr;
 pub use toluca_core::aot::flush_icache;
-use toluca_core::aot::{AOT_CODE_ALIGNMENT, AotError, AotManifest, TargetArch};
+use toluca_core::aot::{AOT_CODE_ALIGNMENT, AotError, AotManifest, DispatchEntry, TargetArch};
 use toluca_core::bridge::RecompiledFn;
 use toluca_core::pe::PeImage;
+
+const VA_HASH_MULT: u32 = 0x9E37_79B1;
+const VA_TABLE_MIN_LEN: usize = 64;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct VaCacheEntry {
+    va: u32,
+    code_offset: u32,
+}
 
 #[derive(Debug)]
 pub enum LoaderError {
@@ -73,6 +83,9 @@ pub struct AotCodeImage {
     manifest: AotManifest,
     code_base: Option<NonNull<u8>>,
     code_len: usize,
+    va_table: Vec<VaCacheEntry>,
+    va_mask: usize,
+    va_shift: u32,
 }
 
 unsafe impl Send for AotCodeImage {}
@@ -91,6 +104,8 @@ impl AotCodeImage {
             });
         }
 
+        let (va_table, va_mask, va_shift) = build_va_table(&manifest.dispatch);
+
         let code_sec = manifest.code_section;
         let host_page_size = query_host_page_size();
         let required_align = AOT_CODE_ALIGNMENT.max(host_page_size as u64);
@@ -106,6 +121,9 @@ impl AotCodeImage {
                 manifest,
                 code_base: None,
                 code_len: 0,
+                va_table,
+                va_mask,
+                va_shift,
             });
         }
 
@@ -139,6 +157,9 @@ impl AotCodeImage {
             manifest,
             code_base,
             code_len,
+            va_table,
+            va_mask,
+            va_shift,
         })
     }
 
@@ -152,10 +173,27 @@ impl AotCodeImage {
         Ok(())
     }
 
+    fn lookup_code_offset(&self, va: GuestAddr) -> Option<u32> {
+        if va == 0 {
+            return self.manifest.lookup_va(va).map(|entry| entry.code_offset);
+        }
+        let mask = self.va_mask;
+        let mut slot = ((va.wrapping_mul(VA_HASH_MULT)) >> self.va_shift) as usize & mask;
+        loop {
+            let entry = self.va_table[slot];
+            if entry.va == va {
+                return Some(entry.code_offset);
+            }
+            if entry.va == 0 {
+                return None;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
     pub fn resolve_va(&self, va: GuestAddr) -> Option<RecompiledFn> {
-        let entry = self.manifest.lookup_va(va)?;
         let base = self.code_base?;
-        let offset = entry.code_offset as usize;
+        let offset = self.lookup_code_offset(va)? as usize;
         if offset >= self.code_len {
             return None;
         }
@@ -180,36 +218,15 @@ impl AotCodeImage {
 
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
-        use toluca_core::aot::{AotHeader, SectionEntry};
+        let manifest = empty_test_manifest(Vec::new());
+        let (va_table, va_mask, va_shift) = build_va_table(&manifest.dispatch);
         Self {
-            manifest: AotManifest {
-                header: AotHeader {
-                    magic: *b"TLCA",
-                    format_version: 1,
-                    arch: 1,
-                    flags: 0,
-                    section_count: 0,
-                    source_sha1: [0; 20],
-                    entry_guest_va: 0,
-                    image_base: 0,
-                    payload_crc32: 0,
-                    total_file_size: 0,
-                    reserved: [0; 8],
-                },
-                code_section: SectionEntry {
-                    kind: 1,
-                    flags: 0,
-                    file_offset: 0,
-                    byte_len: 0,
-                    entry_count: 0,
-                    crc32: 0,
-                },
-                dispatch: Vec::new(),
-                relocations: Vec::new(),
-                imports: Vec::new(),
-            },
+            manifest,
             code_base: None,
             code_len: 0,
+            va_table,
+            va_mask,
+            va_shift,
         }
     }
 }
@@ -224,7 +241,155 @@ impl Drop for AotCodeImage {
     }
 }
 
+fn build_va_table(dispatch: &[DispatchEntry]) -> (Vec<VaCacheEntry>, usize, u32) {
+    let min_slots = dispatch.len().saturating_mul(2).max(VA_TABLE_MIN_LEN);
+    let cap = min_slots.next_power_of_two();
+    let mask = cap - 1;
+    let shift = 32u32.saturating_sub(cap.trailing_zeros());
+    let mut table = vec![VaCacheEntry::default(); cap];
+
+    for entry in dispatch {
+        if entry.guest_va == 0 {
+            continue;
+        }
+        let mut slot = ((entry.guest_va.wrapping_mul(VA_HASH_MULT)) >> shift) as usize & mask;
+        while table[slot].va != 0 {
+            if table[slot].va == entry.guest_va {
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        table[slot] = VaCacheEntry {
+            va: entry.guest_va,
+            code_offset: entry.code_offset,
+        };
+    }
+
+    (table, mask, shift)
+}
+
+#[cfg(test)]
+fn empty_test_manifest(dispatch: Vec<DispatchEntry>) -> AotManifest {
+    use toluca_core::aot::{AotHeader, SectionEntry};
+    AotManifest {
+        header: AotHeader {
+            magic: *b"TLCA",
+            format_version: 1,
+            arch: 1,
+            flags: 0,
+            section_count: 0,
+            source_sha1: [0; 20],
+            entry_guest_va: 0,
+            image_base: 0,
+            payload_crc32: 0,
+            total_file_size: 0,
+            reserved: [0; 8],
+        },
+        code_section: SectionEntry {
+            kind: 1,
+            flags: 0,
+            file_offset: 0,
+            byte_len: 0,
+            entry_count: 0,
+            crc32: 0,
+        },
+        dispatch,
+        relocations: Vec::new(),
+        imports: Vec::new(),
+    }
+}
+
 fn query_host_page_size() -> usize {
     let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(raw).unwrap_or(4096).max(4096)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_image_with_dispatch(mut dispatch: Vec<DispatchEntry>, code_len: usize) -> AotCodeImage {
+        dispatch.sort_by_key(|entry| entry.guest_va);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                code_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "anonymous mmap for test image failed");
+        let code_base = NonNull::new(ptr.cast::<u8>());
+        let (va_table, va_mask, va_shift) = build_va_table(&dispatch);
+        AotCodeImage {
+            manifest: empty_test_manifest(dispatch),
+            code_base,
+            code_len,
+            va_table,
+            va_mask,
+            va_shift,
+        }
+    }
+
+    fn fn_offset(img: &AotCodeImage, f: RecompiledFn) -> usize {
+        let base = img.code_base.unwrap().as_ptr() as usize;
+        (f as usize) - base
+    }
+
+    #[test]
+    fn resolve_va_handles_hits_misses_collisions_and_zero() {
+        // Choose two VAs that deliberately hash to the exact same initial slot when cap == 64.
+        let shift = 32 - VA_TABLE_MIN_LEN.trailing_zeros();
+        let mask = VA_TABLE_MIN_LEN - 1;
+        let va1 = 0x0040_1000u32;
+        let bucket1 = ((va1.wrapping_mul(VA_HASH_MULT)) >> shift) as usize & mask;
+        let mut va2 = 0x0040_2000u32;
+        while (((va2.wrapping_mul(VA_HASH_MULT)) >> shift) as usize & mask) != bucket1 {
+            va2 += 0x10;
+        }
+
+        let entries = vec![
+            DispatchEntry {
+                guest_va: 0,
+                code_offset: 0x0100,
+                code_size: 16,
+                flags: 0,
+            },
+            DispatchEntry {
+                guest_va: va1,
+                code_offset: 0x0200,
+                code_size: 16,
+                flags: 0,
+            },
+            DispatchEntry {
+                guest_va: va2,
+                code_offset: 0x0300,
+                code_size: 16,
+                flags: 0,
+            },
+        ];
+        let img = test_image_with_dispatch(entries, 4096);
+
+        assert_eq!(img.resolve_va(va1).map(|f| fn_offset(&img, f)), Some(0x0200));
+        assert_eq!(img.resolve_va(va2).map(|f| fn_offset(&img, f)), Some(0x0300));
+        assert_eq!(img.resolve_va(0).map(|f| fn_offset(&img, f)), Some(0x0100));
+        assert!(img.resolve_va(0x0040_9999).is_none());
+
+        // Missing VA that hashes to the same colliding bucket must still terminate and return None.
+        let mut va_miss_same_bucket = va2 + 0x10;
+        while (((va_miss_same_bucket.wrapping_mul(VA_HASH_MULT)) >> shift) as usize & mask) != bucket1
+            || va_miss_same_bucket == va1
+            || va_miss_same_bucket == va2
+        {
+            va_miss_same_bucket += 0x10;
+        }
+        assert!(img.resolve_va(va_miss_same_bucket).is_none());
+
+        // Verify empty_for_test safely misses on both zero and non-zero VAs.
+        let empty = AotCodeImage::empty_for_test();
+        assert!(empty.resolve_va(0).is_none());
+        assert!(empty.resolve_va(va1).is_none());
+    }
 }

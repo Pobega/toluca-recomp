@@ -911,6 +911,12 @@ struct BinkInstance {
     selected_audio_track: Option<BinkAudioTrack>,
     next_frame_due: Instant,
     start_audio_frames: u64,
+    open_instant: Instant,
+    first_frame_instant: Option<Instant>,
+    wait_true: u32,
+    wait_false: u32,
+    dec_ns: u64,
+    yuv_ns: u64,
     decoder: Option<FfmpegDecoder>,
     current_frame: Option<DecodedVideoFrame>,
 }
@@ -1037,11 +1043,44 @@ fn select_audio_track(
     (0, Some(header.audio_tracks[0]))
 }
 
+const BINK_PERF_LOG_FRAME_STRIDE: u32 = 30;
+
 fn bink_perf_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("TOLUCA_PERF").is_some_and(|v| !v.is_empty() && v != "0")
     })
+}
+
+fn log_bink_perf(inst: &BinkInstance, mixer_mutex: &std::sync::Mutex<DsoundMixer>) {
+    let open_ms = inst.open_instant.elapsed().as_millis();
+    let play_ms = inst
+        .first_frame_instant
+        .map_or(0, |t| t.elapsed().as_millis());
+    let vid_ms = inst.header.frame_duration().as_nanos()
+        * u128::from(inst.frame_num.saturating_sub(1))
+        / 1_000_000;
+    let (aud_ms, aud_q_ms) = if let Ok(mixer) = mixer_mutex.lock() {
+        let rate = u64::from(mixer.output_sample_rate().max(1));
+        let played = mixer
+            .aux_played_frames()
+            .saturating_sub(inst.start_audio_frames)
+            * 1000
+            / rate;
+        let queued = (mixer.aux_queued_frames() as u64) * 1000 / rate;
+        (played, queued)
+    } else {
+        (0, 0)
+    };
+    let dec_ms = (inst.dec_ns as f64) / 1_000_000.0;
+    let yuv_ms = (inst.yuv_ns as f64) / 1_000_000.0;
+    eprintln!(
+        "[toluca-bink-perf] frame={}/{} open_ms={open_ms} play_ms={play_ms} vid_ms={vid_ms} aud_ms={aud_ms} aud_q_ms={aud_q_ms} wait_t={} wait_f={} dec_ms={dec_ms:.1} yuv_ms={yuv_ms:.1}",
+        inst.frame_num,
+        inst.header.num_frames,
+        inst.wait_true,
+        inst.wait_false,
+    );
 }
 
 fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
@@ -1103,6 +1142,7 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
     } else {
         0
     };
+    let now = Instant::now();
     ctx.win32.bink.instances.insert(
         bink_va,
         BinkInstance {
@@ -1113,8 +1153,14 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
             paused: false,
             sound_on,
             selected_audio_track,
-            next_frame_due: Instant::now() + frame_period,
+            next_frame_due: now + frame_period,
             start_audio_frames,
+            open_instant: now,
+            first_frame_instant: None,
+            wait_true: 0,
+            wait_false: 0,
+            dec_ns: 0,
+            yuv_ns: 0,
             decoder,
             current_frame: None,
         },
@@ -1127,6 +1173,9 @@ fn bink_open(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
 fn bink_close(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let bink_va = peek_arg_u32(cpu, ctx.arena, 0)?;
     if let Some(inst) = ctx.win32.bink.instances.remove(&bink_va) {
+        if bink_perf_enabled() {
+            log_bink_perf(&inst, &ctx.win32.dsound.mixer);
+        }
         if let (Some(dec), Some(api)) = (inst.decoder, ctx.win32.bink.ffmpeg.as_ref()) {
             dec.close(api);
         }
@@ -1247,9 +1296,17 @@ fn bink_wait(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<()
         return_stdcall(cpu, ctx.arena, 1, 0)?;
         return Ok(());
     }
-    let wait = match ctx.win32.bink.instances.get(&bink_va) {
+    let wait = match ctx.win32.bink.instances.get_mut(&bink_va) {
         Some(inst) if inst.decoder.is_some() => {
-            u32::from(should_wait_for_frame(inst, &ctx.win32.dsound.mixer))
+            let should_wait = should_wait_for_frame(inst, &ctx.win32.dsound.mixer);
+            if bink_perf_enabled() {
+                if should_wait {
+                    inst.wait_true = inst.wait_true.saturating_add(1);
+                } else {
+                    inst.wait_false = inst.wait_false.saturating_add(1);
+                }
+            }
+            u32::from(should_wait)
         }
         _ => 0,
     };
@@ -1264,6 +1321,11 @@ fn bink_do_frame(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
         return Ok(());
     };
 
+    let perf = bink_perf_enabled();
+    if perf {
+        inst.first_frame_instant.get_or_insert_with(Instant::now);
+    }
+    let dec_t0 = perf.then(Instant::now);
     let (decoded_vid, decoded_aud) = if let (Some(dec), Some(api)) =
         (inst.decoder.as_mut(), ctx.win32.bink.ffmpeg.as_ref())
     {
@@ -1271,6 +1333,9 @@ fn bink_do_frame(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
     } else {
         (None, Vec::new())
     };
+    if let Some(start) = dec_t0 {
+        inst.dec_ns += start.elapsed().as_nanos() as u64;
+    }
 
     if let Some(vid) = decoded_vid {
         inst.current_frame = Some(vid);
@@ -1301,6 +1366,20 @@ fn bink_do_frame(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
         inst.last_frame_num,
         inst.open_flags,
     )?;
+
+    if perf
+        && (inst.frame_num == 1
+            || inst.frame_num == 2
+            || inst.frame_num.is_multiple_of(BINK_PERF_LOG_FRAME_STRIDE))
+    {
+        log_bink_perf(inst, &ctx.win32.dsound.mixer);
+        if inst.frame_num.is_multiple_of(BINK_PERF_LOG_FRAME_STRIDE) {
+            inst.wait_true = 0;
+            inst.wait_false = 0;
+            inst.dec_ns = 0;
+            inst.yuv_ns = 0;
+        }
+    }
 
     return_stdcall(cpu, ctx.arena, 1, 0)?;
     Ok(())
@@ -1369,6 +1448,7 @@ fn bink_copy_to_buffer(
         return Ok(());
     };
 
+    let yuv_t0 = bink_perf_enabled().then(Instant::now);
     let ret = copy_frame_to_guest_surface(
         ctx.arena,
         &frame,
@@ -1381,6 +1461,11 @@ fn bink_copy_to_buffer(
             flags,
         },
     )?;
+    if let Some(start) = yuv_t0 {
+        if let Some(inst) = ctx.win32.bink.instances.get_mut(&bink_va) {
+            inst.yuv_ns += start.elapsed().as_nanos() as u64;
+        }
+    }
     return_stdcall(cpu, ctx.arena, 7, ret)?;
     Ok(())
 }
@@ -1674,6 +1759,12 @@ mod tests {
             selected_audio_track: None,
             next_frame_due: Instant::now() + Duration::from_secs(5),
             start_audio_frames: 1_000,
+            open_instant: Instant::now(),
+            first_frame_instant: None,
+            wait_true: 0,
+            wait_false: 0,
+            dec_ns: 0,
+            yuv_ns: 0,
             decoder: None,
             current_frame: None,
         };

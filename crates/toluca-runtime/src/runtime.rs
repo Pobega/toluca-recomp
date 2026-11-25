@@ -3,7 +3,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use toluca_core::GuestAddr;
@@ -536,6 +536,7 @@ impl Runtime {
             trap: None,
             pending_error: None,
             suspend_slot: None,
+            perf: rt_perf_enabled().then(MainThreadPerf::new),
         };
         let bridge = build_host_bridge((&raw mut tctx).cast());
         cpu.bridge = &bridge;
@@ -729,6 +730,178 @@ fn build_host_bridge(user_data: *mut core::ffi::c_void) -> HostBridge {
     }
 }
 
+const RT_PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const RT_PERF_CHECK_STRIDE: u32 = 256;
+
+fn rt_perf_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TOLUCA_PERF").is_some_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+fn thread_cpu_time_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        if rc == 0 {
+            return (ts.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec as u64);
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+fn format_import_slot_name(imports: &[ResolvedImportSlot], slot_idx: u32) -> String {
+    match imports.get(slot_idx as usize) {
+        Some(slot) => match &slot.symbol {
+            ImportSymbol::Name(name) => name.clone(),
+            ImportSymbol::Ordinal(ord) => format!("{}#{}", slot.dll_name, ord),
+        },
+        None => format!("slot#{slot_idx}"),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PerfCallKind {
+    Import(u32),
+    Com { iface: u32, method: u32 },
+}
+
+struct MainThreadPerf {
+    wall_start: Instant,
+    cpu_start_ns: u64,
+    lock_wait_ns: u64,
+    imp_ns: u64,
+    imp_calls: u64,
+    com_ns: u64,
+    com_calls: u64,
+    ind_calls: u64,
+    ind_lookup_ns: u64,
+    wait_ns: u64,
+    imp_by_slot: HashMap<u32, (u64, u64)>,
+    com_by_method: HashMap<(u32, u32), (u64, u64)>,
+    check_counter: u32,
+}
+
+impl MainThreadPerf {
+    fn new() -> Self {
+        Self {
+            wall_start: Instant::now(),
+            cpu_start_ns: thread_cpu_time_ns(),
+            lock_wait_ns: 0,
+            imp_ns: 0,
+            imp_calls: 0,
+            com_ns: 0,
+            com_calls: 0,
+            ind_calls: 0,
+            ind_lookup_ns: 0,
+            wait_ns: 0,
+            imp_by_slot: HashMap::new(),
+            com_by_method: HashMap::new(),
+            check_counter: 0,
+        }
+    }
+
+    fn record_import(&mut self, slot: u32, elapsed_ns: u64) {
+        self.imp_calls += 1;
+        self.imp_ns += elapsed_ns;
+        let entry = self.imp_by_slot.entry(slot).or_insert((0, 0));
+        entry.0 += elapsed_ns;
+        entry.1 += 1;
+    }
+
+    fn record_com(&mut self, iface: u32, method: u32, elapsed_ns: u64) {
+        self.com_calls += 1;
+        self.com_ns += elapsed_ns;
+        let entry = self.com_by_method.entry((iface, method)).or_insert((0, 0));
+        entry.0 += elapsed_ns;
+        entry.1 += 1;
+    }
+
+    fn needs_flush(&self) -> bool {
+        self.wall_start.elapsed() >= RT_PERF_LOG_INTERVAL
+    }
+
+    fn maybe_flush(&mut self, imports: &[ResolvedImportSlot], force_check: bool) {
+        if !force_check {
+            self.check_counter = self.check_counter.wrapping_add(1);
+            if !self.check_counter.is_multiple_of(RT_PERF_CHECK_STRIDE) {
+                return;
+            }
+        }
+        let now = Instant::now();
+        let wall_dur = now.duration_since(self.wall_start);
+        if wall_dur < RT_PERF_LOG_INTERVAL {
+            return;
+        }
+        let cpu_now_ns = thread_cpu_time_ns();
+        let cpu_ns = cpu_now_ns.saturating_sub(self.cpu_start_ns);
+        let wall_ms = wall_dur.as_millis() as u64;
+        let cpu_ms = cpu_ns / 1_000_000;
+        let wait_ms = self.wait_ns / 1_000_000;
+        let lock_ms = self.lock_wait_ns / 1_000_000;
+        let imp_ms = self.imp_ns / 1_000_000;
+        let com_ms = self.com_ns / 1_000_000;
+        let host_ns = self.imp_ns.saturating_add(self.com_ns);
+        let host_ms = host_ns / 1_000_000;
+        let preempt_ms = wall_ms.saturating_sub(wait_ms).saturating_sub(cpu_ms);
+        let guest_ms = cpu_ms.saturating_sub(host_ms);
+        let ind_ms = (self.ind_lookup_ns as f64) / 1_000_000.0;
+
+        let (top_com_iface, top_com_method, top_com_ms, top_com_calls) = self
+            .com_by_method
+            .iter()
+            .max_by_key(|(_, (ns, _))| *ns)
+            .map_or(("none", 0, 0.0, 0), |(&(iface_id, method), &(ns, calls))| {
+                let iface_name = toluca_d3d8::ComInterfaceId::from_u32(iface_id)
+                    .map_or("unknown", |id| id.name());
+                (iface_name, method, (ns as f64) / 1_000_000.0, calls)
+            });
+
+        let (top_imp_name, top_imp_ms, top_imp_calls) = self
+            .imp_by_slot
+            .iter()
+            .max_by_key(|(_, (ns, _))| *ns)
+            .map_or_else(
+                || ("none".to_string(), 0.0, 0),
+                |(&slot_idx, &(ns, calls))| {
+                    let name = format_import_slot_name(imports, slot_idx);
+                    (name, (ns as f64) / 1_000_000.0, calls)
+                },
+            );
+
+        eprintln!(
+            "[toluca-rt] wall={wall_ms}ms cpu={cpu_ms}ms preempt={preempt_ms}ms wait={wait_ms}ms host={host_ms}ms(lock={lock_ms}ms imp={imp_ms}ms/{} com={com_ms}ms/{}) guest={guest_ms}ms ind={}({ind_ms:.1}ms) top_com={top_com_iface}:{top_com_method}({top_com_ms:.1}ms/{top_com_calls}) top_imp={top_imp_name}({top_imp_ms:.1}ms/{top_imp_calls})",
+            self.imp_calls,
+            self.com_calls,
+            self.ind_calls,
+        );
+
+        self.wall_start = now;
+        self.cpu_start_ns = cpu_now_ns;
+        self.lock_wait_ns = 0;
+        self.imp_ns = 0;
+        self.imp_calls = 0;
+        self.com_ns = 0;
+        self.com_calls = 0;
+        self.ind_calls = 0;
+        self.ind_lookup_ns = 0;
+        self.wait_ns = 0;
+        self.imp_by_slot.clear();
+        self.com_by_method.clear();
+    }
+}
+
 struct ThreadBridgeContext {
     shared: Arc<SharedRuntime>,
     tid: u64,
@@ -736,6 +909,7 @@ struct ThreadBridgeContext {
     trap: Option<TrapInfo>,
     pending_error: Option<RuntimeError>,
     suspend_slot: Option<&'static crate::win32::ThreadSuspendState>,
+    perf: Option<MainThreadPerf>,
 }
 
 unsafe fn thread_ctx_from_cpu<'a>(
@@ -750,6 +924,7 @@ unsafe fn thread_ctx_from_cpu<'a>(
 fn with_locked_ctx<R>(
     tctx: &mut ThreadBridgeContext,
     state: &mut GuestCpuState,
+    perf_kind: PerfCallKind,
     f: impl FnOnce(&mut RuntimeContext<'_>, &mut GuestCpuState) -> R,
 ) -> R {
     if let Some(inner_ptr) = tctx.held_inner {
@@ -777,8 +952,11 @@ fn with_locked_ctx<R>(
         slot.in_host_code.store(true, Ordering::SeqCst);
     }
 
-    let (result, pending_wait, pending_threads, pending_timers, killed_timers, notify_sync) = {
+    let perf_enabled = tctx.perf.is_some();
+    let (result, pending_wait, pending_threads, pending_timers, killed_timers, notify_sync, lock_ns, call_ns) = {
+        let lock_t0 = perf_enabled.then(Instant::now);
         let mut guard = tctx.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let lock_ns = lock_t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
         tctx.held_inner = Some(&raw mut *guard);
         let inner = &mut *guard;
         let mut ctx = RuntimeContext {
@@ -797,15 +975,28 @@ fn with_locked_ctx<R>(
             trap: &mut tctx.trap,
             pending_error: &mut tctx.pending_error,
         };
+        let call_t0 = perf_enabled.then(Instant::now);
         let res = f(&mut ctx, state);
+        let call_ns = call_t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
         let wait = inner.win32.pending_wait.take();
         let threads = std::mem::take(&mut inner.win32.pending_threads);
         let timers = std::mem::take(&mut inner.win32.pending_timers);
         let killed = std::mem::take(&mut inner.win32.pending_killed_timers);
         let notify = std::mem::replace(&mut inner.win32.notify_sync, false);
         tctx.held_inner = None;
-        (res, wait, threads, timers, killed, notify)
+        if let Some(perf) = tctx.perf.as_mut() {
+            perf.lock_wait_ns += lock_ns;
+            match perf_kind {
+                PerfCallKind::Import(slot) => perf.record_import(slot, call_ns),
+                PerfCallKind::Com { iface, method } => perf.record_com(iface, method, call_ns),
+            }
+            if wait.is_none() {
+                perf.maybe_flush(&inner.imports, false);
+            }
+        }
+        (res, wait, threads, timers, killed, notify, lock_ns, call_ns)
     };
+    let _ = (lock_ns, call_ns);
 
     if notify_sync {
         tctx.shared.sync_cv.notify_all();
@@ -817,7 +1008,15 @@ fn with_locked_ctx<R>(
         schedule_timers(&tctx.shared, pending_timers, killed_timers);
     }
     if let Some(wait) = pending_wait {
+        let wait_t0 = tctx.perf.is_some().then(Instant::now);
         perform_host_wait(&tctx.shared, tctx.tid, state, wait);
+        if let (Some(perf), Some(start)) = (tctx.perf.as_mut(), wait_t0) {
+            perf.wait_ns += start.elapsed().as_nanos() as u64;
+            if perf.needs_flush() {
+                let guard = tctx.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                perf.maybe_flush(&guard.imports, true);
+            }
+        }
     }
     if let Some(slot) = tctx.suspend_slot {
         slot.in_host_code.store(false, Ordering::SeqCst);
@@ -1082,7 +1281,7 @@ unsafe extern "C" fn bridge_call_import(cpu: *mut GuestCpuState, import_index: u
         state.exit_reason = ExitReason::Halt as u32;
         return;
     }
-    with_locked_ctx(tctx, state, |ctx, state| {
+    with_locked_ctx(tctx, state, PerfCallKind::Import(import_index), |ctx, state| {
         dispatch_import_slot(ctx, state, import_index);
     });
 }
@@ -1109,16 +1308,24 @@ unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u3
         && (target_va - IMPORT_THUNK_BASE).is_multiple_of(THUNK_STRIDE)
     {
         let slot_idx = (target_va - IMPORT_THUNK_BASE) / THUNK_STRIDE;
-        with_locked_ctx(tctx, state, |ctx, state| {
+        with_locked_ctx(tctx, state, PerfCallKind::Import(slot_idx), |ctx, state| {
             dispatch_import_slot(ctx, state, slot_idx);
         });
         return;
     }
 
     if let Some((iface, method_idx)) = toluca_d3d8::decode_com_thunk(target_va) {
-        with_locked_ctx(tctx, state, |ctx, state| {
-            crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_idx);
-        });
+        with_locked_ctx(
+            tctx,
+            state,
+            PerfCallKind::Com {
+                iface: iface as u32,
+                method: method_idx,
+            },
+            |ctx, state| {
+                crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_idx);
+            },
+        );
         return;
     }
 
@@ -1132,7 +1339,13 @@ unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u3
         return;
     }
 
-    if let Some(target_fn) = tctx.shared.code.resolve_va(target_va) {
+    let lookup_t0 = tctx.perf.is_some().then(Instant::now);
+    let resolved = tctx.shared.code.resolve_va(target_va);
+    if let (Some(perf), Some(start)) = (tctx.perf.as_mut(), lookup_t0) {
+        perf.ind_calls += 1;
+        perf.ind_lookup_ns += start.elapsed().as_nanos() as u64;
+    }
+    if let Some(target_fn) = resolved {
         unsafe {
             target_fn(cpu);
         }
@@ -1156,9 +1369,17 @@ unsafe extern "C" fn bridge_call_com(
         return;
     }
     if let Some(iface) = toluca_d3d8::ComInterfaceId::from_u32(interface_id) {
-        with_locked_ctx(tctx, state, |ctx, state| {
-            crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_index);
-        });
+        with_locked_ctx(
+            tctx,
+            state,
+            PerfCallKind::Com {
+                iface: interface_id,
+                method: method_index,
+            },
+            |ctx, state| {
+                crate::win32::d3d8::dispatch_com_call(ctx, state, iface, method_index);
+            },
+        );
         return;
     }
     state.exit_reason = ExitReason::HostTrap as u32;
@@ -1456,6 +1677,7 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
                     trap: None,
                     pending_error: None,
                     suspend_slot,
+                    perf: None,
                 };
                 let bridge = build_host_bridge((&raw mut tctx).cast());
                 cpu.bridge = &bridge;
@@ -1633,6 +1855,7 @@ fn timer_worker_loop(shared: Arc<SharedRuntime>, done: Arc<AtomicBool>) {
                     trap: None,
                     pending_error: None,
                     suspend_slot: None,
+                    perf: None,
                 };
                 let bridge = build_host_bridge((&raw mut tctx).cast());
                 cpu.bridge = &bridge;

@@ -40,10 +40,14 @@ struct AdxmLockCandidate {
     prev_prio_va: GuestAddr,
 }
 
+#[cfg(target_os = "linux")]
+const ADXM_CEILING_NICE: i32 = -19;
+
 #[derive(Default)]
 struct AdxmLockState {
     owner_tid: u64,
     depth: u32,
+    saved_nice: Option<i32>,
 }
 
 pub struct AdxmMutexShim {
@@ -85,10 +89,14 @@ impl AdxmMutexShim {
         if shutdown.load(Ordering::Acquire) && tid != 1 {
             return 0;
         }
+        let is_outer = guard.depth == 0;
         guard.owner_tid = tid;
         guard.depth = guard.depth.saturating_add(1);
         let depth = guard.depth;
         write_guest_depth(arena_base, self.lock_depth_va, depth);
+        if is_outer {
+            guard.saved_nice = boost_calling_thread_nice();
+        }
         depth
     }
 
@@ -100,8 +108,15 @@ impl AdxmMutexShim {
         guard.depth -= 1;
         let depth = guard.depth;
         write_guest_depth(arena_base, self.lock_depth_va, depth);
-        if depth == 0 {
+        let saved = if depth == 0 {
             guard.owner_tid = 0;
+            guard.saved_nice.take()
+        } else {
+            None
+        };
+        drop(guard);
+        if depth == 0 {
+            restore_calling_thread_nice(saved);
             self.cv.notify_one();
         }
         depth
@@ -112,7 +127,10 @@ impl AdxmMutexShim {
         if guard.owner_tid == tid {
             guard.depth = 0;
             guard.owner_tid = 0;
+            let saved = guard.saved_nice.take();
             write_guest_depth(arena_base, self.lock_depth_va, 0);
+            drop(guard);
+            restore_calling_thread_nice(saved);
             self.cv.notify_all();
         }
     }
@@ -122,6 +140,45 @@ impl AdxmMutexShim {
         self.cv.notify_all();
     }
 }
+
+#[cfg(target_os = "linux")]
+fn current_thread_nice() -> Option<i32> {
+    unsafe {
+        *libc::__errno_location() = 0;
+        let prio = libc::getpriority(libc::PRIO_PROCESS, 0);
+        if *libc::__errno_location() != 0 {
+            return None;
+        }
+        Some(prio)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn boost_calling_thread_nice() -> Option<i32> {
+    let prev = current_thread_nice()?;
+    if prev <= ADXM_CEILING_NICE {
+        return None;
+    }
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, ADXM_CEILING_NICE) };
+    if rc == 0 { Some(prev) } else { None }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_calling_thread_nice(saved: Option<i32>) {
+    if let Some(prev) = saved {
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, prev);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn boost_calling_thread_nice() -> Option<i32> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn restore_calling_thread_nice(_saved: Option<i32>) {}
 
 fn write_guest_depth(arena_base: usize, lock_depth_va: GuestAddr, depth: u32) {
     if arena_base == 0 {

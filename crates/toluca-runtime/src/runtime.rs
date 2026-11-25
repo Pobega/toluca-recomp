@@ -476,7 +476,9 @@ impl Runtime {
                 );
             }
         }
-        crate::win32::set_split_guest_workers(adxm_shim.is_some());
+        let split_workers = adxm_shim.is_some()
+            && std::env::var_os("TOLUCA_SPLIT_WORKERS").is_some_and(|v| v == "1");
+        crate::win32::set_split_guest_workers(split_workers);
 
         let arena_base = arena.base_ptr() as usize;
         let inner = RuntimeInner {
@@ -903,7 +905,10 @@ enum PerfCallKind {
     Com { iface: u32, method: u32 },
 }
 
+const BG_RT_PERF_MIN_CPU_MS: u64 = 50;
+
 struct MainThreadPerf {
+    worker_label: Option<String>,
     main_os_tid: libc::pid_t,
     wall_start: Instant,
     cpu_start_ns: u64,
@@ -914,6 +919,7 @@ struct MainThreadPerf {
     com_calls: u64,
     ind_calls: u64,
     ind_lookup_ns: u64,
+    adxm_calls: u64,
     wait_ns: u64,
     imp_by_slot: HashMap<u32, (u64, u64)>,
     com_by_method: HashMap<(u32, u32), (u64, u64)>,
@@ -923,7 +929,16 @@ struct MainThreadPerf {
 
 impl MainThreadPerf {
     fn new() -> Self {
+        Self::with_label(None)
+    }
+
+    fn new_worker(label: String) -> Self {
+        Self::with_label(Some(label))
+    }
+
+    fn with_label(worker_label: Option<String>) -> Self {
         Self {
+            worker_label,
             main_os_tid: current_os_tid(),
             wall_start: Instant::now(),
             cpu_start_ns: thread_cpu_time_ns(),
@@ -934,6 +949,7 @@ impl MainThreadPerf {
             com_calls: 0,
             ind_calls: 0,
             ind_lookup_ns: 0,
+            adxm_calls: 0,
             wait_ns: 0,
             imp_by_slot: HashMap::new(),
             com_by_method: HashMap::new(),
@@ -1015,18 +1031,34 @@ impl MainThreadPerf {
                 },
             );
 
-        let (main_nice, bg_str) = format_bg_thread_summary(
-            self.main_os_tid,
-            guest_thread_tids,
-            &mut self.prev_bg_ticks,
-        );
-
-        eprintln!(
-            "[toluca-rt] wall={wall_ms}ms cpu={cpu_ms}ms preempt={preempt_ms}ms wait={wait_ms}ms host={host_ms}ms(lock={lock_ms}ms imp={imp_ms}ms/{} com={com_ms}ms/{}) guest={guest_ms}ms ind={}({ind_ms:.1}ms) top_com={top_com_iface}:{top_com_method}({top_com_ms:.1}ms/{top_com_calls}) top_imp={top_imp_name}({top_imp_ms:.1}ms/{top_imp_calls}) mn={main_nice} bg=[{bg_str}]",
-            self.imp_calls,
-            self.com_calls,
-            self.ind_calls,
-        );
+        if let Some(label) = self.worker_label.as_deref() {
+            if cpu_ms >= BG_RT_PERF_MIN_CPU_MS {
+                eprintln!(
+                    "[toluca-bg-rt] thread={label} wall={wall_ms}ms cpu={cpu_ms}ms host={host_ms}ms(lock={lock_ms}ms imp={imp_ms}ms/{} com={com_ms}ms/{}) guest={guest_ms}ms ind={}({ind_ms:.1}ms) adxm={} top_com={top_com_iface}:{top_com_method}({top_com_ms:.1}ms/{top_com_calls}) top_imp={top_imp_name}({top_imp_ms:.1}ms/{top_imp_calls})",
+                    self.imp_calls,
+                    self.com_calls,
+                    self.ind_calls,
+                    self.adxm_calls,
+                );
+            }
+        } else {
+            let (main_nice, bg_str) = format_bg_thread_summary(
+                self.main_os_tid,
+                guest_thread_tids,
+                &mut self.prev_bg_ticks,
+            );
+            let adxm_suffix = if self.adxm_calls > 0 {
+                format!(" adxm={}", self.adxm_calls)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[toluca-rt] wall={wall_ms}ms cpu={cpu_ms}ms preempt={preempt_ms}ms wait={wait_ms}ms host={host_ms}ms(lock={lock_ms}ms imp={imp_ms}ms/{} com={com_ms}ms/{}) guest={guest_ms}ms ind={}({ind_ms:.1}ms){adxm_suffix} top_com={top_com_iface}:{top_com_method}({top_com_ms:.1}ms/{top_com_calls}) top_imp={top_imp_name}({top_imp_ms:.1}ms/{top_imp_calls}) mn={main_nice} bg=[{bg_str}]",
+                self.imp_calls,
+                self.com_calls,
+                self.ind_calls,
+            );
+        }
 
         self.wall_start = now;
         self.cpu_start_ns = cpu_now_ns;
@@ -1037,6 +1069,7 @@ impl MainThreadPerf {
         self.com_calls = 0;
         self.ind_calls = 0;
         self.ind_lookup_ns = 0;
+        self.adxm_calls = 0;
         self.wait_ns = 0;
         self.imp_by_slot.clear();
         self.com_by_method.clear();
@@ -1452,11 +1485,16 @@ unsafe extern "C" fn bridge_call_import(cpu: *mut GuestCpuState, import_index: u
 }
 
 fn dispatch_adxm_shim(
-    tctx: &ThreadBridgeContext,
+    tctx: &mut ThreadBridgeContext,
     state: &mut GuestCpuState,
-    shim: &crate::adxm::AdxmMutexShim,
     is_lock: bool,
 ) {
+    if let Some(perf) = tctx.perf.as_mut() {
+        perf.adxm_calls += 1;
+    }
+    let Some(shim) = tctx.shared.adxm_shim.as_ref() else {
+        return;
+    };
     if let Some(slot) = tctx.suspend_slot {
         slot.in_host_code.store(true, Ordering::SeqCst);
     }
@@ -1548,15 +1586,18 @@ unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u3
         return;
     }
 
-    if let Some(shim) = tctx.shared.adxm_shim.as_ref() {
+    let adxm_action = tctx.shared.adxm_shim.as_ref().and_then(|shim| {
         if target_va == shim.lock_va() {
-            dispatch_adxm_shim(tctx, state, shim, true);
-            return;
+            Some(true)
+        } else if target_va == shim.unlock_va() {
+            Some(false)
+        } else {
+            None
         }
-        if target_va == shim.unlock_va() {
-            dispatch_adxm_shim(tctx, state, shim, false);
-            return;
-        }
+    });
+    if let Some(is_lock) = adxm_action {
+        dispatch_adxm_shim(tctx, state, is_lock);
+        return;
     }
 
     let lookup_t0 = tctx.perf.is_some().then(Instant::now);
@@ -1875,7 +1916,7 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
                     }
                     let (next_guard, _) = shared
                         .sync_cv
-                        .wait_timeout(guard, Duration::from_millis(10))
+                        .wait_timeout(guard, Duration::from_millis(250))
                         .unwrap_or_else(|e| e.into_inner());
                     guard = next_guard;
                 }
@@ -1899,7 +1940,8 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
                         trap: None,
                         pending_error: None,
                         suspend_slot,
-                        perf: None,
+                        perf: rt_perf_enabled()
+                            .then(|| MainThreadPerf::new_worker(format!("{:x}", spawn.start_va))),
                     };
                     let bridge = build_host_bridge((&raw mut tctx).cast());
                     cpu.bridge = &bridge;

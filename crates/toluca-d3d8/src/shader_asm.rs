@@ -522,6 +522,74 @@ pub fn translate_vs_1_x(tokens: &[u32], decl: &[VertexDeclElement]) -> Result<St
     Ok(glsl)
 }
 
+pub fn vs_required_const_count(tokens: &[u32]) -> u32 {
+    let Some(&version) = tokens.first() else {
+        return 0;
+    };
+    if (version & 0xFFFF_0000) != VS_VERSION_PREFIX {
+        return 0;
+    }
+
+    let mut max_const_end = 0u32;
+    let mut idx = 1usize;
+    while idx < tokens.len() {
+        let tok = tokens[idx];
+        idx += 1;
+        if tok == SHADER_END_TOKEN {
+            break;
+        }
+        let opcode = tok & 0xFFFF;
+        if opcode == D3DSIO_COMMENT {
+            let len = ((tok >> 16) & 0x7FFF) as usize;
+            idx = idx.saturating_add(len);
+            continue;
+        }
+        if opcode == D3DSIO_NOP {
+            continue;
+        }
+
+        if idx >= tokens.len() {
+            break;
+        }
+        idx += 1;
+
+        let src_count = match opcode {
+            D3DSIO_MOV | D3DSIO_RCP | D3DSIO_RSQ | D3DSIO_EXP | D3DSIO_EXPP | D3DSIO_LOG
+            | D3DSIO_LOGP | D3DSIO_LIT | D3DSIO_FRC => 1usize,
+            D3DSIO_ADD | D3DSIO_SUB | D3DSIO_MUL | D3DSIO_DP3 | D3DSIO_DP4 | D3DSIO_MIN
+            | D3DSIO_MAX | D3DSIO_SLT | D3DSIO_SGE | D3DSIO_DST => 2usize,
+            D3DSIO_MAD => 3usize,
+            D3DSIO_M4X4 | D3DSIO_M4X3 | D3DSIO_M3X4 | D3DSIO_M3X3 | D3DSIO_M3X2 => 2usize,
+            _ => return 96,
+        };
+        if idx + src_count > tokens.len() {
+            return 96;
+        }
+        for s_idx in 0..src_count {
+            let p = decode_param(tokens[idx + s_idx]);
+            if p.reg_type == REG_CONST {
+                if p.relative {
+                    return 96;
+                }
+                let span = if s_idx == 1 {
+                    match opcode {
+                        D3DSIO_M4X4 | D3DSIO_M3X4 => 4,
+                        D3DSIO_M4X3 | D3DSIO_M3X3 => 3,
+                        D3DSIO_M3X2 => 2,
+                        _ => 1,
+                    }
+                } else {
+                    1
+                };
+                max_const_end = max_const_end.max(p.reg_num + span);
+            }
+        }
+        idx += src_count;
+    }
+
+    max_const_end.min(96)
+}
+
 fn ps_reg_name(p: DecodedParam) -> Result<String, String> {
     match p.reg_type {
         REG_TEMP => Ok(format!("r{}", p.reg_num.min(5))),
@@ -736,4 +804,59 @@ pub fn translate_ps_1_x(
     writeln!(glsl, "    frag_color = current;").unwrap();
     writeln!(glsl, "}}").unwrap();
     Ok(glsl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vs_dst(reg_type: u32, reg_num: u32) -> u32 {
+        0x800F_0000 | ((reg_type & 0x7) << 28) | ((reg_type & 0x18) << 8) | (reg_num & 0x7FF)
+    }
+
+    fn vs_src(reg_type: u32, reg_num: u32, relative: bool) -> u32 {
+        let rel = if relative { SRC_REL_ADDR_MASK } else { 0 };
+        0x80E4_0000
+            | rel
+            | ((reg_type & 0x7) << 28)
+            | ((reg_type & 0x18) << 8)
+            | (reg_num & 0x7FF)
+    }
+
+    #[test]
+    fn vs_required_const_count_handles_direct_matrix_and_relative_addressing() {
+        // No constants -> 0
+        let no_const = [
+            0xFFFE_0101,
+            D3DSIO_MOV,
+            vs_dst(REG_RASTOUT, 0),
+            vs_src(REG_INPUT, 0, false),
+            SHADER_END_TOKEN,
+        ];
+        assert_eq!(vs_required_const_count(&no_const), 0);
+
+        // M4x4 at c4 uses c4..=c7 -> 8
+        let matrix_shader = [
+            0xFFFE_0101,
+            D3DSIO_M4X4,
+            vs_dst(REG_RASTOUT, 0),
+            vs_src(REG_INPUT, 0, false),
+            vs_src(REG_CONST, 4, false),
+            D3DSIO_MOV,
+            vs_dst(REG_ATTROUT, 0),
+            vs_src(REG_CONST, 10, false),
+            SHADER_END_TOKEN,
+        ];
+        assert_eq!(vs_required_const_count(&matrix_shader), 11);
+
+        // Relative c[a0.x + 2] -> 96
+        let relative_shader = [
+            0xFFFE_0101,
+            D3DSIO_MOV,
+            vs_dst(REG_RASTOUT, 0),
+            vs_src(REG_CONST, 2, true),
+            SHADER_END_TOKEN,
+        ];
+        assert_eq!(vs_required_const_count(&relative_shader), 96);
+    }
 }

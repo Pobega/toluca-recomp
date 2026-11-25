@@ -12,7 +12,7 @@ use crate::device::vertex_count_for_primitives;
 use crate::shader_asm::{
     D3DVSDT_D3DCOLOR, D3DVSDT_FLOAT1, D3DVSDT_FLOAT2, D3DVSDT_FLOAT3, D3DVSDT_FLOAT4,
     D3DVSDT_SHORT2, D3DVSDT_SHORT4, D3DVSDT_UBYTE4, VertexDeclElement, translate_ps_1_x,
-    translate_vs_1_x,
+    translate_vs_1_x, vs_required_const_count,
 };
 use crate::shader_cache::{
     CachedProgramBinary, ShaderRecipe, ShaderRecipeCache, save_bytes_atomically,
@@ -21,7 +21,7 @@ use crate::shader_ffp::{
     ATTR_DIFFUSE, ATTR_NORMAL, ATTR_POS, ATTR_SPECULAR, ATTR_TEX0, FfpShaderKey, MAX_FFP_LIGHTS,
     MAX_FFP_STAGES, TextureStageKey, generate_ffp_shaders,
 };
-use crate::state::DeviceState;
+use crate::state::{DeviceState, NUM_STREAM_SOURCES};
 use crate::texture::PreparedTextureUpload;
 use crate::types::{
     D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL,
@@ -791,6 +791,21 @@ impl PerfStats {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum AttribCacheKey {
+    Ffp {
+        vbo_id: GLuint,
+        fvf: u32,
+        stride: u32,
+        byte_offset: usize,
+    },
+    Decl {
+        vs_handle: u32,
+        base_vertex_offset: usize,
+        streams: [(GLuint, u32); NUM_STREAM_SOURCES],
+    },
+}
+
 #[allow(clippy::type_complexity)]
 struct GlStateCache {
     current_program: Option<GLuint>,
@@ -809,6 +824,8 @@ struct GlStateCache {
     stencil_enable: Option<bool>,
     stencil_state: Option<(GLenum, GLint, u32, GLenum, GLenum, GLenum, u32)>,
     bound_vao: Option<GLuint>,
+    bound_ebo: Option<GLuint>,
+    last_attrib_key: Option<AttribCacheKey>,
     enabled_attribs_mask: Option<u16>,
     last_render_state_gen: Option<u64>,
     last_viewport: Option<(u32, u32, u32, u32)>,
@@ -833,6 +850,8 @@ impl Default for GlStateCache {
             stencil_enable: None,
             stencil_state: None,
             bound_vao: None,
+            bound_ebo: None,
+            last_attrib_key: None,
             enabled_attribs_mask: None,
             last_render_state_gen: None,
             last_viewport: None,
@@ -919,6 +938,17 @@ impl GlStateCache {
                 (gl.gl_bind_vertex_array)(vao);
             }
             self.bound_vao = Some(vao);
+            self.bound_ebo = None;
+            self.last_attrib_key = None;
+        }
+    }
+
+    fn bind_ebo(&mut self, gl: &Gles3Functions, ebo: GLuint) {
+        if self.bound_ebo != Some(ebo) {
+            unsafe {
+                (gl.gl_bind_buffer)(GL_ELEMENT_ARRAY_BUFFER, ebo);
+            }
+            self.bound_ebo = Some(ebo);
         }
     }
 
@@ -1108,6 +1138,7 @@ struct CompiledProgram {
     u_light_atten: [GLint; MAX_FFP_LIGHTS],
     u_vc: GLint,
     u_pc: GLint,
+    vs_const_count: usize,
     last_transforms_gen: u64,
     last_lights_gen: u64,
     last_material_gen: u64,
@@ -1478,7 +1509,17 @@ impl Gles3Backend {
             (prog, true)
         };
 
-        let compiled = CompiledProgram::from_program(&self.gl, program);
+        let vs_const_count = match &recipe {
+            ShaderRecipe::Ffp(_) => 0,
+            ShaderRecipe::Programmable { vs_tokens, .. } => {
+                if vs_tokens.is_empty() {
+                    0
+                } else {
+                    vs_required_const_count(vs_tokens) as usize
+                }
+            }
+        };
+        let compiled = CompiledProgram::from_program(&self.gl, program, vs_const_count);
         self.state_cache.use_program(&self.gl, program);
         unsafe {
             for (stage, &loc) in compiled.u_tex.iter().enumerate() {
@@ -1601,8 +1642,14 @@ impl Gles3Backend {
             self.state_cache.last_render_state_gen = Some(rs_gen);
         }
 
-        bind_textures(&self.gl, &mut self.textures, &mut self.state_cache, state);
         let prog_id = self.programs[prog_idx].compiled.program;
+        bind_textures(
+            &self.gl,
+            &mut self.textures,
+            &mut self.state_cache,
+            state,
+            &self.programs[prog_idx].compiled.u_tex,
+        );
         self.state_cache.use_program(&self.gl, prog_id);
 
         unsafe {
@@ -1781,10 +1828,35 @@ impl Gles3Backend {
         base_vertex_offset: usize,
     ) -> bool {
         self.state_cache.bind_vertex_array(&self.gl, self.draw_vao);
-        let prev_mask = self.state_cache.ensure_attribs_initialized(&self.gl);
-        let mut new_mask = 0u16;
 
         if let Some(decl) = shaders.vs_parsed_decl {
+            let cache_key = if up_override.is_none() {
+                let mut streams = [(0 as GLuint, 0u32); NUM_STREAM_SOURCES];
+                for elem in decl {
+                    let s = elem.stream as usize;
+                    if s < NUM_STREAM_SOURCES {
+                        if let Some(b) = state.streams[s] {
+                            if let Some(vb) = self.vbos.get(&b.vb_handle) {
+                                streams[s] = (vb.id, b.stride);
+                            }
+                        }
+                    }
+                }
+                let key = AttribCacheKey::Decl {
+                    vs_handle: state.current_vertex_shader,
+                    base_vertex_offset,
+                    streams,
+                };
+                if self.state_cache.last_attrib_key.as_ref() == Some(&key) {
+                    return true;
+                }
+                Some(key)
+            } else {
+                None
+            };
+
+            let prev_mask = self.state_cache.ensure_attribs_initialized(&self.gl);
+            let mut new_mask = 0u16;
             self.setup_decl_attributes(
                 decl,
                 state,
@@ -1794,34 +1866,46 @@ impl Gles3Backend {
                 &mut new_mask,
             );
             self.state_cache.finish_attribs(&self.gl, prev_mask, new_mask);
+            self.state_cache.last_attrib_key = cache_key;
             return true;
         }
 
         let fvf = state.current_vertex_shader;
-        if let Some((up_vbo, stride, up_byte_off)) = up_override {
-            unsafe {
-                (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, up_vbo);
-            }
-            let offset = up_byte_off + base_vertex_offset.saturating_mul(stride as usize);
-            self.setup_fvf_attributes(fvf, stride, offset, prev_mask, &mut new_mask);
-            self.state_cache.finish_attribs(&self.gl, prev_mask, new_mask);
+        let (vbo_id, effective_fvf, stride, offset) =
+            if let Some((up_vbo, stride, up_byte_off)) = up_override {
+                let offset = up_byte_off + base_vertex_offset.saturating_mul(stride as usize);
+                (up_vbo, fvf, stride, offset)
+            } else {
+                let Some(stream0) = state.streams[0] else {
+                    return false;
+                };
+                let Some(vb) = self.vbos.get(&stream0.vb_handle) else {
+                    return false;
+                };
+                let effective_fvf = if fvf != 0 { fvf } else { vb.fvf };
+                let stride = stream0.stride.max(1);
+                let offset = base_vertex_offset.saturating_mul(stride as usize);
+                (vb.id, effective_fvf, stride, offset)
+            };
+
+        let key = AttribCacheKey::Ffp {
+            vbo_id,
+            fvf: effective_fvf,
+            stride,
+            byte_offset: offset,
+        };
+        if self.state_cache.last_attrib_key.as_ref() == Some(&key) {
             return true;
         }
 
-        let Some(stream0) = state.streams[0] else {
-            return false;
-        };
-        let Some(vb) = self.vbos.get(&stream0.vb_handle) else {
-            return false;
-        };
-        let effective_fvf = if fvf != 0 { fvf } else { vb.fvf };
-        let stride = stream0.stride.max(1);
+        let prev_mask = self.state_cache.ensure_attribs_initialized(&self.gl);
+        let mut new_mask = 0u16;
         unsafe {
-            (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, vb.id);
+            (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, vbo_id);
         }
-        let offset = base_vertex_offset.saturating_mul(stride as usize);
         self.setup_fvf_attributes(effective_fvf, stride, offset, prev_mask, &mut new_mask);
         self.state_cache.finish_attribs(&self.gl, prev_mask, new_mask);
+        self.state_cache.last_attrib_key = Some(key);
         true
     }
 }
@@ -2194,8 +2278,44 @@ impl RenderBackend for Gles3Backend {
         self.on_vb_upload(vb_handle, full_data, fvf, usage);
     }
 
+    fn on_vb_discard_sub_upload(
+        &mut self,
+        vb_handle: u32,
+        full_data: &[u8],
+        offset: usize,
+        sub_data: &[u8],
+        fvf: u32,
+        usage: u32,
+    ) {
+        let full_len = full_data.len();
+        if !sub_data.is_empty()
+            && sub_data.len() < full_len
+            && offset.saturating_add(sub_data.len()) <= full_len
+        {
+            if let Some(entry) = self.vbos.get_mut(&vb_handle) {
+                entry.fvf = fvf;
+                if entry.byte_len == full_len && entry.gl_usage == GL_DYNAMIC_DRAW {
+                    unsafe {
+                        (self.gl.gl_bind_buffer)(GL_ARRAY_BUFFER, entry.id);
+                        (self.gl.gl_buffer_data)(
+                            GL_ARRAY_BUFFER,
+                            full_len as GLsizeiptr,
+                            std::ptr::null(),
+                            GL_DYNAMIC_DRAW,
+                        );
+                    }
+                    write_buffer_range_unsync(&self.gl, GL_ARRAY_BUFFER, offset, sub_data);
+                    self.perf.vb_up += 1;
+                    return;
+                }
+            }
+        }
+        self.on_vb_upload(vb_handle, full_data, fvf, usage);
+    }
+
     fn on_vb_destroy(&mut self, vb_handle: u32) {
         if let Some(buf) = self.vbos.remove(&vb_handle) {
+            self.state_cache.last_attrib_key = None;
             unsafe {
                 (self.gl.gl_delete_buffers)(1, &buf.id);
             }
@@ -2218,6 +2338,9 @@ impl RenderBackend for Gles3Backend {
         });
         entry.format = format;
         upload_gl_buffer(&self.gl, entry, GL_ELEMENT_ARRAY_BUFFER, data, usage);
+        let entry_id = entry.id;
+        self.state_cache.bound_ebo =
+            (self.state_cache.bound_vao == Some(self.draw_vao)).then_some(entry_id);
         self.perf.ib_up += 1;
     }
 
@@ -2243,6 +2366,9 @@ impl RenderBackend for Gles3Backend {
                 usage,
                 unsynchronized,
             ) {
+                let entry_id = entry.id;
+                self.state_cache.bound_ebo =
+                    (self.state_cache.bound_vao == Some(self.draw_vao)).then_some(entry_id);
                 self.perf.ib_up += 1;
                 return;
             }
@@ -2252,6 +2378,9 @@ impl RenderBackend for Gles3Backend {
 
     fn on_ib_destroy(&mut self, ib_handle: u32) {
         if let Some(buf) = self.ibos.remove(&ib_handle) {
+            if self.state_cache.bound_ebo == Some(buf.id) {
+                self.state_cache.bound_ebo = None;
+            }
             unsafe {
                 (self.gl.gl_delete_buffers)(1, &buf.id);
             }
@@ -2336,8 +2465,8 @@ impl RenderBackend for Gles3Backend {
             return;
         }
 
+        self.state_cache.bind_ebo(&self.gl, ib_id);
         unsafe {
-            (self.gl.gl_bind_buffer)(GL_ELEMENT_ARRAY_BUFFER, ib_id);
             (self.gl.gl_draw_elements)(
                 gl_mode,
                 idx_count as GLsizei,
@@ -2423,6 +2552,7 @@ impl RenderBackend for Gles3Backend {
             GL_UNSIGNED_SHORT
         };
         let ibo_offset = self.up_ibo.append(&self.gl, index_data);
+        self.state_cache.bound_ebo = Some(self.up_ibo.id);
         unsafe {
             (self.gl.gl_draw_elements)(
                 gl_mode,
@@ -2600,7 +2730,6 @@ fn upload_gl_buffer(
         } else {
             (gl.gl_buffer_data)(target, data.len() as GLsizeiptr, data.as_ptr().cast(), gl_usage);
         }
-        (gl.gl_bind_buffer)(target, 0);
     }
 }
 
@@ -2645,9 +2774,6 @@ fn upload_gl_buffer_sub(
                 sub_data.as_ptr().cast(),
             );
         }
-    }
-    unsafe {
-        (gl.gl_bind_buffer)(target, 0);
     }
     true
 }
@@ -2938,7 +3064,7 @@ fn get_uniform_loc(gl: &Gles3Functions, program: GLuint, name: &str) -> GLint {
 }
 
 impl CompiledProgram {
-    fn from_program(gl: &Gles3Functions, program: GLuint) -> Self {
+    fn from_program(gl: &Gles3Functions, program: GLuint, vs_const_count: usize) -> Self {
         let mut u_tex_mats = [-1; MAX_FFP_STAGES];
         let mut u_tex = [-1; MAX_FFP_STAGES];
         for i in 0..MAX_FFP_STAGES {
@@ -2991,6 +3117,7 @@ impl CompiledProgram {
             u_light_atten,
             u_vc: get_uniform_loc(gl, program, "u_vc"),
             u_pc: get_uniform_loc(gl, program, "u_pc"),
+            vs_const_count,
             last_transforms_gen: 0,
             last_lights_gen: 0,
             last_material_gen: 0,
@@ -3007,8 +3134,12 @@ fn bind_textures(
     textures: &mut HashMap<u32, GlTexture>,
     state_cache: &mut GlStateCache,
     state: &DeviceState,
+    u_tex: &[GLint; MAX_FFP_STAGES],
 ) {
-    for stage in 0..MAX_FFP_STAGES {
+    for (stage, &loc) in u_tex.iter().enumerate().take(MAX_FFP_STAGES) {
+        if loc < 0 {
+            continue;
+        }
         let s = stage as u32;
         let Some(tex_handle) = state.bound_textures[stage] else {
             state_cache.bind_texture(gl, s, 0);
@@ -3200,12 +3331,15 @@ unsafe fn upload_uniforms(
     let vc_gen = state.vs_const_gen();
     if prog.last_vs_const_gen != vc_gen {
         if prog.u_vc >= 0 {
-            unsafe {
-                (gl.gl_uniform4fv)(
-                    prog.u_vc,
-                    state.vs_constants.len() as GLsizei,
-                    state.vs_constants.as_ptr().cast(),
-                );
+            let count = prog.vs_const_count.min(state.vs_constants.len());
+            if count > 0 {
+                unsafe {
+                    (gl.gl_uniform4fv)(
+                        prog.u_vc,
+                        count as GLsizei,
+                        state.vs_constants.as_ptr().cast(),
+                    );
+                }
             }
         }
         prog.last_vs_const_gen = vc_gen;

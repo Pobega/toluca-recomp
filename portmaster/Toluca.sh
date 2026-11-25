@@ -79,7 +79,7 @@ fi
 if [ ! -f "$CACHE_BIN" ] || [ -z "$CURRENT_SHA1" ] || [ "$CURRENT_SHA1" != "$SAVED_SHA1" ]; then
   export PATCHER_FILE="$GAMEDIR/tools/patchscript"
   export PATCHER_GAME="Toluca"
-  export PATCHER_TIME="15 to 45 seconds"
+  export PATCHER_TIME="1 to 3 minutes"
   export GAMEDIR
 
   if [ -f "$controlfolder/utils/patcher.txt" ]; then

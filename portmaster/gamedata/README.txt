@@ -16,7 +16,7 @@ first-run verification.
 2. First Launch (On-Device Recompilation)
 -----------------------------------------
 On first launch, PortMaster runs `tools/patchscript` to verify `sh2pc.exe` and
-compile it directly on your handheld into `cache/toluca_code.bin` (~15-45 seconds).
+compile it directly on your handheld into `cache/toluca_code.bin` (~1-3 minutes).
 Repeat launches skip compilation unless `sh2pc.exe` changes.
 
 3. Supported Screens & Optional `toluca.conf`

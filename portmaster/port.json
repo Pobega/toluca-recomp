@@ -14,7 +14,7 @@
     "desc": "Clean-room static recompiler and native Linux/GLES 3.0 runtime for Silent Hill 2 (PC). Requires your own unprotected vanilla North American v1.0 sh2pc.exe and data/ directory.",
     "desc_md": "Clean-room static recompiler and native Linux/OpenGL ES 3.0 runtime for *Silent Hill 2* (PC).\n\nOn first launch, `patchscript` verifies your legal `sh2pc.exe` and translates it directly on-device into a native ARM64 AOT code cache (`cache/toluca_code.bin`). No copyrighted game files or assets are distributed.",
     "inst": "Copy your legal, unprotected vanilla North American v1.0 sh2pc.exe and its data/ folder into ports/toluca/gamedata/ (or ports/toluca/gamedata/Silent Hill 2/). SafeDisc-encrypted executables are rejected.",
-    "inst_md": "1. Obtain a legal, unprotected vanilla North American v1.0 PC copy of *Silent Hill 2*.\n2. Copy `sh2pc.exe` and the `data/` directory into `ports/toluca/gamedata/` (or `ports/toluca/gamedata/Silent Hill 2/`).\n3. Launch **Toluca** from PortMaster. First launch automatically runs on-device AOT compilation (~15-45 seconds).",
+    "inst_md": "1. Obtain a legal, unprotected vanilla North American v1.0 PC copy of *Silent Hill 2*.\n2. Copy `sh2pc.exe` and the `data/` directory into `ports/toluca/gamedata/` (or `ports/toluca/gamedata/Silent Hill 2/`).\n3. Launch **Toluca** from PortMaster. First launch automatically runs on-device AOT compilation (~1-3 minutes).",
     "genres": [
       "action",
       "adventure"

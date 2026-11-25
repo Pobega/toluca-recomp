@@ -1975,12 +1975,12 @@ mod tests {
             let mut mixer = mixer_mutex.lock().unwrap();
             mixer.hardware_clocked = true;
             mixer.output_sample_rate = 48_000;
-            mixer.last_advance = now;
-            // output_buffer_frames = 2048 -> 0.5 * 2048 = 1024 extra latency frames.
+            mixer.last_audio_callback = now;
+            // output_buffer_frames = 2048 -> 1.5 * 2048 = 3072 extra latency frames.
             // With last_aux_popped_frames = 2048 and start_audio_frames = 1000:
-            // aux_played_frames = 6424 => audible = (5424 - 2048 - 1024) / 48000 = 2352 / 48000 = 49 ms.
+            // aux_played_frames = 8472 => audible = (7472 - 2048 - 3072) / 48000 = 2352 / 48000 = 49 ms.
             mixer.last_aux_popped_frames = 2048;
-            mixer.aux_played_frames = 6_424;
+            mixer.aux_played_frames = 8_472;
             mixer.push_aux_pcm(&[1, 2], 48_000, 2);
         }
 
@@ -2010,7 +2010,7 @@ mod tests {
         assert!(should_wait_for_frame_at(&inst, &mixer_mutex, now));
 
         // 100 ms - 51 ms = 49 ms <= 50 ms lead cap -> advances immediately.
-        mixer_mutex.lock().unwrap().aux_played_frames = 6_520;
+        mixer_mutex.lock().unwrap().aux_played_frames = 8_568;
         assert!(!should_wait_for_frame_at(&inst, &mixer_mutex, now));
 
         // Uncapped video fast-forward safety: video > 50 ms ahead of audio waits.
@@ -2089,10 +2089,11 @@ mod tests {
         let mut cb_clock_accum = 0.0f64;
         let mut last_cb_t_sec = 0.0f64;
 
-        // Prime 1.5 periods of hardware pipeline latency so audible starts near 0 at t=0.
-        mixer.mix_into(&mut cb_buf);
-        mixer.mix_into(&mut cb_buf);
-        inst.start_audio_frames = mixer.aux_played_frames().saturating_sub(cb_frames as u64 * 3 / 2);
+        // Prime 2.5 periods of hardware pipeline latency so audible starts near 0 at t=0.
+        for _ in 0..3 {
+            mixer.mix_into(&mut cb_buf);
+        }
+        inst.start_audio_frames = mixer.aux_played_frames().saturating_sub(cb_frames as u64 * 5 / 2);
 
         for _ in 0..600 {
             sim_t_sec += 1.0 / 30.0;
@@ -2110,7 +2111,7 @@ mod tests {
                 mixer.mix_into(&mut out_buf);
             }
             let cb_instant = base_now + Duration::from_secs_f64(last_cb_t_sec);
-            mixer.last_advance = cb_instant;
+            mixer.last_audio_callback = cb_instant;
             let sim_now = base_now + Duration::from_secs_f64(sim_t_sec);
 
             update_aux_rate_control_at(&mut inst, &mut mixer, sim_now);
@@ -2163,12 +2164,13 @@ mod tests {
             let mut mixer = mixer_mutex.lock().unwrap();
             mixer.hardware_clocked = true;
             mixer.output_sample_rate = 48_000;
-            let pre_pcm = vec![100i16; 9_600 * 2];
+            let pre_pcm = vec![100i16; 12_800 * 2];
             mixer.push_aux_pcm(&pre_pcm, 48_000, 2);
             let cb_frames = mixer.output_buffer_frames() as usize;
             let mut cb_buf = vec![0i16; cb_frames * 2];
-            mixer.mix_into(&mut cb_buf);
-            mixer.mix_into(&mut cb_buf);
+            for _ in 0..3 {
+                mixer.mix_into(&mut cb_buf);
+            }
             cb_frames
         };
 
@@ -2186,7 +2188,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .aux_played_frames()
-                .saturating_sub(cb_frames as u64),
+                .saturating_sub(cb_frames as u64 * 5 / 2),
             av_err_integral: 0.0,
             av_rate_ratio: 1.0,
             open_instant: base_now,
@@ -2223,7 +2225,7 @@ mod tests {
             let sim_now = base_now + Duration::from_secs_f64(sim_t_sec);
             {
                 let mut mixer = mixer_mutex.lock().unwrap();
-                mixer.last_advance = base_now + Duration::from_secs_f64(last_cb_t_sec);
+                mixer.last_audio_callback = base_now + Duration::from_secs_f64(last_cb_t_sec);
                 audio_per_frame_accum += 48_000.0 * 1_001.0 / 30_000.0;
                 let push_frames = audio_per_frame_accum.floor() as usize;
                 audio_per_frame_accum -= push_frames as f64;

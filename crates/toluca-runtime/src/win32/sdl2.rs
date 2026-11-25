@@ -1079,6 +1079,7 @@ impl Sdl2WindowBackend {
                 "[toluca-audio] opened freq={} samples={} ch={}",
                 obtained_freq, obtained_samples, obtained_ch
             );
+            log_alsa_hw_params();
         }
 
         unsafe {
@@ -1101,6 +1102,60 @@ impl Sdl2WindowBackend {
             userdata: boxed,
             drop_userdata: drop_boxed::<T>,
         })
+    }
+}
+
+fn log_alsa_hw_params() {
+    let Ok(cards) = std::fs::read_dir("/proc/asound") else {
+        return;
+    };
+    for card in cards.flatten() {
+        let name = card.file_name();
+        if !name.to_string_lossy().starts_with("card") {
+            continue;
+        }
+        let Ok(pcms) = std::fs::read_dir(card.path()) else {
+            continue;
+        };
+        for pcm in pcms.flatten() {
+            let pcm_name = pcm.file_name();
+            if !pcm_name.to_string_lossy().starts_with("pcm") {
+                continue;
+            }
+            let Ok(subs) = std::fs::read_dir(pcm.path()) else {
+                continue;
+            };
+            for sub in subs.flatten() {
+                let hw_path = sub.path().join("hw_params");
+                let Ok(text) = std::fs::read_to_string(&hw_path) else {
+                    continue;
+                };
+                if text.trim() == "closed" {
+                    continue;
+                }
+                let mut period = "";
+                let mut buffer = "";
+                let mut rate = "";
+                for line in text.lines() {
+                    if let Some(v) = line.strip_prefix("period_size:") {
+                        period = v.trim();
+                    } else if let Some(v) = line.strip_prefix("buffer_size:") {
+                        buffer = v.trim();
+                    } else if let Some(v) = line.strip_prefix("rate:") {
+                        rate = v.trim();
+                    }
+                }
+                if !period.is_empty() || !buffer.is_empty() {
+                    eprintln!(
+                        "[toluca-audio] alsa={} period_size={} buffer_size={} rate={}",
+                        hw_path.display(),
+                        period,
+                        buffer,
+                        rate
+                    );
+                }
+            }
+        }
     }
 }
 

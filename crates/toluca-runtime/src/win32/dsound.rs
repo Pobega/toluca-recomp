@@ -183,7 +183,11 @@ const SOFT_LIMIT_KNEE: f32 = 0.85;
 const DEFAULT_OUTPUT_BUFFER_FRAMES: u32 = 2048;
 pub const MAX_AUX_RATE_SKEW: f64 = 0.025;
 const AUX_RATE_UNITY_EPSILON: f64 = 1e-6;
-const NET_AUDIO_LATENCY_EXTRA_PERIODS: f64 = 0.5;
+// Net audio-minus-video pipeline delay beyond the just-popped SDL2 mixbuf period:
+// ALSA holds ~2 periods ahead of mixbuf (~85 ms at 2048/48 kHz) minus ~30 ms LCD
+// scanout latency, putting mean audible audio ~2.0 periods (0.5 + 1.5) behind
+// aux_played_frames.
+const NET_AUDIO_LATENCY_EXTRA_PERIODS: f64 = 1.5;
 
 pub struct DsoundMixer {
     pub buffers: HashMap<usize, DsoundBufferData>,
@@ -201,6 +205,7 @@ pub struct DsoundMixer {
     mix_accum: Vec<f32>,
     pub hardware_clocked: bool,
     pub last_advance: Instant,
+    pub last_audio_callback: Instant,
     last_perf_log: Instant,
 }
 
@@ -229,6 +234,7 @@ impl DsoundMixer {
             mix_accum: Vec::new(),
             hardware_clocked: false,
             last_advance: now,
+            last_audio_callback: now,
             last_perf_log: now,
         }
     }
@@ -272,7 +278,7 @@ impl DsoundMixer {
         let buf_frames = f64::from(self.output_buffer_frames.max(1));
         let period_sec = buf_frames / rate;
         let elapsed_sec = now
-            .saturating_duration_since(self.last_advance)
+            .saturating_duration_since(self.last_audio_callback)
             .as_secs_f64()
             .min(period_sec);
         let played_since_start = (self.aux_played_frames - start_audio_frames) as f64;
@@ -299,11 +305,10 @@ impl DsoundMixer {
     }
 
     pub fn tick_headless_cursors(&mut self) {
-        let now = Instant::now();
         if self.hardware_clocked {
-            self.last_advance = now;
             return;
         }
+        let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_advance).as_secs_f64();
         self.last_advance = now;
         if elapsed <= 0.0 {
@@ -401,6 +406,7 @@ impl DsoundMixer {
     pub fn mix_into(&mut self, out: &mut [i16]) {
         let now = Instant::now();
         self.last_advance = now;
+        self.last_audio_callback = now;
         let out_frames = out.len() / OUTPUT_CHANNELS;
         if out_frames == 0 {
             return;
@@ -806,7 +812,7 @@ unsafe extern "C" fn sdl_audio_callback(userdata: *mut c_void, stream: *mut u8, 
     }
     let mixer = unsafe { &*userdata.cast::<Arc<Mutex<DsoundMixer>>>() };
     let total_samples = (len as usize) / std::mem::size_of::<i16>();
-    let mut chunk = [0i16; 2048];
+    let mut chunk = [0i16; 4096];
     let mut offset = 0usize;
 
     let Ok(mut guard) = mixer.lock() else {
@@ -816,6 +822,7 @@ unsafe extern "C" fn sdl_audio_callback(userdata: *mut c_void, stream: *mut u8, 
         return;
     };
 
+    let start_aux_played = guard.aux_played_frames;
     while offset < total_samples {
         let count = (total_samples - offset).min(chunk.len());
         chunk[..count].fill(0);
@@ -829,6 +836,8 @@ unsafe extern "C" fn sdl_audio_callback(userdata: *mut c_void, stream: *mut u8, 
         }
         offset += count;
     }
+    guard.last_aux_popped_frames = guard.aux_played_frames.saturating_sub(start_aux_played);
+    guard.last_audio_callback = Instant::now();
 }
 
 pub fn register_imports(registry: &mut ImportRegistry) {
@@ -2954,20 +2963,50 @@ mod tests {
         mixer.push_aux_pcm(&pcm, 48_000, 2);
 
         let mut out = vec![0i16; period_frames * OUTPUT_CHANNELS];
-        // Callback 1 and Callback 2
-        mixer.mix_into(&mut out);
-        mixer.mix_into(&mut out);
-        let t_end_k = mixer.last_advance + period_dur;
+        // Prime 3 periods so audible is positive beyond the 2.5-period initial pipeline delay.
+        for _ in 0..3 {
+            mixer.mix_into(&mut out);
+        }
+        let t_end_k = mixer.last_audio_callback + period_dur;
         let est_before = mixer.estimated_audible_aux_sec(0, t_end_k).unwrap();
 
-        // Callback 3 at the exact end of period K
+        // Next callback at the exact end of period K
         mixer.mix_into(&mut out);
-        let t_start_k1 = mixer.last_advance;
+        let t_start_k1 = mixer.last_audio_callback;
         let est_after = mixer.estimated_audible_aux_sec(0, t_start_k1).unwrap();
 
         assert!(
             (est_before - est_after).abs() < 1e-6,
             "expected C0 continuity across 2048-frame callback: before={est_before:.6}s after={est_after:.6}s"
+        );
+    }
+
+    #[test]
+    fn sdl_audio_callback_tracks_full_period_and_ignores_headless_cursor_polls() {
+        let mixer = Arc::new(Mutex::new(DsoundMixer::new()));
+        {
+            let mut guard = mixer.lock().unwrap();
+            guard.hardware_clocked = true;
+            guard.output_sample_rate = 48_000;
+            // Push enough audio for multiple 2048-frame callbacks plus multi-chunk callbacks.
+            let pcm = vec![120i16; 2048 * 8 * OUTPUT_CHANNELS];
+            guard.push_aux_pcm(&pcm, 48_000, 2);
+        }
+
+        // Simulate a 4096-frame (16384-byte) callback that spans multiple internal chunks.
+        let mut raw_stream = vec![0u8; 4096 * OUTPUT_CHANNELS * std::mem::size_of::<i16>()];
+        let userdata = std::ptr::addr_of!(mixer).cast::<c_void>().cast_mut();
+        unsafe {
+            sdl_audio_callback(userdata, raw_stream.as_mut_ptr(), raw_stream.len() as i32);
+        }
+
+        let mut guard = mixer.lock().unwrap();
+        assert_eq!(guard.last_aux_popped_frames, 4096);
+        let cb_ts = guard.last_audio_callback;
+        guard.tick_headless_cursors();
+        assert_eq!(
+            guard.last_audio_callback, cb_ts,
+            "tick_headless_cursors must not clobber last_audio_callback when hardware_clocked"
         );
     }
 }

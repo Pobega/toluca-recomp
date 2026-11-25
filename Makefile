@@ -8,12 +8,15 @@ NEXTUI_GAMEDIR ?= $(NEXTUI_DOTPORTS_DIR)/toluca
 DIST_BIN_DIR := dist/aarch64
 TOOLBOX_RUN := $(if $(wildcard /run/.containerenv),,toolbox run --container fedora-toolbox-44)
 
-.PHONY: all build host test package push push-fast logs
+.PHONY: all build test-aarch64 host test package push push-fast logs
 
 all: build
 
 build:
 	bash scripts/build-aarch64.sh
+
+test-aarch64:
+	bash scripts/build-aarch64.sh --test
 
 host:
 	$(TOOLBOX_RUN) cargo build --release -p toluca-recomp -p toluca-runtime

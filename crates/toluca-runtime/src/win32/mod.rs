@@ -366,42 +366,63 @@ fn initial_available_cpus() -> &'static [usize] {
     })
 }
 
+static SPLIT_GUEST_WORKERS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_split_guest_workers(enabled: bool) {
+    SPLIT_GUEST_WORKERS.store(enabled, Ordering::Release);
+}
+
+fn select_core_layout(cpus: &[usize], split_workers: bool) -> Option<(usize, usize, &[usize])> {
+    if cpus.len() < 2 {
+        return None;
+    }
+    if split_workers && cpus.len() >= 3 {
+        Some((cpus[0], cpus[1], &cpus[2..]))
+    } else if split_workers && cpus.len() == 2 {
+        Some((cpus[0], cpus[1], &cpus[1..]))
+    } else {
+        Some((cpus[0], cpus[0], &cpus[1..]))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_cpus(target_cpus: &[usize]) {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::CPU_ZERO(&mut set);
+        for &cpu in target_cpus {
+            libc::CPU_SET(cpu, &mut set);
+        }
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 pub fn pin_current_thread_to_guest_core() {
     #[cfg(target_os = "linux")]
-    {
-        if !guest_single_core_enabled() {
-            return;
+    if guest_single_core_enabled() {
+        let split = SPLIT_GUEST_WORKERS.load(Ordering::Acquire);
+        if let Some((main_cpu, _, _)) = select_core_layout(initial_available_cpus(), split) {
+            pin_current_thread_to_cpus(&[main_cpu]);
         }
-        let cpus = initial_available_cpus();
-        if cpus.len() < 2 {
-            return;
-        }
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::CPU_ZERO(&mut set);
-            libc::CPU_SET(cpus[0], &mut set);
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+pub fn pin_current_thread_to_guest_worker_core() {
+    #[cfg(target_os = "linux")]
+    if guest_single_core_enabled() {
+        let split = SPLIT_GUEST_WORKERS.load(Ordering::Acquire);
+        if let Some((_, worker_cpu, _)) = select_core_layout(initial_available_cpus(), split) {
+            pin_current_thread_to_cpus(&[worker_cpu]);
         }
     }
 }
 
 pub fn pin_current_thread_to_host_cores() {
     #[cfg(target_os = "linux")]
-    {
-        if !guest_single_core_enabled() {
-            return;
-        }
-        let cpus = initial_available_cpus();
-        if cpus.len() < 2 {
-            return;
-        }
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::CPU_ZERO(&mut set);
-            for &cpu in &cpus[1..] {
-                libc::CPU_SET(cpu, &mut set);
-            }
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    if guest_single_core_enabled() {
+        let split = SPLIT_GUEST_WORKERS.load(Ordering::Acquire);
+        if let Some((_, _, host_cpus)) = select_core_layout(initial_available_cpus(), split) {
+            pin_current_thread_to_cpus(host_cpus);
         }
     }
 }
@@ -990,5 +1011,38 @@ pub(crate) fn map_io_error(err: &std::io::Error) -> u32 {
         std::io::ErrorKind::AlreadyExists => ERROR_FILE_EXISTS,
         std::io::ErrorKind::InvalidInput => ERROR_INVALID_PARAMETER,
         _ => ERROR_ACCESS_DENIED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_core_layout;
+
+    #[test]
+    fn select_core_layout_handles_single_two_three_and_four_cpus() {
+        assert_eq!(select_core_layout(&[], false), None);
+        assert_eq!(select_core_layout(&[0], false), None);
+        assert_eq!(select_core_layout(&[0], true), None);
+
+        assert_eq!(select_core_layout(&[0, 1], false), Some((0, 0, &[1][..])));
+        assert_eq!(select_core_layout(&[0, 1], true), Some((0, 1, &[1][..])));
+
+        assert_eq!(
+            select_core_layout(&[0, 1, 2], false),
+            Some((0, 0, &[1, 2][..]))
+        );
+        assert_eq!(
+            select_core_layout(&[0, 1, 2], true),
+            Some((0, 1, &[2][..]))
+        );
+
+        assert_eq!(
+            select_core_layout(&[0, 1, 2, 3], false),
+            Some((0, 0, &[1, 2, 3][..]))
+        );
+        assert_eq!(
+            select_core_layout(&[0, 1, 2, 3], true),
+            Some((0, 1, &[2, 3][..]))
+        );
     }
 }

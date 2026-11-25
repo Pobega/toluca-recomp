@@ -350,6 +350,7 @@ struct SharedRuntime {
     shutdown: AtomicBool,
     worker_done_flags: Mutex<Vec<Arc<AtomicBool>>>,
     guest_thread_tids: Mutex<Vec<(libc::pid_t, String)>>,
+    adxm_shim: Option<crate::adxm::AdxmMutexShim>,
 }
 
 unsafe impl Send for SharedRuntime {}
@@ -464,6 +465,19 @@ impl Runtime {
             });
         }
 
+        let adxm_shim = crate::adxm::detect_adxm_lock_pair(&pe).map(crate::adxm::AdxmMutexShim::new);
+        if rt_perf_enabled() {
+            if let Some(shim) = &adxm_shim {
+                eprintln!(
+                    "[toluca-rt] CRI ADXM_Lock mutex shim active: lock=0x{:08x} unlock=0x{:08x} depth=0x{:08x}",
+                    shim.lock_va(),
+                    shim.unlock_va(),
+                    shim.lock_depth_va()
+                );
+            }
+        }
+        crate::win32::set_split_guest_workers(adxm_shim.is_some());
+
         let arena_base = arena.base_ptr() as usize;
         let inner = RuntimeInner {
             arena,
@@ -490,6 +504,7 @@ impl Runtime {
             shutdown: AtomicBool::new(false),
             worker_done_flags: Mutex::new(Vec::new()),
             guest_thread_tids: Mutex::new(Vec::new()),
+            adxm_shim,
         });
 
         Ok(Self { pe, shared })
@@ -577,6 +592,9 @@ impl Runtime {
 
     fn shutdown_workers(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
+        if let Some(shim) = &self.shared.adxm_shim {
+            shim.notify_all();
+        }
         crate::win32::wake_all_suspended_threads();
         self.shared.sync_cv.notify_all();
         self.shared.timer_cv.notify_all();
@@ -1433,6 +1451,50 @@ unsafe extern "C" fn bridge_call_import(cpu: *mut GuestCpuState, import_index: u
     });
 }
 
+fn dispatch_adxm_shim(
+    tctx: &ThreadBridgeContext,
+    state: &mut GuestCpuState,
+    shim: &crate::adxm::AdxmMutexShim,
+    is_lock: bool,
+) {
+    if let Some(slot) = tctx.suspend_slot {
+        slot.in_host_code.store(true, Ordering::SeqCst);
+    }
+    let depth = if is_lock {
+        shim.lock(tctx.tid, tctx.shared.arena_base, &tctx.shared.shutdown)
+    } else {
+        shim.unlock(tctx.tid, tctx.shared.arena_base)
+    };
+    if is_lock && tctx.shared.shutdown.load(Ordering::Acquire) && tctx.tid != 1 {
+        state.exit_reason = ExitReason::Halt as u32;
+        if let Some(slot) = tctx.suspend_slot {
+            slot.in_host_code.store(false, Ordering::SeqCst);
+        }
+        return;
+    }
+    let esp = state.gpr(Gpr::Esp);
+    let ret_va = if tctx.shared.arena_base != 0 {
+        let mut bytes = [0u8; 4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (tctx.shared.arena_base + esp as usize) as *const u8,
+                bytes.as_mut_ptr(),
+                4,
+            );
+        }
+        u32::from_le_bytes(bytes)
+    } else {
+        GUEST_RETURN_SENTINEL
+    };
+    state.set_gpr(Gpr::Esp, esp.wrapping_add(4));
+    state.eip = ret_va;
+    state.set_gpr(Gpr::Eax, depth);
+    if let Some(slot) = tctx.suspend_slot {
+        slot.in_host_code.store(false, Ordering::SeqCst);
+        crate::win32::park_while_suspended(slot, &tctx.shared.shutdown);
+    }
+}
+
 unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u32) {
     let Some((state, tctx)) = (unsafe { thread_ctx_from_cpu(cpu) }) else {
         return;
@@ -1484,6 +1546,17 @@ unsafe extern "C" fn bridge_call_indirect(cpu: *mut GuestCpuState, target_va: u3
             method_index: 0,
         });
         return;
+    }
+
+    if let Some(shim) = tctx.shared.adxm_shim.as_ref() {
+        if target_va == shim.lock_va() {
+            dispatch_adxm_shim(tctx, state, shim, true);
+            return;
+        }
+        if target_va == shim.unlock_va() {
+            dispatch_adxm_shim(tctx, state, shim, false);
+            return;
+        }
     }
 
     let lookup_t0 = tctx.perf.is_some().then(Instant::now);
@@ -1770,7 +1843,7 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
 
             let slot_idx = crate::win32::register_thread_suspend_slot(os_tid);
             let suspend_slot = slot_idx.and_then(crate::win32::thread_suspend_slot);
-            crate::win32::pin_current_thread_to_guest_core();
+            crate::win32::pin_current_thread_to_guest_worker_core();
 
             let thread_priority = {
                 let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1854,6 +1927,9 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
                 }
                 shared.sync_cv.notify_all();
             }
+            if let Some(shim) = &shared.adxm_shim {
+                shim.release_if_owned(spawn.handle as u64, shared.arena_base);
+            }
             crate::win32::unregister_thread_suspend_slot(slot_idx);
             done.store(true, Ordering::Release);
         });
@@ -1919,7 +1995,7 @@ fn timer_worker_loop(shared: Arc<SharedRuntime>, done: Arc<AtomicBool>) {
 
     let _tid_perf_guard =
         GuestTidPerfGuard::enter(&shared, current_os_tid(), "timer".to_string());
-    crate::win32::pin_current_thread_to_guest_core();
+    crate::win32::pin_current_thread_to_guest_worker_core();
 
     let (stack_top, teb_va) = {
         let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2078,6 +2154,7 @@ mod tests {
             shutdown: AtomicBool::new(false),
             worker_done_flags: Mutex::new(Vec::new()),
             guest_thread_tids: Mutex::new(Vec::new()),
+            adxm_shim: None,
         });
 
         let mut cancelled_ids = Vec::new();

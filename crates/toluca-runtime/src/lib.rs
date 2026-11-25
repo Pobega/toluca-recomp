@@ -1,3 +1,4 @@
+pub mod adxm;
 pub mod arena;
 pub mod callconv;
 pub mod heap;

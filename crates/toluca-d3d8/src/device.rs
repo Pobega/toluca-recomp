@@ -6,7 +6,9 @@ use crate::backend::{ActiveShaders, NullBackend, RenderBackend};
 use crate::mem::{ComInterfaceId, ComObjectTable, GuestMemory};
 use crate::shader_asm::{VertexDeclElement, parse_vertex_declaration};
 use crate::state::{DeviceState, StateBlockData, StreamBinding};
-use crate::texture::{convert_surface_rect_to_rgba8, prepare_texture_upload};
+use crate::texture::{
+    PreparedTextureUpload, convert_surface_rect_to_rgba8_into, prepare_texture_upload_with_buf,
+};
 use crate::types::{
     D3DADAPTER_DEFAULT, D3DCLEAR_TARGET, D3DDEVTYPE_HAL, D3DDEVTYPE_REF, D3DERR_INVALIDCALL,
     D3DERR_NOTAVAILABLE, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8,
@@ -397,6 +399,7 @@ pub struct D3d8Context {
     scratch_vtx: Vec<u8>,
     scratch_idx: Vec<u8>,
     scratch_tex: Vec<u8>,
+    scratch_rgba: Vec<u8>,
 }
 
 impl Default for D3d8Context {
@@ -424,6 +427,7 @@ impl D3d8Context {
             scratch_vtx: Vec::new(),
             scratch_idx: Vec::new(),
             scratch_tex: Vec::new(),
+            scratch_rgba: Vec::new(),
         }
     }
 
@@ -2481,9 +2485,10 @@ impl D3d8Context {
         let palette = self.surface_palette(dev_h, fmt);
         let cur_pal_gen = self.surface_palette_gen(dev_h);
         let pitch = surface_row_pitch(fmt, width);
+        let scratch_buf = std::mem::take(&mut self.scratch_rgba);
         let prepared = {
             let surf = self.surfaces.get(&surf_handle).unwrap();
-            prepare_texture_upload(
+            prepare_texture_upload_with_buf(
                 fmt,
                 width,
                 height,
@@ -2492,10 +2497,15 @@ impl D3d8Context {
                 palette.as_ref(),
                 self.backend.max_texture_size(),
                 self.backend.supports_s3tc(),
+                scratch_buf,
             )
         };
         if let Ok(prepared) = prepared {
             self.backend.on_texture_upload(tex_h, level, &prepared);
+            self.scratch_rgba = match prepared {
+                PreparedTextureUpload::Rgba8(img) => img.pixels,
+                PreparedTextureUpload::CompressedS3tc { data, .. } => data,
+            };
             if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
                 surf.uploaded_once = true;
                 surf.last_palette_gen = cur_pal_gen;
@@ -3035,21 +3045,30 @@ impl D3d8Context {
             };
             if let Some((tex_h, level)) = parent_tex {
                 let palette = self.surface_palette(dev_h, fmt);
-                let surf = self.surfaces.get(&surf_handle).unwrap();
-                let uploaded = convert_surface_rect_to_rgba8(
-                    fmt,
-                    pitch,
-                    &surf.data,
-                    rx,
-                    ry,
-                    rw,
-                    rh,
-                    palette.as_ref(),
-                )
-                .is_ok_and(|decoded| {
-                    self.backend
-                        .on_texture_sub_upload(tex_h, level, rx, ry, &decoded)
-                });
+                let scratch_buf = std::mem::take(&mut self.scratch_rgba);
+                let decoded = {
+                    let surf = self.surfaces.get(&surf_handle).unwrap();
+                    convert_surface_rect_to_rgba8_into(
+                        fmt,
+                        pitch,
+                        &surf.data,
+                        rx,
+                        ry,
+                        rw,
+                        rh,
+                        palette.as_ref(),
+                        scratch_buf,
+                    )
+                };
+                let uploaded = if let Ok(decoded) = decoded {
+                    let ok = self
+                        .backend
+                        .on_texture_sub_upload(tex_h, level, rx, ry, &decoded);
+                    self.scratch_rgba = decoded.pixels;
+                    ok
+                } else {
+                    false
+                };
                 if uploaded {
                     if let Some(surf) = self.surfaces.get_mut(&surf_handle) {
                         surf.uploaded_once = true;
@@ -3682,5 +3701,236 @@ pub fn vertex_count_for_primitives(prim_type: u32, prim_count: u32) -> u32 {
         D3DPT_TRIANGLELIST => prim_count.saturating_mul(3),
         D3DPT_TRIANGLESTRIP | D3DPT_TRIANGLEFAN => prim_count.saturating_add(2),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+    use crate::backend::RenderBackend;
+    use crate::types::{D3D_SDK_VERSION, D3DPOOL_MANAGED};
+
+    struct LocalMem {
+        next_va: GuestAddr,
+        allocs: HashMap<GuestAddr, Vec<u8>>,
+        watches: HashMap<GuestAddr, bool>,
+        arm_calls: u32,
+        remove_calls: u32,
+    }
+
+    impl LocalMem {
+        fn new() -> Self {
+            Self {
+                next_va: 0x1000_0000,
+                allocs: HashMap::new(),
+                watches: HashMap::new(),
+                arm_calls: 0,
+                remove_calls: 0,
+            }
+        }
+
+        fn locate(&self, va: GuestAddr, len: usize) -> Result<(&[u8], usize, GuestAddr), String> {
+            for (&base, buf) in &self.allocs {
+                let end = base as usize + buf.len();
+                if (va as usize) >= (base as usize) && (va as usize) + len <= end {
+                    return Ok((buf.as_slice(), (va - base) as usize, base));
+                }
+            }
+            Err(format!("unmapped read at 0x{va:08x} len={len}"))
+        }
+
+        fn locate_mut(
+            &mut self,
+            va: GuestAddr,
+            len: usize,
+        ) -> Result<(&mut [u8], usize, GuestAddr), String> {
+            for (&base, buf) in &mut self.allocs {
+                let end = base as usize + buf.len();
+                if (va as usize) >= (base as usize) && (va as usize) + len <= end {
+                    return Ok((buf.as_mut_slice(), (va - base) as usize, base));
+                }
+            }
+            Err(format!("unmapped write at 0x{va:08x} len={len}"))
+        }
+    }
+
+    impl GuestMemory for LocalMem {
+        fn bytes_slice(&self, va: GuestAddr, len: usize) -> Result<Option<&[u8]>, String> {
+            let (buf, off, _) = self.locate(va, len)?;
+            Ok(Some(&buf[off..off + len]))
+        }
+        fn read_bytes(&self, va: GuestAddr, len: usize) -> Result<Vec<u8>, String> {
+            let (buf, off, _) = self.locate(va, len)?;
+            Ok(buf[off..off + len].to_vec())
+        }
+        fn write_bytes(&mut self, va: GuestAddr, data: &[u8]) -> Result<(), String> {
+            let (buf, off, base) = self.locate_mut(va, data.len())?;
+            buf[off..off + data.len()].copy_from_slice(data);
+            if let Some(dirty) = self.watches.get_mut(&base) {
+                *dirty = true;
+            }
+            Ok(())
+        }
+        fn zero_range(&mut self, va: GuestAddr, len: usize) -> Result<(), String> {
+            let (buf, off, base) = self.locate_mut(va, len)?;
+            buf[off..off + len].fill(0);
+            if let Some(dirty) = self.watches.get_mut(&base) {
+                *dirty = true;
+            }
+            Ok(())
+        }
+        fn alloc(&mut self, size: usize, _zeroed: bool) -> Result<GuestAddr, String> {
+            let va = self.next_va;
+            self.next_va += ((size as u32).max(16) + 0xFFF) & !0xFFF;
+            self.allocs.insert(va, vec![0u8; size]);
+            Ok(va)
+        }
+        fn free(&mut self, va: GuestAddr) -> Result<(), String> {
+            self.allocs.remove(&va);
+            self.watches.remove(&va);
+            Ok(())
+        }
+        fn arm_write_watch(&mut self, va: GuestAddr, _alloc_size: usize) -> bool {
+            self.arm_calls += 1;
+            self.watches.insert(va, false);
+            true
+        }
+        fn is_write_watch_dirty(&self, va: GuestAddr, _alloc_size: usize) -> Option<bool> {
+            self.watches.get(&va).copied()
+        }
+        fn remove_write_watch(&mut self, va: GuestAddr, _alloc_size: usize) {
+            self.remove_calls += 1;
+            self.watches.remove(&va);
+        }
+    }
+
+    #[derive(Default)]
+    struct UploadCounterBackend {
+        uploads: u32,
+        skips: u32,
+    }
+
+    impl RenderBackend for UploadCounterBackend {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn max_texture_size(&self) -> u32 {
+            2048
+        }
+        fn supports_s3tc(&self) -> bool {
+            false
+        }
+        fn on_device_create(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_device_reset(&mut self, _: u32, _: u32, _: u32, _: bool) {}
+        fn on_clear(&mut self, _: u32, _: u32, _: f32, _: u32, _: &[D3dRect]) {}
+        fn on_texture_upload(&mut self, _: u32, _: u32, _: &PreparedTextureUpload) {
+            self.uploads += 1;
+        }
+        fn on_texture_upload_skipped(&mut self) {
+            self.skips += 1;
+        }
+        fn on_texture_destroy(&mut self, _: u32) {}
+        fn on_vb_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_vb_destroy(&mut self, _: u32) {}
+        fn on_ib_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_ib_destroy(&mut self, _: u32) {}
+        fn on_draw_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32) {}
+        fn on_draw_indexed_primitive(&mut self, _: &DeviceState, _: &ActiveShaders<'_>, _: u32, _: u32, _: u32, _: u32, _: u32) {}
+        fn on_present(&mut self) {}
+    }
+
+    fn call(
+        ctx: &mut D3d8Context,
+        mem: &mut LocalMem,
+        obj_va: GuestAddr,
+        method_idx: u32,
+        args: &[u32],
+    ) -> HResult {
+        let iface = ComInterfaceId::from_u32(mem.read_u32(obj_va + 8).unwrap()).unwrap();
+        let mut full_args = Vec::with_capacity(args.len() + 1);
+        full_args.push(obj_va);
+        full_args.extend_from_slice(args);
+        ctx.dispatch_com(mem, iface, method_idx, &full_args).unwrap().ret_val
+    }
+
+    #[test]
+    fn unchanged_unlock_after_dirty_streak_skips_upload_and_rearms_write_watch() {
+        let mut mem = LocalMem::new();
+        let mut ctx = D3d8Context::new(Box::new(UploadCounterBackend::default()));
+        let pp_va = mem.alloc(D3dPresentParameters::SIZE, true).unwrap();
+        let out_ptr = mem.alloc(4, true).unwrap();
+        let lr_va = mem.alloc(8, true).unwrap();
+        let d3d8_va = ctx.create_direct3d8(&mut mem, D3D_SDK_VERSION).unwrap();
+        let pp = D3dPresentParameters {
+            back_buffer_width: 640,
+            back_buffer_height: 480,
+            back_buffer_format: D3DFMT_X8R8G8B8,
+            back_buffer_count: 1,
+            swap_effect: 1,
+            windowed: 1,
+            ..Default::default()
+        };
+        pp.write_to(&mut mem, pp_va).unwrap();
+        assert_eq!(
+            call(&mut ctx, &mut mem, d3d8_va, 15, &[0, D3DDEVTYPE_HAL, 0x0002_0000, 0x40, pp_va, out_ptr]),
+            D3D_OK
+        );
+        let dev_va = mem.read_u32(out_ptr).unwrap();
+        // 128x128 A8R8G8B8 = 64 KiB (>= WRITE_WATCH_MIN_BYTES) so write-watch arms.
+        assert_eq!(
+            call(&mut ctx, &mut mem, dev_va, 20, &[128, 128, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, out_ptr]),
+            D3D_OK
+        );
+        let tex_va = mem.read_u32(out_ptr).unwrap();
+
+        // Initial unlock uploads and arms write-watch.
+        assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+        let lr = D3dLockedRect::read_from(&mem, lr_va).unwrap();
+        mem.write_u32(lr.p_bits, 0xFF10_2030).unwrap();
+        assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+        let scratch_ptr = ctx.scratch_rgba.as_ptr();
+        let scratch_cap = ctx.scratch_rgba.capacity();
+        assert_eq!(mem.arm_calls, 1);
+
+        // Three consecutive dirty unlocks disarm write-watch after reaching WRITE_WATCH_DIRTY_STREAK_LIMIT.
+        for step in 1..=u32::from(WRITE_WATCH_DIRTY_STREAK_LIMIT) {
+            assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+            mem.write_u32(lr.p_bits, 0xFF10_2030 + step).unwrap();
+            assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+            assert_eq!(ctx.scratch_rgba.as_ptr(), scratch_ptr);
+            assert_eq!(ctx.scratch_rgba.capacity(), scratch_cap);
+        }
+        assert_eq!(mem.remove_calls, 1);
+        let tex_surf = ctx
+            .surfaces
+            .values()
+            .find(|s| s.parent_texture.is_some())
+            .unwrap();
+        assert_eq!(tex_surf.consecutive_dirty_locks, WRITE_WATCH_DIRTY_STREAK_LIMIT);
+        assert!(!tex_surf.write_watched);
+
+        // Once pixels stabilize, unlock must still diff bytes, skip upload, reset streak, and re-arm write-watch.
+        assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+        assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+        let tex_surf = ctx
+            .surfaces
+            .values()
+            .find(|s| s.parent_texture.is_some())
+            .unwrap();
+        assert_eq!(tex_surf.consecutive_dirty_locks, 0);
+        assert!(tex_surf.write_watched);
+        assert_eq!(mem.arm_calls, 4);
+
+        // Subsequent clean unlock skips directly via write-watch without touching bytes.
+        assert_eq!(call(&mut ctx, &mut mem, tex_va, 16, &[0, lr_va, 0, 0]), D3D_OK);
+        assert_eq!(call(&mut ctx, &mut mem, tex_va, 17, &[0]), D3D_OK);
+
+        let backend = ctx.backend().as_any().downcast_ref::<UploadCounterBackend>().unwrap();
+        assert_eq!(backend.uploads, 1 + u32::from(WRITE_WATCH_DIRTY_STREAK_LIMIT));
+        assert_eq!(backend.skips, 2);
     }
 }

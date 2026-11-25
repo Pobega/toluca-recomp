@@ -86,9 +86,32 @@ fn write_rgba8_pixel(out: &mut [u8], width: u32, x: u32, y: u32, rgba: [u8; 4]) 
     out[idx..idx + RGBA8_BPP].copy_from_slice(&rgba);
 }
 
-pub fn decode_dxt1_to_rgba8(src: &[u8], width: u32, height: u32) -> DecodedRgba8 {
-    let mut pixels = vec![0u8; (width as usize) * (height as usize) * RGBA8_BPP];
+fn prepare_dxt_pixels(
+    mut pixels: Vec<u8>,
+    needed: usize,
+    src_len: usize,
+    blocks_w: u32,
+    blocks_h: u32,
+    block_bytes: usize,
+) -> Vec<u8> {
+    let prev_len = pixels.len();
+    pixels.resize(needed, 0);
+    let expected = (blocks_w as usize) * (blocks_h as usize) * block_bytes;
+    if src_len < expected && prev_len > 0 {
+        pixels[..prev_len.min(needed)].fill(0);
+    }
+    pixels
+}
+
+fn decode_dxt1_to_rgba8_into(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    mut pixels: Vec<u8>,
+) -> DecodedRgba8 {
+    let needed = (width as usize) * (height as usize) * RGBA8_BPP;
     if width == 0 || height == 0 {
+        pixels.clear();
         return DecodedRgba8 {
             width,
             height,
@@ -98,6 +121,7 @@ pub fn decode_dxt1_to_rgba8(src: &[u8], width: u32, height: u32) -> DecodedRgba8
 
     let blocks_w = width.div_ceil(DXT_BLOCK_DIM);
     let blocks_h = height.div_ceil(DXT_BLOCK_DIM);
+    pixels = prepare_dxt_pixels(pixels, needed, src.len(), blocks_w, blocks_h, DXT1_BLOCK_BYTES);
 
     for by in 0..blocks_h {
         for bx in 0..blocks_w {
@@ -136,14 +160,20 @@ pub fn decode_dxt1_to_rgba8(src: &[u8], width: u32, height: u32) -> DecodedRgba8
     }
 }
 
+pub fn decode_dxt1_to_rgba8(src: &[u8], width: u32, height: u32) -> DecodedRgba8 {
+    decode_dxt1_to_rgba8_into(src, width, height, Vec::new())
+}
+
 fn decode_dxt3_internal(
     src: &[u8],
     width: u32,
     height: u32,
     premultiplied: bool,
+    mut pixels: Vec<u8>,
 ) -> DecodedRgba8 {
-    let mut pixels = vec![0u8; (width as usize) * (height as usize) * RGBA8_BPP];
+    let needed = (width as usize) * (height as usize) * RGBA8_BPP;
     if width == 0 || height == 0 {
+        pixels.clear();
         return DecodedRgba8 {
             width,
             height,
@@ -153,6 +183,14 @@ fn decode_dxt3_internal(
 
     let blocks_w = width.div_ceil(DXT_BLOCK_DIM);
     let blocks_h = height.div_ceil(DXT_BLOCK_DIM);
+    pixels = prepare_dxt_pixels(
+        pixels,
+        needed,
+        src.len(),
+        blocks_w,
+        blocks_h,
+        DXT3_DXT5_BLOCK_BYTES,
+    );
 
     for by in 0..blocks_h {
         for bx in 0..blocks_w {
@@ -201,7 +239,7 @@ fn decode_dxt3_internal(
 }
 
 pub fn decode_dxt3_to_rgba8(src: &[u8], width: u32, height: u32) -> DecodedRgba8 {
-    decode_dxt3_internal(src, width, height, false)
+    decode_dxt3_internal(src, width, height, false, Vec::new())
 }
 
 fn dxt5_alpha_table(a0: u8, a1: u8) -> [u8; 8] {
@@ -229,9 +267,11 @@ fn decode_dxt5_internal(
     width: u32,
     height: u32,
     premultiplied: bool,
+    mut pixels: Vec<u8>,
 ) -> DecodedRgba8 {
-    let mut pixels = vec![0u8; (width as usize) * (height as usize) * RGBA8_BPP];
+    let needed = (width as usize) * (height as usize) * RGBA8_BPP;
     if width == 0 || height == 0 {
+        pixels.clear();
         return DecodedRgba8 {
             width,
             height,
@@ -241,6 +281,14 @@ fn decode_dxt5_internal(
 
     let blocks_w = width.div_ceil(DXT_BLOCK_DIM);
     let blocks_h = height.div_ceil(DXT_BLOCK_DIM);
+    pixels = prepare_dxt_pixels(
+        pixels,
+        needed,
+        src.len(),
+        blocks_w,
+        blocks_h,
+        DXT3_DXT5_BLOCK_BYTES,
+    );
 
     for by in 0..blocks_h {
         for bx in 0..blocks_w {
@@ -294,7 +342,7 @@ fn decode_dxt5_internal(
 }
 
 pub fn decode_dxt5_to_rgba8(src: &[u8], width: u32, height: u32) -> DecodedRgba8 {
-    decode_dxt5_internal(src, width, height, false)
+    decode_dxt5_internal(src, width, height, false, Vec::new())
 }
 
 fn palette_has_nonzero_alpha(palette: &[[u8; 4]; 256]) -> bool {
@@ -422,6 +470,29 @@ fn check_rect_bounds(
     Ok(())
 }
 
+#[inline]
+fn swizzle_bgra_to_rgba_row(src: &[u8], dst: &mut [u8]) {
+    for (px, out) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+        let bgra = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+        let rgba = (bgra & 0xFF00_FF00)
+            | ((bgra & 0x00FF_0000) >> 16)
+            | ((bgra & 0x0000_00FF) << 16);
+        out.copy_from_slice(&rgba.to_le_bytes());
+    }
+}
+
+#[inline]
+fn swizzle_bgrx_to_rgba_row(src: &[u8], dst: &mut [u8]) {
+    for (px, out) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+        let bgrx = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+        let rgba = 0xFF00_0000
+            | (bgrx & 0x0000_FF00)
+            | ((bgrx & 0x00FF_0000) >> 16)
+            | ((bgrx & 0x0000_00FF) << 16);
+        out.copy_from_slice(&rgba.to_le_bytes());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn convert_surface_rect_to_rgba8(
     format: u32,
@@ -433,8 +504,23 @@ pub fn convert_surface_rect_to_rgba8(
     rh: u32,
     palette: Option<&[[u8; 4]; 256]>,
 ) -> Result<DecodedRgba8, String> {
-    let mut pixels = vec![0u8; (rw as usize) * (rh as usize) * RGBA8_BPP];
+    convert_surface_rect_to_rgba8_into(format, pitch, src, rx, ry, rw, rh, palette, Vec::new())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn convert_surface_rect_to_rgba8_into(
+    format: u32,
+    pitch: u32,
+    src: &[u8],
+    rx: u32,
+    ry: u32,
+    rw: u32,
+    rh: u32,
+    palette: Option<&[[u8; 4]; 256]>,
+    mut pixels: Vec<u8>,
+) -> Result<DecodedRgba8, String> {
     if rw == 0 || rh == 0 {
+        pixels.clear();
         return Ok(DecodedRgba8 {
             width: rw,
             height: rh,
@@ -455,31 +541,34 @@ pub fn convert_surface_rect_to_rgba8(
     check_rect_bounds(src, effective_pitch, ry_usize, rh_usize, row_end_byte)?;
 
     let out_stride = rw_usize * RGBA8_BPP;
+    let needed = rh_usize * out_stride;
+    pixels.resize(needed, 0);
     let src_x_off = rx_usize * bpp;
     let src_span = rw_usize * bpp;
+    let flat_contiguous = effective_pitch == src_span && rx_usize == 0;
 
     match format {
         D3DFMT_A8R8G8B8 => {
-            for dy in 0..rh_usize {
-                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
-                let out_row = &mut pixels[dy * out_stride..][..out_stride];
-                for (px, dst) in row.chunks_exact(4).zip(out_row.chunks_exact_mut(4)) {
-                    dst[0] = px[2];
-                    dst[1] = px[1];
-                    dst[2] = px[0];
-                    dst[3] = px[3];
+            if flat_contiguous {
+                let flat_src = &src[ry_usize * effective_pitch..][..rh_usize * src_span];
+                swizzle_bgra_to_rgba_row(flat_src, &mut pixels[..needed]);
+            } else {
+                for dy in 0..rh_usize {
+                    let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                    let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                    swizzle_bgra_to_rgba_row(row, out_row);
                 }
             }
         }
         D3DFMT_X8R8G8B8 => {
-            for dy in 0..rh_usize {
-                let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
-                let out_row = &mut pixels[dy * out_stride..][..out_stride];
-                for (px, dst) in row.chunks_exact(4).zip(out_row.chunks_exact_mut(4)) {
-                    dst[0] = px[2];
-                    dst[1] = px[1];
-                    dst[2] = px[0];
-                    dst[3] = 255;
+            if flat_contiguous {
+                let flat_src = &src[ry_usize * effective_pitch..][..rh_usize * src_span];
+                swizzle_bgrx_to_rgba_row(flat_src, &mut pixels[..needed]);
+            } else {
+                for dy in 0..rh_usize {
+                    let row = &src[(ry_usize + dy) * effective_pitch + src_x_off..][..src_span];
+                    let out_row = &mut pixels[dy * out_stride..][..out_stride];
+                    swizzle_bgrx_to_rgba_row(row, out_row);
                 }
             }
         }
@@ -592,16 +681,28 @@ pub fn convert_surface_to_rgba8(
     src: &[u8],
     palette: Option<&[[u8; 4]; 256]>,
 ) -> Result<DecodedRgba8, String> {
+    convert_surface_to_rgba8_into(format, width, height, pitch, src, palette, Vec::new())
+}
+
+pub fn convert_surface_to_rgba8_into(
+    format: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    src: &[u8],
+    palette: Option<&[[u8; 4]; 256]>,
+    pixels: Vec<u8>,
+) -> Result<DecodedRgba8, String> {
     match format {
-        D3DFMT_DXT1 => return Ok(decode_dxt1_to_rgba8(src, width, height)),
-        D3DFMT_DXT2 => return Ok(decode_dxt3_internal(src, width, height, true)),
-        D3DFMT_DXT3 => return Ok(decode_dxt3_to_rgba8(src, width, height)),
-        D3DFMT_DXT4 => return Ok(decode_dxt5_internal(src, width, height, true)),
-        D3DFMT_DXT5 => return Ok(decode_dxt5_to_rgba8(src, width, height)),
+        D3DFMT_DXT1 => return Ok(decode_dxt1_to_rgba8_into(src, width, height, pixels)),
+        D3DFMT_DXT2 => return Ok(decode_dxt3_internal(src, width, height, true, pixels)),
+        D3DFMT_DXT3 => return Ok(decode_dxt3_internal(src, width, height, false, pixels)),
+        D3DFMT_DXT4 => return Ok(decode_dxt5_internal(src, width, height, true, pixels)),
+        D3DFMT_DXT5 => return Ok(decode_dxt5_internal(src, width, height, false, pixels)),
         _ => {}
     }
 
-    convert_surface_rect_to_rgba8(format, pitch, src, 0, 0, width, height, palette)
+    convert_surface_rect_to_rgba8_into(format, pitch, src, 0, 0, width, height, palette, pixels)
 }
 
 fn downsample_rgba8_half(img: &DecodedRgba8) -> DecodedRgba8 {
@@ -665,6 +766,31 @@ pub fn prepare_texture_upload(
     max_texture_size: u32,
     supports_s3tc: bool,
 ) -> Result<PreparedTextureUpload, String> {
+    prepare_texture_upload_with_buf(
+        format,
+        width,
+        height,
+        pitch,
+        src,
+        palette,
+        max_texture_size,
+        supports_s3tc,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_texture_upload_with_buf(
+    format: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    src: &[u8],
+    palette: Option<&[[u8; 4]; 256]>,
+    max_texture_size: u32,
+    supports_s3tc: bool,
+    mut scratch_buf: Vec<u8>,
+) -> Result<PreparedTextureUpload, String> {
     let limit = max_texture_size.max(1);
     let native_s3tc = supports_s3tc
         && matches!(format, D3DFMT_DXT1 | D3DFMT_DXT3 | D3DFMT_DXT5)
@@ -672,15 +798,18 @@ pub fn prepare_texture_upload(
         && height <= limit;
 
     if native_s3tc {
+        scratch_buf.resize(src.len(), 0);
+        scratch_buf.copy_from_slice(src);
         return Ok(PreparedTextureUpload::CompressedS3tc {
             format,
             width,
             height,
-            data: src.to_vec(),
+            data: scratch_buf,
         });
     }
 
-    let decoded = convert_surface_to_rgba8(format, width, height, pitch, src, palette)?;
+    let decoded =
+        convert_surface_to_rgba8_into(format, width, height, pitch, src, palette, scratch_buf)?;
     Ok(PreparedTextureUpload::Rgba8(clamp_rgba8_to_max_size(
         decoded, limit,
     )))
@@ -753,5 +882,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rect_p8.pixels, slice_rgba_rect(&full_p8, rx, ry, rw, rh));
+    }
+
+    #[test]
+    fn prepare_texture_upload_with_buf_reuses_capacity_and_handles_packed_strided_argb() {
+        let scratch = Vec::with_capacity(4096);
+        let orig_ptr = scratch.as_ptr();
+        let orig_cap = scratch.capacity();
+
+        // Packed A8R8G8B8 (hits flat contiguous fast path)
+        let w = 8u32;
+        let h = 4u32;
+        let packed_src: Vec<u8> = (0..(w * h * 4))
+            .map(|i| ((i * 41 + 9) & 0xFF) as u8)
+            .collect();
+        let prepared_a = prepare_texture_upload_with_buf(
+            D3DFMT_A8R8G8B8,
+            w,
+            h,
+            w * 4,
+            &packed_src,
+            None,
+            2048,
+            false,
+            scratch,
+        )
+        .unwrap();
+        let PreparedTextureUpload::Rgba8(img_a) = prepared_a else {
+            panic!("expected Rgba8");
+        };
+        assert_eq!(img_a.pixels.as_ptr(), orig_ptr);
+        assert_eq!(img_a.pixels.capacity(), orig_cap);
+        for (src_px, dst_px) in packed_src.chunks_exact(4).zip(img_a.pixels.chunks_exact(4)) {
+            assert_eq!(dst_px, &[src_px[2], src_px[1], src_px[0], src_px[3]]);
+        }
+
+        // Strided X8R8G8B8 (hits row-by-row swizzle path and forces alpha=255)
+        let strided_pitch = w * 4 + 16;
+        let mut strided_src = vec![0x77u8; (strided_pitch * h) as usize];
+        for row in 0..h as usize {
+            let src_row = &packed_src[row * (w as usize * 4)..][..(w as usize * 4)];
+            let dst_row = &mut strided_src[row * (strided_pitch as usize)..][..(w as usize * 4)];
+            dst_row.copy_from_slice(src_row);
+        }
+        let prepared_x = prepare_texture_upload_with_buf(
+            D3DFMT_X8R8G8B8,
+            w,
+            h,
+            strided_pitch,
+            &strided_src,
+            None,
+            2048,
+            false,
+            img_a.pixels,
+        )
+        .unwrap();
+        let PreparedTextureUpload::Rgba8(img_x) = prepared_x else {
+            panic!("expected Rgba8");
+        };
+        assert_eq!(img_x.pixels.as_ptr(), orig_ptr);
+        assert_eq!(img_x.pixels.capacity(), orig_cap);
+        for (src_px, dst_px) in packed_src.chunks_exact(4).zip(img_x.pixels.chunks_exact(4)) {
+            assert_eq!(dst_px, &[src_px[2], src_px[1], src_px[0], 255]);
+        }
+
+        // Packed X8R8G8B8 + sub-rect A8R8G8B8 into same buffer
+        let expected_x = img_x.pixels.clone();
+        let packed_x = convert_surface_rect_to_rgba8_into(
+            D3DFMT_X8R8G8B8,
+            w * 4,
+            &packed_src,
+            0,
+            0,
+            w,
+            h,
+            None,
+            img_x.pixels,
+        )
+        .unwrap();
+        assert_eq!(packed_x.pixels.as_ptr(), orig_ptr);
+        assert_eq!(packed_x.pixels, expected_x);
     }
 }

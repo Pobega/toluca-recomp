@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.1"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache desktop Bink FFmpeg libs
+        uses: actions/cache@v4
+        with:
+          path: dist/x86_64
+          key: desktop-ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/build-desktop-ffmpeg.sh') }}
+
+      - name: Build minimal Bink-only FFmpeg 7.1.1
+        run: ./scripts/build-desktop-ffmpeg.sh
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Run Bink runtime tests with bundled FFmpeg
+        run: LD_LIBRARY_PATH="$PWD/dist/x86_64/libs" cargo test -p toluca-runtime --lib binkw32
+
+      - name: Build release host binaries
+        run: cargo build --release -p toluca-recomp -p toluca-runtime
+
+      - name: Package desktop release zip
+        env:
+          MAX_GLIBC_MINOR: "35"
+          OUT_ZIP: ${{ github.workspace }}/dist/toluca-${{ inputs.tag || github.ref_name }}-linux-x86_64.zip
+        run: ./scripts/package-desktop.sh --require-ffmpeg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-bundle
+          path: dist/toluca-*-linux-x86_64.zip
+
+  build-portmaster:
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build AArch64 container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile.aarch64
+          load: true
+          tags: toluca-portmaster-aarch64-builder
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Cache AArch64 cargo target
+        uses: actions/cache@v4
+        with:
+          path: target/aarch64-container
+          key: aarch64-container-${{ hashFiles('Containerfile.aarch64', 'Cargo.lock') }}
+          restore-keys: |
+            aarch64-container-
+
+      - name: Cross-compile and test AArch64 binaries
+        env:
+          CONTAINER_ENGINE: docker
+          TOLUCA_SKIP_IMAGE_BUILD: "1"
+        run: ./scripts/build-aarch64.sh --test
+
+      - name: Package PortMaster release zip
+        env:
+          OUT_ZIP: ${{ github.workspace }}/dist/toluca-${{ inputs.tag || github.ref_name }}-portmaster.zip
+        run: ./scripts/package-portmaster.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portmaster-bundle
+          path: dist/toluca-*-portmaster.zip
+
+  draft-release:
+    needs: [build-desktop, build-portmaster]
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd release-assets
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update draft GitHub release
+        run: |
+          cat <<EOF > release-notes.md
+          ## Downloads
+          - \`toluca-${RELEASE_TAG}-linux-x86_64.zip\` — Linux x86-64 desktop bundle (\`./toluca.sh\`, stripped binaries, and LGPLv2.1 Bink-only FFmpeg 7.1.1 libraries).
+          - \`toluca-${RELEASE_TAG}-portmaster.zip\` — PortMaster ARM64 bundle for 1 GB Linux handhelds (extract \`Toluca.sh\` and \`toluca/\` to your PortMaster \`ports/\` directory).
+          - \`SHA256SUMS.txt\` — SHA-256 checksums for both release archives.
+
+          ## Clean-Room Game Data Requirement
+          No copyrighted Konami executables or game assets are included. Supply your own legal, unprotected vanilla North American v1.0 \`sh2pc.exe\` and \`data/\` directory.
+          EOF
+
+          PRERELEASE_ARGS=()
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            PRERELEASE_ARGS+=(--prerelease)
+          fi
+
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft "${PRERELEASE_ARGS[@]}" --notes-file release-notes.md
+            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" release-assets/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" release-assets/* --repo "${GITHUB_REPOSITORY}" --draft "${PRERELEASE_ARGS[@]}" --title "Toluca ${RELEASE_TAG}" --notes-file release-notes.md --generate-notes
+          fi

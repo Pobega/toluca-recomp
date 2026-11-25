@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  host-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.1"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint shell scripts
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck portmaster/Toluca.sh portmaster/tools/patchscript desktop/toluca.sh scripts/*.sh
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Cache desktop Bink FFmpeg libs
+        uses: actions/cache@v4
+        with:
+          path: dist/x86_64
+          key: desktop-ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/build-desktop-ffmpeg.sh') }}
+
+      - name: Build minimal Bink-only FFmpeg 7.1.1
+        run: ./scripts/build-desktop-ffmpeg.sh
+
+      - name: Run Bink runtime tests with bundled FFmpeg
+        run: LD_LIBRARY_PATH="$PWD/dist/x86_64/libs" cargo test -p toluca-runtime --lib binkw32
+
+      - name: Build release host binaries
+        run: cargo build --release -p toluca-recomp -p toluca-runtime
+
+      - name: Package and verify desktop release bundle
+        env:
+          MAX_GLIBC_MINOR: "35"
+        run: ./scripts/package-desktop.sh --require-ffmpeg
+
+  aarch64-portmaster:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build AArch64 container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile.aarch64
+          load: true
+          tags: toluca-portmaster-aarch64-builder
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Cache AArch64 cargo target
+        uses: actions/cache@v4
+        with:
+          path: target/aarch64-container
+          key: aarch64-container-${{ hashFiles('Containerfile.aarch64', 'Cargo.lock') }}
+          restore-keys: |
+            aarch64-container-
+
+      - name: Cross-compile and test AArch64 binaries
+        env:
+          CONTAINER_ENGINE: docker
+          TOLUCA_SKIP_IMAGE_BUILD: "1"
+        run: ./scripts/build-aarch64.sh --test
+
+      - name: Package and verify PortMaster bundle
+        run: ./scripts/package-portmaster.sh

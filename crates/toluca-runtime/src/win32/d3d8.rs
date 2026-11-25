@@ -211,16 +211,34 @@ pub fn dispatch_com_call(
         return;
     };
 
-    let mut args = Vec::with_capacity(arg_count as usize);
-    for idx in 0..arg_count {
-        match peek_arg_u32(state, ctx.arena, idx) {
-            Ok(val) => args.push(val),
-            Err(err) => {
-                fail_com_call(ctx, state, iface, method_idx, RuntimeError::Arena(err));
-                return;
+    const MAX_COM_ARGS: usize = 16;
+    let count = arg_count as usize;
+    let mut stack_args = [0u32; MAX_COM_ARGS];
+    let mut overflow_args = Vec::new();
+    let args: &[u32] = if count <= MAX_COM_ARGS {
+        for (idx, slot) in stack_args[..count].iter_mut().enumerate() {
+            match peek_arg_u32(state, ctx.arena, idx as u32) {
+                Ok(val) => *slot = val,
+                Err(err) => {
+                    fail_com_call(ctx, state, iface, method_idx, RuntimeError::Arena(err));
+                    return;
+                }
             }
         }
-    }
+        &stack_args[..count]
+    } else {
+        overflow_args.reserve(count);
+        for idx in 0..arg_count {
+            match peek_arg_u32(state, ctx.arena, idx) {
+                Ok(val) => overflow_args.push(val),
+                Err(err) => {
+                    fail_com_call(ctx, state, iface, method_idx, RuntimeError::Arena(err));
+                    return;
+                }
+            }
+        }
+        &overflow_args
+    };
 
     if iface == ComInterfaceId::Direct3D8 && method_idx == 15 {
         let focus_hwnd = args.get(3).copied().unwrap_or(0);
@@ -233,7 +251,7 @@ pub fn dispatch_com_call(
             heap: ctx.heap,
             vmem: ctx.vmem,
         };
-        ctx.win32.d3d8.dispatch_com(&mut mem, iface, method_idx, &args)
+        ctx.win32.d3d8.dispatch_com(&mut mem, iface, method_idx, args)
     };
 
     match result {

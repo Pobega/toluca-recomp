@@ -1843,9 +1843,8 @@ impl D3d8Context {
                 if p_data == 0 {
                     return Ok(D3DERR_INVALIDCALL);
                 }
-                let regs = read_vec4_array(mem, p_data, count)?;
                 if let Some(dev) = self.devices.get_mut(&handle) {
-                    dev.state.set_vs_constants(reg, &regs);
+                    apply_shader_constants(mem, p_data, reg, count, &mut dev.state, false)?;
                 }
                 Ok(D3D_OK)
             }
@@ -2036,9 +2035,8 @@ impl D3d8Context {
                 if p_data == 0 {
                     return Ok(D3DERR_INVALIDCALL);
                 }
-                let regs = read_vec4_array(mem, p_data, count)?;
                 if let Some(dev) = self.devices.get_mut(&handle) {
-                    dev.state.set_ps_constants(reg, &regs);
+                    apply_shader_constants(mem, p_data, reg, count, &mut dev.state, true)?;
                 }
                 Ok(D3D_OK)
             }
@@ -3312,7 +3310,18 @@ impl D3d8Context {
             }
             let is_dynamic = (vb.usage & D3DUSAGE_DYNAMIC) != 0;
             if is_dynamic && (flags & D3DLOCK_DISCARD) != 0 {
-                self.backend.on_vb_upload(handle, &vb.data, vb.fvf, vb.usage);
+                if (end - start) < vb.data.len() {
+                    self.backend.on_vb_discard_sub_upload(
+                        handle,
+                        &vb.data,
+                        start,
+                        &vb.data[start..end],
+                        vb.fvf,
+                        vb.usage,
+                    );
+                } else {
+                    self.backend.on_vb_upload(handle, &vb.data, vb.fvf, vb.usage);
+                }
             } else {
                 let unsynchronized = is_dynamic && (flags & D3DLOCK_NOOVERWRITE) != 0;
                 self.backend.on_vb_sub_upload(
@@ -3660,23 +3669,50 @@ fn write_token_buffer(
     Ok(D3D_OK)
 }
 
-fn read_vec4_array(
+const MAX_SHADER_CONST_REGS: usize = 96;
+
+fn apply_shader_constants(
     mem: &dyn GuestMemory,
     va: GuestAddr,
+    start_reg: u32,
     count: u32,
-) -> Result<Vec<[f32; 4]>, String> {
-    let clamped = count.min(256) as usize;
-    let bytes = mem.read_bytes(va, clamped * 16)?;
-    let mut out = Vec::with_capacity(clamped);
-    for chunk in bytes.chunks_exact(16) {
-        let mut v = [0.0f32; 4];
-        for (i, dst) in v.iter_mut().enumerate() {
+    state: &mut DeviceState,
+    is_pixel: bool,
+) -> Result<(), String> {
+    let max_regs = if is_pixel {
+        state.ps_constants.len()
+    } else {
+        state.vs_constants.len()
+    }
+    .min(MAX_SHADER_CONST_REGS);
+    let effective = (count as usize).min(max_regs.saturating_sub(start_reg as usize));
+    if effective == 0 {
+        return Ok(());
+    }
+    let byte_len = effective * 16;
+    let mut stack_regs = [[0.0f32; 4]; MAX_SHADER_CONST_REGS];
+    let mut raw_buf = [0u8; MAX_SHADER_CONST_REGS * 16];
+    let bytes: &[u8] = if let Some(slice) = mem.bytes_slice(va, byte_len)? {
+        slice
+    } else {
+        mem.read_into(va, &mut raw_buf[..byte_len])?;
+        &raw_buf[..byte_len]
+    };
+    for (dst_reg, chunk) in stack_regs[..effective]
+        .iter_mut()
+        .zip(bytes.chunks_exact(16))
+    {
+        for (i, dst) in dst_reg.iter_mut().enumerate() {
             let bits = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
             *dst = f32::from_bits(bits);
         }
-        out.push(v);
     }
-    Ok(out)
+    if is_pixel {
+        state.set_ps_constants(start_reg, &stack_regs[..effective]);
+    } else {
+        state.set_vs_constants(start_reg, &stack_regs[..effective]);
+    }
+    Ok(())
 }
 
 fn active_shaders_for_device(dev: &DeviceObj) -> ActiveShaders<'_> {
@@ -3809,6 +3845,8 @@ mod tests {
     struct UploadCounterBackend {
         uploads: u32,
         skips: u32,
+        vb_full_uploads: u32,
+        vb_discard_subs: Vec<(usize, usize, usize)>,
     }
 
     impl RenderBackend for UploadCounterBackend {
@@ -3834,7 +3872,21 @@ mod tests {
             self.skips += 1;
         }
         fn on_texture_destroy(&mut self, _: u32) {}
-        fn on_vb_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
+        fn on_vb_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {
+            self.vb_full_uploads += 1;
+        }
+        fn on_vb_discard_sub_upload(
+            &mut self,
+            _: u32,
+            full_data: &[u8],
+            offset: usize,
+            sub_data: &[u8],
+            _: u32,
+            _: u32,
+        ) {
+            self.vb_discard_subs
+                .push((full_data.len(), offset, sub_data.len()));
+        }
         fn on_vb_destroy(&mut self, _: u32) {}
         fn on_ib_upload(&mut self, _: u32, _: &[u8], _: u32, _: u32) {}
         fn on_ib_destroy(&mut self, _: u32) {}
@@ -3932,5 +3984,68 @@ mod tests {
         let backend = ctx.backend().as_any().downcast_ref::<UploadCounterBackend>().unwrap();
         assert_eq!(backend.uploads, 1 + u32::from(WRITE_WATCH_DIRTY_STREAK_LIMIT));
         assert_eq!(backend.skips, 2);
+    }
+
+    #[test]
+    fn shader_constants_and_partial_vb_discard_upload_cleanly() {
+        let mut mem = LocalMem::new();
+        let mut ctx = D3d8Context::new(Box::new(UploadCounterBackend::default()));
+        let pp_va = mem.alloc(D3dPresentParameters::SIZE, true).unwrap();
+        let out_ptr = mem.alloc(4, true).unwrap();
+        let d3d8_va = ctx.create_direct3d8(&mut mem, D3D_SDK_VERSION).unwrap();
+        let pp = D3dPresentParameters {
+            back_buffer_width: 640,
+            back_buffer_height: 480,
+            back_buffer_format: D3DFMT_X8R8G8B8,
+            back_buffer_count: 1,
+            swap_effect: 1,
+            windowed: 1,
+            ..Default::default()
+        };
+        pp.write_to(&mut mem, pp_va).unwrap();
+        assert_eq!(
+            call(&mut ctx, &mut mem, d3d8_va, 15, &[0, D3DDEVTYPE_HAL, 0x0002_0000, 0x40, pp_va, out_ptr]),
+            D3D_OK
+        );
+        let dev_va = mem.read_u32(out_ptr).unwrap();
+
+        // SetVertexShaderConstant (79) and SetPixelShaderConstant (91)
+        let vs_const_va = mem.alloc(32, true).unwrap();
+        let ps_const_va = mem.alloc(16, true).unwrap();
+        let vs_vals = [1.25f32, -2.5, 3.0, 4.5, 5.0, 6.0, 7.0, 8.0];
+        for (i, &val) in vs_vals.iter().enumerate() {
+            mem.write_f32(vs_const_va + (i as u32) * 4, val).unwrap();
+        }
+        let ps_vals = [0.5f32, 0.25, 0.75, 1.0];
+        for (i, &val) in ps_vals.iter().enumerate() {
+            mem.write_f32(ps_const_va + (i as u32) * 4, val).unwrap();
+        }
+        assert_eq!(call(&mut ctx, &mut mem, dev_va, 79, &[2, vs_const_va, 2]), D3D_OK);
+        assert_eq!(call(&mut ctx, &mut mem, dev_va, 91, &[1, ps_const_va, 1]), D3D_OK);
+        let dev = ctx.devices.values().next().unwrap();
+        assert_eq!(dev.state.vs_constants[2], [1.25, -2.5, 3.0, 4.5]);
+        assert_eq!(dev.state.vs_constants[3], [5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(dev.state.ps_constants[1], [0.5, 0.25, 0.75, 1.0]);
+
+        // Dynamic VB partial DISCARD vs full DISCARD
+        assert_eq!(
+            call(&mut ctx, &mut mem, dev_va, 23, &[256, D3DUSAGE_DYNAMIC, 0x02, D3DPOOL_MANAGED, out_ptr]),
+            D3D_OK
+        );
+        let vb_va = mem.read_u32(out_ptr).unwrap();
+        assert_eq!(
+            call(&mut ctx, &mut mem, vb_va, 11, &[32, 64, out_ptr, D3DLOCK_DISCARD]),
+            D3D_OK
+        );
+        assert_eq!(call(&mut ctx, &mut mem, vb_va, 12, &[]), D3D_OK);
+        assert_eq!(
+            call(&mut ctx, &mut mem, vb_va, 11, &[0, 0, out_ptr, D3DLOCK_DISCARD]),
+            D3D_OK
+        );
+        assert_eq!(call(&mut ctx, &mut mem, vb_va, 12, &[]), D3D_OK);
+
+        let backend = ctx.backend().as_any().downcast_ref::<UploadCounterBackend>().unwrap();
+        assert_eq!(backend.vb_discard_subs, vec![(256, 32, 64)]);
+        assert_eq!(backend.vb_full_uploads, 1);
     }
 }

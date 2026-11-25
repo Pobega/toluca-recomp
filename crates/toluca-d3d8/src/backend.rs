@@ -51,6 +51,19 @@ pub trait RenderBackend {
         let _ = (offset, sub_data, unsynchronized);
         self.on_vb_upload(vb_handle, full_data, fvf, usage);
     }
+    #[allow(clippy::too_many_arguments)]
+    fn on_vb_discard_sub_upload(
+        &mut self,
+        vb_handle: u32,
+        full_data: &[u8],
+        offset: usize,
+        sub_data: &[u8],
+        fvf: u32,
+        usage: u32,
+    ) {
+        let _ = (offset, sub_data);
+        self.on_vb_upload(vb_handle, full_data, fvf, usage);
+    }
     fn on_vb_destroy(&mut self, vb_handle: u32);
     fn on_ib_upload(&mut self, ib_handle: u32, data: &[u8], format: u32, usage: u32);
     #[allow(clippy::too_many_arguments)]

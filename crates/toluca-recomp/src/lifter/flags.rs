@@ -57,6 +57,15 @@ pub const fn condition_from_mnemonic(mnemonic: Mnemonic) -> Option<Condition> {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct PendingLazyFlags {
+    pub op: LazyFlagOp,
+    pub width: u32,
+    pub lhs: Value,
+    pub rhs: Value,
+    pub res: Value,
+}
+
 impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     pub fn set_lazy_flags(
         &mut self,
@@ -66,31 +75,52 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         rhs: Value,
         res: Value,
     ) {
+        if !self.current_arith_flags_live_after {
+            self.pending_flags = None;
+            return;
+        }
+        self.pending_flags = Some(PendingLazyFlags {
+            op,
+            width: byte_width,
+            lhs: self.ensure_u32(lhs),
+            rhs: self.ensure_u32(rhs),
+            res: self.ensure_u32(res),
+        });
+    }
+
+    pub fn flush_pending_flags(&mut self) {
+        let Some(pf) = self.pending_flags.take() else {
+            return;
+        };
         let base = cpu_offsets::LAZY_FLAGS;
-        let op_val = self.builder.ins().iconst(I32, op as i64);
-        let width_val = self.builder.ins().iconst(I32, byte_width as i64);
-        let lhs_32 = self.ensure_u32(lhs);
-        let rhs_32 = self.ensure_u32(rhs);
-        let res_32 = self.ensure_u32(res);
+        let op_val = self.builder.ins().iconst(I32, pf.op as i64);
+        let width_val = self.builder.ins().iconst(I32, pf.width as i64);
 
         self.store_lazy_field(base + offset_of!(LazyFlags, op), op_val);
         self.store_lazy_field(base + offset_of!(LazyFlags, width), width_val);
-        self.store_lazy_field(base + offset_of!(LazyFlags, lhs), lhs_32);
-        self.store_lazy_field(base + offset_of!(LazyFlags, rhs), rhs_32);
-        self.store_lazy_field(base + offset_of!(LazyFlags, res), res_32);
+        self.store_lazy_field(base + offset_of!(LazyFlags, lhs), pf.lhs);
+        self.store_lazy_field(base + offset_of!(LazyFlags, rhs), pf.rhs);
+        self.store_lazy_field(base + offset_of!(LazyFlags, res), pf.res);
     }
 
     pub fn clear_lazy_flags(&mut self) {
+        self.pending_flags = None;
         let off = cpu_offsets::LAZY_FLAGS + offset_of!(LazyFlags, op);
         let zero = self.builder.ins().iconst(I32, LazyFlagOp::None as i64);
         self.store_lazy_field(off, zero);
     }
 
     pub fn materialize_flags(&mut self) {
+        self.flush_pending_flags();
         self.call_bridge_void(bridge::offsets::MATERIALIZE_FLAGS);
     }
 
     pub fn eval_condition(&mut self, cond: Condition) -> Value {
+        if let Some(pf) = self.pending_flags {
+            if let Some(val) = self.try_eval_inline_condition(pf, cond) {
+                return val;
+            }
+        }
         self.materialize_flags();
         let eflags = self.read_eflags();
         match cond {
@@ -155,6 +185,245 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 let diff = self.builder.ins().bxor(sf, of);
                 let le = self.builder.ins().bor(zf, diff);
                 self.builder.ins().bxor_imm(le, 1)
+            }
+        }
+    }
+
+    fn try_eval_inline_condition(&mut self, pf: PendingLazyFlags, cond: Condition) -> Option<Value> {
+        if matches!(cond, Condition::P | Condition::NP) {
+            return None;
+        }
+        let ty = match pf.width {
+            1 => I8,
+            2 => I16,
+            4 => I32,
+            _ => return None,
+        };
+        let lhs = self.coerce_int(pf.lhs, ty);
+        let rhs = self.coerce_int(pf.rhs, ty);
+        let res = self.coerce_int(pf.res, ty);
+
+        match pf.op {
+            LazyFlagOp::Sub => Some(self.eval_sub_inline(lhs, rhs, res, cond)),
+            LazyFlagOp::Logic => Some(self.eval_logic_inline(res, cond)),
+            LazyFlagOp::Add => Some(self.eval_add_inline(lhs, rhs, res, cond)),
+            LazyFlagOp::Inc => self.eval_inc_dec_inline(ty, lhs, res, cond, true),
+            LazyFlagOp::Dec => self.eval_inc_dec_inline(ty, lhs, res, cond, false),
+            _ => None,
+        }
+    }
+
+    fn eval_sub_inline(&mut self, lhs: Value, rhs: Value, res: Value, cond: Condition) -> Value {
+        match cond {
+            Condition::E => self.builder.ins().icmp_imm(IntCC::Equal, res, 0),
+            Condition::NE => self.builder.ins().icmp_imm(IntCC::NotEqual, res, 0),
+            Condition::B => self.builder.ins().icmp(IntCC::UnsignedLessThan, lhs, rhs),
+            Condition::AE => self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs, rhs),
+            Condition::BE => self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThanOrEqual, lhs, rhs),
+            Condition::A => self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, lhs, rhs),
+            Condition::L => self.builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs),
+            Condition::GE => self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs),
+            Condition::LE => self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedLessThanOrEqual, lhs, rhs),
+            Condition::G => self.builder.ins().icmp(IntCC::SignedGreaterThan, lhs, rhs),
+            Condition::S => self.builder.ins().icmp_imm(IntCC::SignedLessThan, res, 0),
+            Condition::NS => self
+                .builder
+                .ins()
+                .icmp_imm(IntCC::SignedGreaterThanOrEqual, res, 0),
+            Condition::O => {
+                let x0 = self.builder.ins().bxor(lhs, rhs);
+                let x1 = self.builder.ins().bxor(lhs, res);
+                let ov = self.builder.ins().band(x0, x1);
+                self.builder.ins().icmp_imm(IntCC::SignedLessThan, ov, 0)
+            }
+            Condition::NO => {
+                let x0 = self.builder.ins().bxor(lhs, rhs);
+                let x1 = self.builder.ins().bxor(lhs, res);
+                let ov = self.builder.ins().band(x0, x1);
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedGreaterThanOrEqual, ov, 0)
+            }
+            Condition::P | Condition::NP => unreachable!(),
+        }
+    }
+
+    fn eval_logic_inline(&mut self, res: Value, cond: Condition) -> Value {
+        match cond {
+            Condition::E | Condition::BE => self.builder.ins().icmp_imm(IntCC::Equal, res, 0),
+            Condition::NE | Condition::A => self.builder.ins().icmp_imm(IntCC::NotEqual, res, 0),
+            Condition::S | Condition::L => {
+                self.builder.ins().icmp_imm(IntCC::SignedLessThan, res, 0)
+            }
+            Condition::NS | Condition::GE => self
+                .builder
+                .ins()
+                .icmp_imm(IntCC::SignedGreaterThanOrEqual, res, 0),
+            Condition::LE => self
+                .builder
+                .ins()
+                .icmp_imm(IntCC::SignedLessThanOrEqual, res, 0),
+            Condition::G => self
+                .builder
+                .ins()
+                .icmp_imm(IntCC::SignedGreaterThan, res, 0),
+            Condition::B | Condition::O => self.builder.ins().iconst(I8, 0),
+            Condition::AE | Condition::NO => self.builder.ins().iconst(I8, 1),
+            Condition::P | Condition::NP => unreachable!(),
+        }
+    }
+
+    fn eval_add_inline(&mut self, lhs: Value, rhs: Value, res: Value, cond: Condition) -> Value {
+        let add_of_raw = |builder: &mut cranelift_frontend::FunctionBuilder<'_>| {
+            let x0 = builder.ins().bxor(res, lhs);
+            let x1 = builder.ins().bxor(res, rhs);
+            builder.ins().band(x0, x1)
+        };
+        match cond {
+            Condition::E => self.builder.ins().icmp_imm(IntCC::Equal, res, 0),
+            Condition::NE => self.builder.ins().icmp_imm(IntCC::NotEqual, res, 0),
+            Condition::S => self.builder.ins().icmp_imm(IntCC::SignedLessThan, res, 0),
+            Condition::NS => self
+                .builder
+                .ins()
+                .icmp_imm(IntCC::SignedGreaterThanOrEqual, res, 0),
+            Condition::B => self.builder.ins().icmp(IntCC::UnsignedLessThan, res, lhs),
+            Condition::AE => self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, res, lhs),
+            Condition::BE => {
+                let cf = self.builder.ins().icmp(IntCC::UnsignedLessThan, res, lhs);
+                let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+                self.builder.ins().bor(cf, zf)
+            }
+            Condition::A => {
+                let cf = self.builder.ins().icmp(IntCC::UnsignedLessThan, res, lhs);
+                let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+                let be = self.builder.ins().bor(cf, zf);
+                self.builder.ins().bxor_imm(be, 1)
+            }
+            Condition::O => {
+                let ov = add_of_raw(self.builder);
+                self.builder.ins().icmp_imm(IntCC::SignedLessThan, ov, 0)
+            }
+            Condition::NO => {
+                let ov = add_of_raw(self.builder);
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedGreaterThanOrEqual, ov, 0)
+            }
+            Condition::L => {
+                let ov = add_of_raw(self.builder);
+                let sf_xor_of = self.builder.ins().bxor(res, ov);
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedLessThan, sf_xor_of, 0)
+            }
+            Condition::GE => {
+                let ov = add_of_raw(self.builder);
+                let sf_xor_of = self.builder.ins().bxor(res, ov);
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedGreaterThanOrEqual, sf_xor_of, 0)
+            }
+            Condition::LE => {
+                let ov = add_of_raw(self.builder);
+                let sf_xor_of = self.builder.ins().bxor(res, ov);
+                let lt = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedLessThan, sf_xor_of, 0);
+                let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+                self.builder.ins().bor(zf, lt)
+            }
+            Condition::G => {
+                let ov = add_of_raw(self.builder);
+                let sf_xor_of = self.builder.ins().bxor(res, ov);
+                let lt = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedLessThan, sf_xor_of, 0);
+                let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+                let le = self.builder.ins().bor(zf, lt);
+                self.builder.ins().bxor_imm(le, 1)
+            }
+            Condition::P | Condition::NP => unreachable!(),
+        }
+    }
+
+    fn eval_inc_dec_inline(
+        &mut self,
+        ty: cranelift_codegen::ir::Type,
+        lhs: Value,
+        res: Value,
+        cond: Condition,
+        is_inc: bool,
+    ) -> Option<Value> {
+        let sign_bit: i64 = match ty {
+            I8 => i8::MIN as i64,
+            I16 => i16::MIN as i64,
+            _ => i32::MIN as i64,
+        };
+        let of_input = if is_inc { res } else { lhs };
+        match cond {
+            Condition::B | Condition::AE | Condition::BE | Condition::A | Condition::P | Condition::NP => {
+                None
+            }
+            Condition::E => Some(self.builder.ins().icmp_imm(IntCC::Equal, res, 0)),
+            Condition::NE => Some(self.builder.ins().icmp_imm(IntCC::NotEqual, res, 0)),
+            Condition::S => Some(self.builder.ins().icmp_imm(IntCC::SignedLessThan, res, 0)),
+            Condition::NS => Some(
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedGreaterThanOrEqual, res, 0),
+            ),
+            Condition::O => Some(self.builder.ins().icmp_imm(IntCC::Equal, of_input, sign_bit)),
+            Condition::NO => Some(
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::NotEqual, of_input, sign_bit),
+            ),
+            Condition::L => {
+                let sf = self.builder.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+                let of = self.builder.ins().icmp_imm(IntCC::Equal, of_input, sign_bit);
+                Some(self.builder.ins().bxor(sf, of))
+            }
+            Condition::GE => {
+                let sf = self.builder.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+                let of = self.builder.ins().icmp_imm(IntCC::Equal, of_input, sign_bit);
+                let diff = self.builder.ins().bxor(sf, of);
+                Some(self.builder.ins().bxor_imm(diff, 1))
+            }
+            Condition::LE => {
+                let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+                let sf = self.builder.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+                let of = self.builder.ins().icmp_imm(IntCC::Equal, of_input, sign_bit);
+                let diff = self.builder.ins().bxor(sf, of);
+                Some(self.builder.ins().bor(zf, diff))
+            }
+            Condition::G => {
+                let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+                let sf = self.builder.ins().icmp_imm(IntCC::SignedLessThan, res, 0);
+                let of = self.builder.ins().icmp_imm(IntCC::Equal, of_input, sign_bit);
+                let diff = self.builder.ins().bxor(sf, of);
+                let le = self.builder.ins().bor(zf, diff);
+                Some(self.builder.ins().bxor_imm(le, 1))
             }
         }
     }

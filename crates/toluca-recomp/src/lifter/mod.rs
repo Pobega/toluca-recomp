@@ -2,6 +2,7 @@ pub mod control_flow;
 pub mod flags;
 pub mod fpu;
 pub mod integer;
+pub mod liveness;
 pub mod operands;
 pub mod simd;
 pub mod string_ops;
@@ -23,7 +24,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::{self, CallConv, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
 use toluca_core::GuestAddr;
 use toluca_core::aot::{RelocKind, TargetArch};
@@ -126,6 +127,11 @@ pub struct LifterContext<'ctx, 'b> {
     pub sig_cpu_u32: SigRef,
     pub sig_cpu_u32_u32: SigRef,
     pub unsupported_count: usize,
+    pub gpr_vars: [Variable; 8],
+    pub pending_flags: Option<flags::PendingLazyFlags>,
+    pub current_arith_flags_live_after: bool,
+    pub current_cf_live_after: bool,
+    pub flag_liveness: &'b liveness::FunctionFlagLiveness,
 }
 
 impl<'ctx, 'b> LifterContext<'ctx, 'b> {
@@ -180,6 +186,7 @@ pub fn lift_function(
     if !split_vas.contains(&func.entry_va) {
         return Err(LifterError::NoInstructions(func.entry_va));
     }
+    let flag_liveness = liveness::compute_function_flag_liveness(image, func, &split_vas);
 
     let unsupported_count = {
         let mut builder = FunctionBuilder::new(&mut ctx.func, func_ctx);
@@ -226,6 +233,14 @@ pub fn lift_function(
             cpu_ptr,
             cpu_offsets::BRIDGE as i32,
         );
+        let gpr_vars: [Variable; 8] = std::array::from_fn(|idx| {
+            let gpr = operands::ALL_GPRS[idx];
+            let var = builder.declare_var(I32);
+            let off = toluca_core::GuestCpuState::gpr_offset(gpr) as i32;
+            let val = builder.ins().load(I32, MemFlags::trusted(), cpu_ptr, off);
+            builder.def_var(var, val);
+            var
+        });
         let first_block = func_blocks[&func.entry_va];
         builder.ins().jump(first_block, &[]);
 
@@ -245,26 +260,26 @@ pub fn lift_function(
             sig_cpu_u32,
             sig_cpu_u32_u32,
             unsupported_count: 0,
+            gpr_vars,
+            pending_flags: None,
+            current_arith_flags_live_after: true,
+            current_cf_live_after: true,
+            flag_liveness: &flag_liveness,
         };
 
         let split_list: Vec<GuestAddr> = split_vas.iter().copied().collect();
-        for (idx, &start_va) in split_list.iter().enumerate() {
+        for idx in 0..split_list.len() {
+            let start_va = split_list[idx];
             let block = func_blocks[&start_va];
             lifter.builder.switch_to_block(block);
 
-            let Some(containing_end) = containing_block_end(func, start_va) else {
+            let Some(decoded) = liveness::decode_split_block(image, func, &split_list, idx) else {
+                lifter.pending_flags = None;
+                lifter.flush_gprs();
                 lifter.builder.ins().return_(&[]);
                 continue;
             };
-            let next_split = split_list.get(idx + 1).copied();
-            let limit_va = next_split.map_or(containing_end, |s| s.min(containing_end));
-
-            lift_split_block(
-                &mut lifter,
-                start_va,
-                limit_va,
-                known_functions,
-            );
+            lift_split_block(&mut lifter, &decoded, known_functions);
         }
 
         let count = lifter.unsupported_count;
@@ -275,6 +290,7 @@ pub fn lift_function(
             unwind_block,
             &func_blocks,
             &call_return_vas,
+            &gpr_vars,
         );
         builder.seal_all_blocks();
         builder.finalize();
@@ -294,7 +310,7 @@ pub fn lift_function(
                 &mach_reloc.target
             {
                 return Err(LifterError::CraneliftCompile(format!(
-                    "unexpected Cranelift libcall relocation: {call:?}"
+                    "unexpected Cranelift libcall: {call:?}"
                 )));
             }
             let Some(kind) = map_reloc_kind(mach_reloc.kind) else {
@@ -357,23 +373,20 @@ pub fn lift_raw_snippet(
 
 fn lift_split_block(
     lifter: &mut LifterContext<'_, '_>,
-    start_va: GuestAddr,
-    limit_va: GuestAddr,
+    decoded: &liveness::DecodedSplitBlock,
     known_functions: &BTreeSet<GuestAddr>,
 ) {
-    let byte_len = limit_va.saturating_sub(start_va) as usize;
-    let Some(bytes) = lifter.image.read_bytes_at_va(start_va, byte_len) else {
-        lifter.builder.ins().return_(&[]);
-        return;
-    };
+    lifter.pending_flags = None;
+    let (arith_live_out, cf_live_out) = lifter.flag_liveness.block_live_out(
+        &decoded.instrs,
+        decoded.has_invalid,
+        decoded.end_va,
+    );
+    let (arith_after, cf_after) =
+        liveness::compute_block_instr_liveness(&decoded.instrs, arith_live_out, cf_live_out);
 
-    let mut decoder = Decoder::with_ip(32, bytes, start_va as u64, DecoderOptions::NONE);
-    let mut instr = Instruction::default();
     let mut terminated = false;
-    let mut current_end = start_va;
-
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instr);
+    for (idx, instr) in decoded.instrs.iter().enumerate() {
         if instr.is_invalid() {
             lifter.emit_unsupported(instr.ip() as GuestAddr);
             lifter.builder.ins().return_(&[]);
@@ -381,21 +394,22 @@ fn lift_split_block(
             break;
         }
 
+        lifter.current_arith_flags_live_after = arith_after[idx];
+        lifter.current_cf_live_after = cf_after[idx];
         let next_va = (instr.ip() as GuestAddr).saturating_add(instr.len() as u32);
-        current_end = next_va;
 
-        match lifter.lift_control_flow(&instr, next_va, known_functions) {
+        match lifter.lift_control_flow(instr, next_va, known_functions) {
             ControlFlowOutcome::Terminated => {
                 terminated = true;
                 break;
             }
             ControlFlowOutcome::Continue => {}
             ControlFlowOutcome::NotHandled => {
-                if !lifter.lift_flag_instruction(&instr)
-                    && !lifter.lift_integer_instruction(&instr)
-                    && !lifter.lift_fpu(&instr)
-                    && !lifter.lift_simd(&instr)
-                    && !lifter.lift_string_op(&instr)
+                if !lifter.lift_flag_instruction(instr)
+                    && !lifter.lift_integer_instruction(instr)
+                    && !lifter.lift_fpu(instr)
+                    && !lifter.lift_simd(instr)
+                    && !lifter.lift_string_op(instr)
                 {
                     lifter.emit_unsupported(instr.ip() as GuestAddr);
                 }
@@ -404,9 +418,16 @@ fn lift_split_block(
     }
 
     if !terminated {
-        if let Some(&next_block) = lifter.func_blocks.get(&current_end) {
+        if let Some(&next_block) = lifter.func_blocks.get(&decoded.end_va) {
+            if lifter.flag_liveness.is_arith_live_in(decoded.end_va) {
+                lifter.flush_pending_flags();
+            } else {
+                lifter.pending_flags = None;
+            }
             lifter.builder.ins().jump(next_block, &[]);
         } else {
+            lifter.flush_pending_flags();
+            lifter.flush_gprs();
             lifter.builder.ins().return_(&[]);
         }
     }
@@ -497,6 +518,7 @@ fn emit_unwind_block(
     unwind_block: Block,
     func_blocks: &BTreeMap<GuestAddr, Block>,
     call_return_vas: &BTreeSet<GuestAddr>,
+    gpr_vars: &[Variable; 8],
 ) {
     builder.switch_to_block(unwind_block);
     let resume_targets: Vec<(GuestAddr, Block)> = call_return_vas
@@ -529,6 +551,11 @@ fn emit_unwind_block(
     builder.ins().return_(&[]);
 
     builder.switch_to_block(dispatch_block);
+    for gpr in operands::ALL_GPRS {
+        let off = toluca_core::GuestCpuState::gpr_offset(gpr) as i32;
+        let val = builder.ins().load(I32, MemFlags::trusted(), cpu_ptr, off);
+        builder.def_var(gpr_vars[gpr as usize], val);
+    }
     let eip = builder
         .ins()
         .load(I32, MemFlags::trusted(), cpu_ptr, cpu_offsets::EIP as i32);
@@ -558,13 +585,6 @@ fn contains_va_in_func(func: &DiscoveredFunction, va: GuestAddr) -> bool {
     func.blocks
         .values()
         .any(|block| va >= block.start_va && va < block.end_va)
-}
-
-fn containing_block_end(func: &DiscoveredFunction, va: GuestAddr) -> Option<GuestAddr> {
-    func.blocks
-        .values()
-        .find(|block| va >= block.start_va && va < block.end_va)
-        .map(|block| block.end_va)
 }
 
 const fn map_reloc_kind(reloc: Reloc) -> Option<RelocKind> {
@@ -660,6 +680,11 @@ mod tests {
 
         fn as_fn(&self) -> RecompiledFn {
             unsafe { core::mem::transmute::<*const u8, RecompiledFn>(self.ptr) }
+        }
+
+        fn fn_at_offset(&self, offset: usize) -> RecompiledFn {
+            assert!(offset < self.len, "offset {offset} >= {}", self.len);
+            unsafe { core::mem::transmute::<*const u8, RecompiledFn>(self.ptr.add(offset)) }
         }
     }
 
@@ -1280,5 +1305,375 @@ mod tests {
         let compiled = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &code).unwrap();
         assert!(!compiled.code.is_empty());
         assert_eq!(compiled.unsupported_count, 0);
+    }
+
+    static MATERIALIZE_CALL_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_materialize_flags(cpu: *mut GuestCpuState) {
+        MATERIALIZE_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(state) = unsafe { cpu.as_mut() } {
+            state.materialize_flags();
+        }
+    }
+
+    fn run_with_materialize_counter(
+        code: &[u8],
+        init: impl FnOnce(&mut GuestCpuState, &mut [u8]),
+    ) -> (GuestCpuState, usize) {
+        let arch = TargetArch::current().expect("host arch supported");
+        let isa = build_isa(arch).unwrap();
+        let compiled = lift_raw_snippet(isa.as_ref(), 0x0040_1000, code).unwrap();
+        assert_eq!(compiled.unsupported_count, 0);
+
+        let mut arena = vec![0u8; 64 * 1024];
+        let mut bridge = HostBridge::new_stub();
+        bridge.materialize_flags = counting_materialize_flags;
+        let mut cpu = GuestCpuState::new(arena.as_mut_ptr(), &bridge);
+        cpu.set_gpr(Gpr::Esp, 0x8000);
+        init(&mut cpu, &mut arena);
+
+        let before = MATERIALIZE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let exec = ExecBuffer::new(&compiled.code);
+        unsafe {
+            (exec.as_fn())(&mut cpu);
+        }
+        let calls = MATERIALIZE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed) - before;
+        cpu.materialize_flags();
+        (cpu, calls)
+    }
+
+    #[test]
+    fn inline_flags_cover_all_ops_widths_and_overflow_boundaries() {
+        let boundaries: &[(u32, u32)] = &[
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (0x7F, 1),
+            (0x80, 1),
+            (0xFF, 1),
+            (0x7FFF, 1),
+            (0x8000, 1),
+            (0xFFFF, 1),
+            (i32::MAX as u32, 1),
+            (i32::MIN as u32, 1),
+            (i32::MAX as u32, (-1i32) as u32),
+            (i32::MIN as u32, (-1i32) as u32),
+            ((-5i32) as u32, 10),
+        ];
+
+        // Reference opcode encodings for (op eax/ax/al, ecx/cx/cl; setcc dl; ret)
+        let ops_2op: &[(&[u8], &[u8], &[u8])] = &[
+            (&[0x39, 0xC8], &[0x66, 0x39, 0xC8], &[0x38, 0xC8]), // cmp
+            (&[0x29, 0xC8], &[0x66, 0x29, 0xC8], &[0x28, 0xC8]), // sub
+            (&[0x01, 0xC8], &[0x66, 0x01, 0xC8], &[0x00, 0xC8]), // add
+            (&[0x85, 0xC8], &[0x66, 0x85, 0xC8], &[0x84, 0xC8]), // test
+            (&[0x21, 0xC8], &[0x66, 0x21, 0xC8], &[0x20, 0xC8]), // and
+            (&[0x09, 0xC8], &[0x66, 0x09, 0xC8], &[0x08, 0xC8]), // or
+            (&[0x31, 0xC8], &[0x66, 0x31, 0xC8], &[0x30, 0xC8]), // xor
+        ];
+
+        for &(op32, op16, op8) in ops_2op {
+            for op_bytes in [op32, op16, op8] {
+                for cc in 0u8..16u8 {
+                    if cc == 0x0A || cc == 0x0B {
+                        continue; // P/NP intentionally fall back to materialize_flags
+                    }
+                    let mut code = op_bytes.to_vec();
+                    code.extend_from_slice(&[0x0F, 0x90 + cc, 0xC2, 0xC3]); // setcc dl; ret
+                    for &(lhs, rhs) in boundaries {
+                        let (cpu, calls) = run_with_materialize_counter(&code, |cpu, _| {
+                            cpu.set_gpr(Gpr::Eax, lhs);
+                            cpu.set_gpr(Gpr::Ecx, rhs);
+                        });
+                        assert_eq!(calls, 0, "unexpected materialize_flags for cc={cc}");
+                        let bit = match cc {
+                            0x0 => (cpu.eflags & toluca_core::cpu::EFLAGS_OF) != 0,
+                            0x1 => (cpu.eflags & toluca_core::cpu::EFLAGS_OF) == 0,
+                            0x2 => (cpu.eflags & EFLAGS_CF) != 0,
+                            0x3 => (cpu.eflags & EFLAGS_CF) == 0,
+                            0x4 => (cpu.eflags & EFLAGS_ZF) != 0,
+                            0x5 => (cpu.eflags & EFLAGS_ZF) == 0,
+                            0x6 => (cpu.eflags & (EFLAGS_CF | EFLAGS_ZF)) != 0,
+                            0x7 => (cpu.eflags & (EFLAGS_CF | EFLAGS_ZF)) == 0,
+                            0x8 => (cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0,
+                            0x9 => (cpu.eflags & toluca_core::cpu::EFLAGS_SF) == 0,
+                            0xC => {
+                                let sf = (cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0;
+                                let of = (cpu.eflags & toluca_core::cpu::EFLAGS_OF) != 0;
+                                sf != of
+                            }
+                            0xD => {
+                                let sf = (cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0;
+                                let of = (cpu.eflags & toluca_core::cpu::EFLAGS_OF) != 0;
+                                sf == of
+                            }
+                            0xE => {
+                                let zf = (cpu.eflags & EFLAGS_ZF) != 0;
+                                let sf = (cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0;
+                                let of = (cpu.eflags & toluca_core::cpu::EFLAGS_OF) != 0;
+                                zf || (sf != of)
+                            }
+                            0xF => {
+                                let zf = (cpu.eflags & EFLAGS_ZF) != 0;
+                                let sf = (cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0;
+                                let of = (cpu.eflags & toluca_core::cpu::EFLAGS_OF) != 0;
+                                !zf && (sf == of)
+                            }
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            cpu.gpr(Gpr::Edx) & 1,
+                            u32::from(bit),
+                            "mismatch for cc={cc} lhs=0x{lhs:x} rhs=0x{rhs:x} op={op_bytes:x?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // inc / dec inline conditions (E/NE/S/NS/O/NO/L/GE/LE/G) when CF is dead, plus CF preservation when CF is live
+        let inc_dec_ops: &[(&[u8], toluca_core::cpu::LazyFlagOp, u8)] = &[
+            (&[0x40], toluca_core::cpu::LazyFlagOp::Inc, 4),       // inc eax
+            (&[0x66, 0x40], toluca_core::cpu::LazyFlagOp::Inc, 2), // inc ax
+            (&[0xFE, 0xC0], toluca_core::cpu::LazyFlagOp::Inc, 1), // inc al
+            (&[0x48], toluca_core::cpu::LazyFlagOp::Dec, 4),       // dec eax
+            (&[0x66, 0x48], toluca_core::cpu::LazyFlagOp::Dec, 2), // dec ax
+            (&[0xFE, 0xC8], toluca_core::cpu::LazyFlagOp::Dec, 1), // dec al
+        ];
+        let ref_bridge = HostBridge::new_stub();
+        for &(op_bytes, op, width) in inc_dec_ops {
+            let mask = match width {
+                1 => 0xFF,
+                2 => 0xFFFF,
+                _ => 0xFFFF_FFFF,
+            };
+            for cc in [0x0u8, 0x1, 0x4, 0x5, 0x8, 0x9, 0xC, 0xD, 0xE, 0xF] {
+                let mut code = op_bytes.to_vec();
+                code.extend_from_slice(&[0x0F, 0x90 + cc, 0xC2, 0x01, 0xC9, 0xC3]); // setcc dl; add ecx, ecx; ret
+                for &(lhs, _) in boundaries {
+                    let (cpu, calls) = run_with_materialize_counter(&code, |cpu, _| {
+                        cpu.set_gpr(Gpr::Eax, lhs);
+                    });
+                    assert_eq!(calls, 0, "unexpected materialize_flags for inc/dec cc={cc}");
+                    let res = match op {
+                        toluca_core::cpu::LazyFlagOp::Inc => lhs.wrapping_add(1) & mask,
+                        _ => lhs.wrapping_sub(1) & mask,
+                    };
+                    let mut ref_cpu = GuestCpuState::new(core::ptr::null_mut(), &ref_bridge);
+                    ref_cpu.lazy_flags = toluca_core::cpu::LazyFlags {
+                        op: op as u32,
+                        width: u32::from(width),
+                        lhs: lhs & mask,
+                        rhs: 1,
+                        res,
+                    };
+                    ref_cpu.materialize_flags();
+                    let sf = (ref_cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0;
+                    let of = (ref_cpu.eflags & toluca_core::cpu::EFLAGS_OF) != 0;
+                    let zf = (ref_cpu.eflags & EFLAGS_ZF) != 0;
+                    let bit = match cc {
+                        0x0 => of,
+                        0x1 => !of,
+                        0x4 => zf,
+                        0x5 => !zf,
+                        0x8 => sf,
+                        0x9 => !sf,
+                        0xC => sf != of,
+                        0xD => sf == of,
+                        0xE => zf || (sf != of),
+                        0xF => !zf && (sf == of),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(cpu.gpr(Gpr::Edx) & 1, u32::from(bit));
+                }
+            }
+        }
+
+        // stc; inc eax; setb dl; ret -> CF preserved as 1 across inc
+        let (cpu_cf_keep, _) = run_with_materialize_counter(&[0xF9, 0x40, 0x0F, 0x92, 0xC2, 0xC3], |cpu, _| {
+            cpu.set_gpr(Gpr::Eax, 0xFFFF_FFFF);
+        });
+        assert_eq!(cpu_cf_keep.gpr(Gpr::Edx) & 1, 1);
+
+        // clc; dec eax; setb dl; ret -> CF preserved as 0 across dec
+        let (cpu_cf_clr, _) = run_with_materialize_counter(&[0xF8, 0x48, 0x0F, 0x92, 0xC2, 0xC3], |cpu, _| {
+            cpu.set_gpr(Gpr::Eax, 0);
+        });
+        assert_eq!(cpu_cf_clr.gpr(Gpr::Edx) & 1, 0);
+    }
+
+    #[test]
+    fn multi_block_flag_carryover_evaluates_consistently() {
+        // cmp eax, ecx; jg +12; je +12; mov edx, 1; ret; mov edx, 2; ret; mov edx, 3; ret
+        #[rustfmt::skip]
+        let code = [
+            0x39, 0xC8,                   // cmp eax, ecx
+            0x7F, 0x08,                   // jg .hi (+8 -> skips je + mov1 + ret)
+            0x74, 0x0C,                   // je .eq (+12 -> skips mov1 + ret + mov2 + ret)
+            0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+            0xC3,                         // ret
+            0xBA, 0x02, 0x00, 0x00, 0x00, // .hi: mov edx, 2
+            0xC3,                         // ret
+            0xBA, 0x03, 0x00, 0x00, 0x00, // .eq: mov edx, 3
+            0xC3,                         // ret
+        ];
+        for (a, c, want) in [
+            (5u32, 3u32, 2u32),
+            (5, 5, 3),
+            (3, 5, 1),
+            (i32::MIN as u32, 1, 1),
+            (i32::MAX as u32, (-1i32) as u32, 2),
+        ] {
+            let cpu = execute_snippet(&code, |cpu, _| {
+                cpu.set_gpr(Gpr::Eax, a);
+                cpu.set_gpr(Gpr::Ecx, c);
+            });
+            assert_eq!(cpu.gpr(Gpr::Edx), want, "a={a:#x} c={c:#x}");
+        }
+    }
+
+    #[test]
+    fn adx_style_loop_executes_exactly_without_materialize_flags() {
+        #[rustfmt::skip]
+        let code = [
+            0x6B, 0xD3, 0x03,             // imul edx, ebx, 3
+            0xD1, 0xFA,                   // sar edx, 1
+            0x01, 0xD0,                   // add eax, edx
+            0x83, 0xF8, 0x64,             // cmp eax, 100
+            0x7C, 0x05,                   // jl +5
+            0xB8, 0x64, 0x00, 0x00, 0x00, // mov eax, 100
+            0x49,                         // dec ecx
+            0x75, 0xEC,                   // jne loop_top (-20)
+            0x31, 0xD2,                   // xor edx, edx
+            0xC3,                         // ret
+        ];
+        let (cpu, calls) = run_with_materialize_counter(&code, |cpu, _| {
+            cpu.set_gpr(Gpr::Eax, 10);
+            cpu.set_gpr(Gpr::Ecx, 4);
+            cpu.set_gpr(Gpr::Ebx, 40);
+        });
+        assert_eq!(cpu.gpr(Gpr::Eax), 100);
+        assert_eq!(cpu.gpr(Gpr::Ecx), 0);
+        assert_eq!(calls, 0, "tight ADX loop must never call materialize_flags");
+    }
+
+    unsafe extern "C" fn longjmp_restoring_indirect_helper(cpu: *mut GuestCpuState, _target_va: u32) {
+        let state = unsafe { &mut *cpu };
+        let esp = state.gpr(Gpr::Esp);
+        let mem_base = state.mem_base as usize;
+        let ret_va = unsafe {
+            let mut b = [0u8; 4];
+            core::ptr::copy_nonoverlapping((mem_base + esp as usize) as *const u8, b.as_mut_ptr(), 4);
+            u32::from_le_bytes(b)
+        };
+        state.set_gpr(Gpr::Esp, esp.wrapping_add(4));
+        state.set_gpr(Gpr::Ebx, 0xBBBB_0002);
+        state.eip = ret_va;
+        state.exit_reason = ExitReason::Longjmp as u32;
+    }
+
+    #[test]
+    fn ssa_gprs_preserve_values_across_call_ret_and_longjmp() {
+        let arch = TargetArch::current().expect("host arch supported");
+        let isa = build_isa(arch).unwrap();
+
+        // Main at 0x0040_1000:
+        //   mov ebx, 0x1111_2222
+        //   mov esi, 0x3333_4444
+        //   call helper (0x0040_1030)
+        //   add eax, ebx
+        //   add eax, esi
+        //   ret
+        // Helper at 0x0040_1030:
+        //   mov eax, 7
+        //   ret
+        let mut text = vec![0x90u8; 0x60];
+        #[rustfmt::skip]
+        let main_bytes = [
+            0xBB, 0x22, 0x22, 0x11, 0x11, // mov ebx, 0x1111_2222
+            0xBE, 0x44, 0x44, 0x33, 0x33, // mov esi, 0x3333_4444
+            0xE8, 0x21, 0x00, 0x00, 0x00, // call +0x21 -> 0x0040_100F + 0x21 = 0x0040_1030
+            0x01, 0xD8,                   // add eax, ebx
+            0x01, 0xF0,                   // add eax, esi
+            0xC3,                         // ret
+        ];
+        text[0..main_bytes.len()].copy_from_slice(&main_bytes);
+        let helper_bytes = [0xB8, 0x07, 0x00, 0x00, 0x00, 0xC3];
+        text[0x30..0x30 + helper_bytes.len()].copy_from_slice(&helper_bytes);
+
+        let pe_bytes = build_test_pe32(
+            0x0040_0000,
+            0x1000,
+            0x0102,
+            &[],
+            &[TestSectionSpec {
+                name: ".text",
+                virtual_address: 0x1000,
+                characteristics: IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+                data: &text,
+            }],
+        );
+        let image = PeImage::parse(pe_bytes).unwrap();
+        let report = discover_functions(&image);
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        crate::compiler::compile_pe_to_writer(
+            &image,
+            &report,
+            &mut cursor,
+            crate::compiler::CompileOptions {
+                arch,
+                strict_verify: false,
+            },
+        )
+        .unwrap();
+        cursor.set_position(0);
+        let manifest = toluca_core::aot::AotManifest::read_from(&mut cursor, true).unwrap();
+        let entry_disp = manifest.lookup_va(0x0040_1000).unwrap();
+        let raw_aot = cursor.into_inner();
+        let code_start = manifest.code_section.file_offset as usize;
+        let code_end = code_start + manifest.code_section.byte_len as usize;
+        let exec = ExecBuffer::new(&raw_aot[code_start..code_end]);
+
+        let mut arena = vec![0u8; 64 * 1024];
+        let bridge = HostBridge::new_stub();
+        let mut cpu = GuestCpuState::new(arena.as_mut_ptr(), &bridge);
+        cpu.set_gpr(Gpr::Esp, 0x8000);
+        arena[0x8000..0x8004].copy_from_slice(&0x9999_0001u32.to_le_bytes());
+        unsafe {
+            (exec.fn_at_offset(entry_disp.code_offset as usize))(&mut cpu);
+        }
+        assert_eq!(cpu.gpr(Gpr::Eax), 0x4444_666D);
+        assert_eq!(cpu.gpr(Gpr::Ebx), 0x1111_2222);
+        assert_eq!(cpu.gpr(Gpr::Esi), 0x3333_4444);
+        assert_eq!(cpu.eip, 0x9999_0001);
+        assert_eq!(cpu.gpr(Gpr::Esp), 0x8004);
+
+        // Longjmp unwind path:
+        //   0x0040_1000: mov ebx, 0xAAAA_0001
+        //   0x0040_1005: mov eax, 0x0040_9999
+        //   0x0040_100A: call eax              (calls bridge_call_indirect -> triggers Longjmp & sets EBX=0xBBBB_0002)
+        //   0x0040_100C: mov eax, ebx          (resumed via emit_unwind_block)
+        //   0x0040_100E: ret
+        #[rustfmt::skip]
+        let longjmp_code = [
+            0xBB, 0x01, 0x00, 0xAA, 0xAA, // mov ebx, 0xAAAA_0001
+            0xB8, 0x99, 0x99, 0x40, 0x00, // mov eax, 0x0040_9999
+            0xFF, 0xD0,                   // call eax
+            0x89, 0xD8,                   // mov eax, ebx
+            0xC3,                         // ret
+        ];
+        let compiled_lj = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &longjmp_code).unwrap();
+        let mut arena = vec![0u8; 64 * 1024];
+        let mut bridge = HostBridge::new_stub();
+        bridge.call_indirect = longjmp_restoring_indirect_helper;
+        let mut cpu = GuestCpuState::new(arena.as_mut_ptr(), &bridge);
+        cpu.set_gpr(Gpr::Esp, 0x8000);
+        let exec_lj = ExecBuffer::new(&compiled_lj.code);
+        unsafe {
+            (exec_lj.as_fn())(&mut cpu);
+        }
+        assert_eq!(cpu.gpr(Gpr::Eax), 0xBBBB_0002);
+        assert_eq!(cpu.gpr(Gpr::Ebx), 0xBBBB_0002);
     }
 }

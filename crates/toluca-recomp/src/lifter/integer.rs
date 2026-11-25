@@ -213,7 +213,9 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 true
             }
             Mnemonic::Inc => {
-                self.materialize_flags();
+                if self.current_cf_live_after {
+                    self.materialize_flags();
+                }
                 let ty = self.operand_type(instr, 0);
                 let lhs = self.read_operand(instr, 0, ty);
                 let one = self.builder.ins().iconst(ty, 1);
@@ -223,7 +225,9 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 true
             }
             Mnemonic::Dec => {
-                self.materialize_flags();
+                if self.current_cf_live_after {
+                    self.materialize_flags();
+                }
                 let ty = self.operand_type(instr, 0);
                 let lhs = self.read_operand(instr, 0, ty);
                 let one = self.builder.ins().iconst(ty, 1);
@@ -503,8 +507,12 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 let src16 = self.builder.ins().uextend(I16, src);
                 let prod = self.builder.ins().imul(al16, src16);
                 self.write_reg(Register::AX, prod);
-                let high = self.builder.ins().ushr_imm(prod, 8);
-                self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0)
+                if self.current_arith_flags_live_after {
+                    let high = self.builder.ins().ushr_imm(prod, 8);
+                    Some(self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0))
+                } else {
+                    None
+                }
             }
             I16 => {
                 let ax = self.read_reg(Register::AX);
@@ -516,7 +524,11 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 let dx = self.builder.ins().ireduce(I16, high);
                 self.write_reg(Register::AX, low);
                 self.write_reg(Register::DX, dx);
-                self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0)
+                if self.current_arith_flags_live_after {
+                    Some(self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0))
+                } else {
+                    None
+                }
             }
             _ => {
                 let eax = self.read_reg(Register::EAX);
@@ -528,10 +540,18 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 let edx = self.builder.ins().ireduce(I32, high);
                 self.write_reg(Register::EAX, low);
                 self.write_reg(Register::EDX, edx);
-                self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0)
+                if self.current_arith_flags_live_after {
+                    Some(self.builder.ins().icmp_imm(IntCC::NotEqual, high, 0))
+                } else {
+                    None
+                }
             }
         };
-        self.update_cf_of_flags(overflow, overflow);
+        if let Some(ov) = overflow {
+            self.update_cf_of_flags(ov, ov);
+        } else {
+            self.pending_flags = None;
+        }
     }
 
     fn lift_imul(&mut self, instr: &Instruction) {
@@ -546,9 +566,13 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     let src16 = self.builder.ins().sextend(I16, src);
                     let prod = self.builder.ins().imul(al16, src16);
                     self.write_reg(Register::AX, prod);
-                    let low = self.builder.ins().ireduce(I8, prod);
-                    let re_ext = self.builder.ins().sextend(I16, low);
-                    self.builder.ins().icmp(IntCC::NotEqual, prod, re_ext)
+                    if self.current_arith_flags_live_after {
+                        let low = self.builder.ins().ireduce(I8, prod);
+                        let re_ext = self.builder.ins().sextend(I16, low);
+                        Some(self.builder.ins().icmp(IntCC::NotEqual, prod, re_ext))
+                    } else {
+                        None
+                    }
                 }
                 I16 => {
                     let ax = self.read_reg(Register::AX);
@@ -560,8 +584,12 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     let dx = self.builder.ins().ireduce(I16, high);
                     self.write_reg(Register::AX, low);
                     self.write_reg(Register::DX, dx);
-                    let re_ext = self.builder.ins().sextend(I32, low);
-                    self.builder.ins().icmp(IntCC::NotEqual, prod, re_ext)
+                    if self.current_arith_flags_live_after {
+                        let re_ext = self.builder.ins().sextend(I32, low);
+                        Some(self.builder.ins().icmp(IntCC::NotEqual, prod, re_ext))
+                    } else {
+                        None
+                    }
                 }
                 _ => {
                     let eax = self.read_reg(Register::EAX);
@@ -573,11 +601,19 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     let edx = self.builder.ins().ireduce(I32, high);
                     self.write_reg(Register::EAX, low);
                     self.write_reg(Register::EDX, edx);
-                    let re_ext = self.builder.ins().sextend(I64, low);
-                    self.builder.ins().icmp(IntCC::NotEqual, prod, re_ext)
+                    if self.current_arith_flags_live_after {
+                        let re_ext = self.builder.ins().sextend(I64, low);
+                        Some(self.builder.ins().icmp(IntCC::NotEqual, prod, re_ext))
+                    } else {
+                        None
+                    }
                 }
             };
-            self.update_cf_of_flags(overflow, overflow);
+            if let Some(ov) = overflow {
+                self.update_cf_of_flags(ov, ov);
+            } else {
+                self.pending_flags = None;
+            }
             return;
         }
 
@@ -593,6 +629,13 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 self.read_operand(instr, 2, ty),
             )
         };
+
+        if !self.current_arith_flags_live_after {
+            let res = self.builder.ins().imul(lhs, rhs);
+            self.write_operand(instr, 0, res);
+            self.pending_flags = None;
+            return;
+        }
 
         let wide_ty = if ty == I16 { I32 } else { I64 };
         let lhs_w = self.builder.ins().sextend(wide_ty, lhs);
@@ -703,14 +746,21 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             return;
         }
 
-        // Materialize flags first so shift count == 0 preserves prior flags.
-        self.materialize_flags();
+        if self.current_arith_flags_live_after {
+            // Materialize flags first so shift count == 0 preserves prior flags.
+            self.materialize_flags();
+        }
         let lhs = self.read_operand(instr, 0, ty);
         let raw_count = self.read_operand(instr, 1, I8);
         let raw_count32 = self.ensure_u32(raw_count);
         let count32 = self.builder.ins().band_imm(raw_count32, SHIFT_COUNT_MASK);
         let res = self.perform_shift_in_i32(op, ty, lhs, count32);
         self.write_operand(instr, 0, res);
+
+        if !self.current_arith_flags_live_after {
+            self.pending_flags = None;
+            return;
+        }
 
         let is_nz = self.builder.ins().icmp_imm(IntCC::NotEqual, count32, 0);
         let op_active = self.builder.ins().iconst(I32, op as i64);

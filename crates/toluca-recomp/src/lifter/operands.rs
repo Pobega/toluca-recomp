@@ -1,9 +1,21 @@
 use cranelift_codegen::ir::types::{I8, I16, I32, I64};
 use cranelift_codegen::ir::{InstBuilder, MemFlags, Type, Value};
 use iced_x86::{Instruction, OpKind, Register};
+use toluca_core::bridge;
 use toluca_core::cpu::{Gpr, offsets as cpu_offsets};
 
 use super::LifterContext;
+
+pub const ALL_GPRS: [Gpr; 8] = [
+    Gpr::Eax,
+    Gpr::Ecx,
+    Gpr::Edx,
+    Gpr::Ebx,
+    Gpr::Esp,
+    Gpr::Ebp,
+    Gpr::Esi,
+    Gpr::Edi,
+];
 
 impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     pub fn gpr_index(reg: Register) -> Option<Gpr> {
@@ -76,17 +88,32 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     }
 
     pub fn read_gpr(&mut self, gpr: Gpr) -> Value {
-        let off = toluca_core::GuestCpuState::gpr_offset(gpr) as i32;
-        self.builder
-            .ins()
-            .load(I32, MemFlags::trusted(), self.cpu_ptr, off)
+        self.builder.use_var(self.gpr_vars[gpr as usize])
     }
 
     pub fn write_gpr(&mut self, gpr: Gpr, val: Value) {
-        let off = toluca_core::GuestCpuState::gpr_offset(gpr) as i32;
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), val, self.cpu_ptr, off);
+        self.builder.def_var(self.gpr_vars[gpr as usize], val);
+    }
+
+    pub fn flush_gprs(&mut self) {
+        for gpr in ALL_GPRS {
+            let val = self.builder.use_var(self.gpr_vars[gpr as usize]);
+            let off = toluca_core::GuestCpuState::gpr_offset(gpr) as i32;
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), val, self.cpu_ptr, off);
+        }
+    }
+
+    pub fn reload_gprs(&mut self) {
+        for gpr in ALL_GPRS {
+            let off = toluca_core::GuestCpuState::gpr_offset(gpr) as i32;
+            let val = self
+                .builder
+                .ins()
+                .load(I32, MemFlags::trusted(), self.cpu_ptr, off);
+            self.builder.def_var(self.gpr_vars[gpr as usize], val);
+        }
     }
 
     pub fn read_reg(&mut self, reg: Register) -> Value {
@@ -311,6 +338,11 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     }
 
     pub fn call_bridge_void(&mut self, offset: usize) {
+        self.flush_pending_flags();
+        let sync_gprs = offset != bridge::offsets::MATERIALIZE_FLAGS;
+        if sync_gprs {
+            self.flush_gprs();
+        }
         let fn_ptr = self.builder.ins().load(
             self.ptr_ty,
             MemFlags::trusted(),
@@ -320,10 +352,15 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         self.builder
             .ins()
             .call_indirect(self.sig_void_cpu, fn_ptr, &[self.cpu_ptr]);
+        if sync_gprs {
+            self.reload_gprs();
+        }
     }
 
     pub fn call_bridge_u32(&mut self, offset: usize, arg: Value) {
         let arg32 = self.ensure_u32(arg);
+        self.flush_pending_flags();
+        self.flush_gprs();
         let fn_ptr = self.builder.ins().load(
             self.ptr_ty,
             MemFlags::trusted(),
@@ -333,11 +370,14 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         self.builder
             .ins()
             .call_indirect(self.sig_cpu_u32, fn_ptr, &[self.cpu_ptr, arg32]);
+        self.reload_gprs();
     }
 
     pub fn call_bridge_u32_u32(&mut self, offset: usize, arg0: Value, arg1: Value) {
         let a0 = self.ensure_u32(arg0);
         let a1 = self.ensure_u32(arg1);
+        self.flush_pending_flags();
+        self.flush_gprs();
         let fn_ptr = self.builder.ins().load(
             self.ptr_ty,
             MemFlags::trusted(),
@@ -347,6 +387,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         self.builder
             .ins()
             .call_indirect(self.sig_cpu_u32_u32, fn_ptr, &[self.cpu_ptr, a0, a1]);
+        self.reload_gprs();
     }
 
     pub fn ensure_u32(&mut self, val: Value) -> Value {

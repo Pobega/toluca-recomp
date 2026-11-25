@@ -55,6 +55,10 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             return true;
         }
 
+        self.flush_pending_flags();
+        let saved_arith_live = self.current_arith_flags_live_after;
+        self.current_arith_flags_live_after = matches!(kind, StringOpKind::Cmps | StringOpKind::Scas);
+
         let head_block = self.builder.create_block();
         let body_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
@@ -81,6 +85,11 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 Condition::E
             };
             let zf_match = self.eval_condition(cond);
+            if saved_arith_live {
+                self.flush_pending_flags();
+            } else {
+                self.pending_flags = None;
+            }
             self.builder
                 .ins()
                 .brif(zf_match, head_block, &[], exit_block, &[]);
@@ -88,6 +97,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             self.builder.ins().jump(head_block, &[]);
         }
 
+        self.current_arith_flags_live_after = saved_arith_live;
         self.builder.switch_to_block(exit_block);
         true
     }

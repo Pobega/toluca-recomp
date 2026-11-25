@@ -51,6 +51,8 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 return ControlFlowOutcome::Continue;
             }
             Mnemonic::Hlt => {
+                self.flush_pending_flags();
+                self.flush_gprs();
                 let reason = self.builder.ins().iconst(I32, ExitReason::Halt as i64);
                 self.builder.ins().store(
                     MemFlags::trusted(),
@@ -112,6 +114,11 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             FlowControl::UnconditionalBranch => {
                 let target_va = instr.near_branch32();
                 if let Some(&block) = self.func_blocks.get(&target_va) {
+                    if self.flag_liveness.is_arith_live_in(target_va) {
+                        self.flush_pending_flags();
+                    } else {
+                        self.pending_flags = None;
+                    }
                     self.builder.ins().jump(block, &[]);
                 } else {
                     self.emit_tail_call(target_va, known_functions);
@@ -132,8 +139,11 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 let ret_va = self.builder.ins().iconst(I32, next_va as i64);
                 self.push32(ret_va);
                 if known_functions.contains(&target_va) {
+                    self.flush_pending_flags();
+                    self.flush_gprs();
                     let func_ref = self.get_or_declare_direct_call(target_va);
                     self.builder.ins().call(func_ref, &[self.cpu_ptr]);
+                    self.reload_gprs();
                 } else {
                     let target_val = self.builder.ins().iconst(I32, target_va as i64);
                     self.call_bridge_u32(bridge::offsets::CALL_INDIRECT, target_val);
@@ -177,6 +187,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 {
                     let index_val = self.read_reg(instr.memory_index());
                     let index32 = self.ensure_u32(index_val);
+                    self.flush_pending_flags();
 
                     let default_block = self.builder.create_block();
                     let mut switch = Switch::new();
@@ -213,6 +224,8 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     let adjusted = self.builder.ins().iadd_imm(esp, imm);
                     self.write_gpr(Gpr::Esp, adjusted);
                 }
+                self.flush_pending_flags();
+                self.flush_gprs();
                 self.builder.ins().return_(&[]);
                 ControlFlowOutcome::Terminated
             }
@@ -260,6 +273,8 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
 
     fn emit_tail_call(&mut self, target_va: GuestAddr, known_functions: &BTreeSet<GuestAddr>) {
         if known_functions.contains(&target_va) {
+            self.flush_pending_flags();
+            self.flush_gprs();
             let func_ref = self.get_or_declare_direct_call(target_va);
             self.builder.ins().call(func_ref, &[self.cpu_ptr]);
         } else {
@@ -276,6 +291,13 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         fallthrough_va: GuestAddr,
         known_functions: &BTreeSet<GuestAddr>,
     ) {
+        if self.flag_liveness.is_arith_live_in(taken_va)
+            || self.flag_liveness.is_arith_live_in(fallthrough_va)
+        {
+            self.flush_pending_flags();
+        } else {
+            self.pending_flags = None;
+        }
         let taken_block = self.resolve_branch_target_block(taken_va, known_functions);
         let fallthrough_block = self.resolve_branch_target_block(fallthrough_va, known_functions);
         self.builder

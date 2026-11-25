@@ -770,6 +770,7 @@ pub struct Win32State {
     pub pending_threads: Vec<PendingThreadSpawn>,
     pub pending_timers: Vec<PendingTimerSpawn>,
     pub pending_killed_timers: Vec<u32>,
+    pub pending_wake_slots: Vec<usize>,
     pub notify_sync: bool,
     pub main_thread_priority: i32,
 }
@@ -821,6 +822,7 @@ impl Win32State {
             pending_threads: Vec::new(),
             pending_timers: Vec::new(),
             pending_killed_timers: Vec::new(),
+            pending_wake_slots: Vec::new(),
             notify_sync: false,
             main_thread_priority: 0,
         }

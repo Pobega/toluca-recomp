@@ -349,6 +349,7 @@ struct SharedRuntime {
     timer_cv: Condvar,
     shutdown: AtomicBool,
     worker_done_flags: Mutex<Vec<Arc<AtomicBool>>>,
+    guest_thread_tids: Mutex<Vec<(libc::pid_t, String)>>,
 }
 
 unsafe impl Send for SharedRuntime {}
@@ -488,6 +489,7 @@ impl Runtime {
             timer_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             worker_done_flags: Mutex::new(Vec::new()),
+            guest_thread_tids: Mutex::new(Vec::new()),
         });
 
         Ok(Self { pe, shared })
@@ -732,12 +734,25 @@ fn build_host_bridge(user_data: *mut core::ffi::c_void) -> HostBridge {
 
 const RT_PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const RT_PERF_CHECK_STRIDE: u32 = 256;
+#[cfg(target_os = "linux")]
+const BG_THREAD_REPORT_MIN_MS: u64 = 10;
 
 fn rt_perf_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("TOLUCA_PERF").is_some_and(|v| !v.is_empty() && v != "0")
     })
+}
+
+fn current_os_tid() -> libc::pid_t {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 fn thread_cpu_time_ns() -> u64 {
@@ -761,6 +776,99 @@ fn thread_cpu_time_ns() -> u64 {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_clk_tck() -> u64 {
+    static CLK_TCK: OnceLock<u64> = OnceLock::new();
+    *CLK_TCK.get_or_init(|| {
+        let val = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if val > 0 { val as u64 } else { 100 }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_task_stat_ticks_and_nice(os_tid: libc::pid_t) -> Option<(u64, i64)> {
+    let path = format!("/proc/self/task/{os_tid}/stat");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let rparen = contents.rfind(')')?;
+    let rest = contents.get(rparen + 1..)?;
+    let mut fields = rest.split_whitespace();
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    let nice: i64 = fields.nth(3)?.parse().ok()?;
+    Some((utime.saturating_add(stime), nice))
+}
+
+fn format_bg_thread_summary(
+    main_os_tid: libc::pid_t,
+    guest_thread_tids: &Mutex<Vec<(libc::pid_t, String)>>,
+    prev_bg_ticks: &mut HashMap<libc::pid_t, u64>,
+) -> (i64, String) {
+    #[cfg(target_os = "linux")]
+    {
+        let main_nice = read_task_stat_ticks_and_nice(main_os_tid).map_or(0, |(_, n)| n);
+        let tracked = guest_thread_tids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        prev_bg_ticks.retain(|tid, _| tracked.iter().any(|(t, _)| t == tid));
+        let clk_tck = linux_clk_tck().max(1);
+        let mut bg_entries: Vec<(u64, String, i64)> = Vec::new();
+        for (tid, label) in tracked {
+            if let Some((ticks, nice)) = read_task_stat_ticks_and_nice(tid) {
+                let prev = prev_bg_ticks.insert(tid, ticks).unwrap_or(0);
+                let delta_ms = ticks.saturating_sub(prev).saturating_mul(1000) / clk_tck;
+                if delta_ms >= BG_THREAD_REPORT_MIN_MS {
+                    bg_entries.push((delta_ms, label, nice));
+                }
+            }
+        }
+        bg_entries.sort_by(|a, b| b.0.cmp(&a.0));
+        let bg_str = bg_entries
+            .into_iter()
+            .map(|(ms, label, nice)| format!("{label}:{ms}ms/n{nice}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (main_nice, bg_str)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (main_os_tid, guest_thread_tids, prev_bg_ticks);
+        (0, String::new())
+    }
+}
+
+struct GuestTidPerfGuard {
+    shared: Arc<SharedRuntime>,
+    os_tid: libc::pid_t,
+}
+
+impl GuestTidPerfGuard {
+    fn enter(shared: &Arc<SharedRuntime>, os_tid: libc::pid_t, label: String) -> Option<Self> {
+        if !rt_perf_enabled() || os_tid == 0 {
+            return None;
+        }
+        shared
+            .guest_thread_tids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((os_tid, label));
+        Some(Self {
+            shared: Arc::clone(shared),
+            os_tid,
+        })
+    }
+}
+
+impl Drop for GuestTidPerfGuard {
+    fn drop(&mut self) {
+        self.shared
+            .guest_thread_tids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(tid, _)| *tid != self.os_tid);
+    }
+}
+
 fn format_import_slot_name(imports: &[ResolvedImportSlot], slot_idx: u32) -> String {
     match imports.get(slot_idx as usize) {
         Some(slot) => match &slot.symbol {
@@ -778,6 +886,7 @@ enum PerfCallKind {
 }
 
 struct MainThreadPerf {
+    main_os_tid: libc::pid_t,
     wall_start: Instant,
     cpu_start_ns: u64,
     lock_wait_ns: u64,
@@ -790,12 +899,14 @@ struct MainThreadPerf {
     wait_ns: u64,
     imp_by_slot: HashMap<u32, (u64, u64)>,
     com_by_method: HashMap<(u32, u32), (u64, u64)>,
+    prev_bg_ticks: HashMap<libc::pid_t, u64>,
     check_counter: u32,
 }
 
 impl MainThreadPerf {
     fn new() -> Self {
         Self {
+            main_os_tid: current_os_tid(),
             wall_start: Instant::now(),
             cpu_start_ns: thread_cpu_time_ns(),
             lock_wait_ns: 0,
@@ -808,6 +919,7 @@ impl MainThreadPerf {
             wait_ns: 0,
             imp_by_slot: HashMap::new(),
             com_by_method: HashMap::new(),
+            prev_bg_ticks: HashMap::new(),
             check_counter: 0,
         }
     }
@@ -832,7 +944,12 @@ impl MainThreadPerf {
         self.wall_start.elapsed() >= RT_PERF_LOG_INTERVAL
     }
 
-    fn maybe_flush(&mut self, imports: &[ResolvedImportSlot], force_check: bool) {
+    fn maybe_flush(
+        &mut self,
+        guest_thread_tids: &Mutex<Vec<(libc::pid_t, String)>>,
+        imports: &[ResolvedImportSlot],
+        force_check: bool,
+    ) {
         if !force_check {
             self.check_counter = self.check_counter.wrapping_add(1);
             if !self.check_counter.is_multiple_of(RT_PERF_CHECK_STRIDE) {
@@ -880,8 +997,14 @@ impl MainThreadPerf {
                 },
             );
 
+        let (main_nice, bg_str) = format_bg_thread_summary(
+            self.main_os_tid,
+            guest_thread_tids,
+            &mut self.prev_bg_ticks,
+        );
+
         eprintln!(
-            "[toluca-rt] wall={wall_ms}ms cpu={cpu_ms}ms preempt={preempt_ms}ms wait={wait_ms}ms host={host_ms}ms(lock={lock_ms}ms imp={imp_ms}ms/{} com={com_ms}ms/{}) guest={guest_ms}ms ind={}({ind_ms:.1}ms) top_com={top_com_iface}:{top_com_method}({top_com_ms:.1}ms/{top_com_calls}) top_imp={top_imp_name}({top_imp_ms:.1}ms/{top_imp_calls})",
+            "[toluca-rt] wall={wall_ms}ms cpu={cpu_ms}ms preempt={preempt_ms}ms wait={wait_ms}ms host={host_ms}ms(lock={lock_ms}ms imp={imp_ms}ms/{} com={com_ms}ms/{}) guest={guest_ms}ms ind={}({ind_ms:.1}ms) top_com={top_com_iface}:{top_com_method}({top_com_ms:.1}ms/{top_com_calls}) top_imp={top_imp_name}({top_imp_ms:.1}ms/{top_imp_calls}) mn={main_nice} bg=[{bg_str}]",
             self.imp_calls,
             self.com_calls,
             self.ind_calls,
@@ -953,7 +1076,17 @@ fn with_locked_ctx<R>(
     }
 
     let perf_enabled = tctx.perf.is_some();
-    let (result, pending_wait, pending_threads, pending_timers, killed_timers, notify_sync, lock_ns, call_ns) = {
+    let (
+        result,
+        pending_wait,
+        pending_threads,
+        pending_timers,
+        killed_timers,
+        wake_slots,
+        notify_sync,
+        lock_ns,
+        call_ns,
+    ) = {
         let lock_t0 = perf_enabled.then(Instant::now);
         let mut guard = tctx.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         let lock_ns = lock_t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
@@ -982,6 +1115,7 @@ fn with_locked_ctx<R>(
         let threads = std::mem::take(&mut inner.win32.pending_threads);
         let timers = std::mem::take(&mut inner.win32.pending_timers);
         let killed = std::mem::take(&mut inner.win32.pending_killed_timers);
+        let wake_slots = std::mem::take(&mut inner.win32.pending_wake_slots);
         let notify = std::mem::replace(&mut inner.win32.notify_sync, false);
         tctx.held_inner = None;
         if let Some(perf) = tctx.perf.as_mut() {
@@ -991,15 +1125,28 @@ fn with_locked_ctx<R>(
                 PerfCallKind::Com { iface, method } => perf.record_com(iface, method, call_ns),
             }
             if wait.is_none() {
-                perf.maybe_flush(&inner.imports, false);
+                perf.maybe_flush(&tctx.shared.guest_thread_tids, &inner.imports, false);
             }
         }
-        (res, wait, threads, timers, killed, notify, lock_ns, call_ns)
+        (
+            res,
+            wait,
+            threads,
+            timers,
+            killed,
+            wake_slots,
+            notify,
+            lock_ns,
+            call_ns,
+        )
     };
     let _ = (lock_ns, call_ns);
 
     if notify_sync {
         tctx.shared.sync_cv.notify_all();
+    }
+    for slot_idx in wake_slots {
+        crate::win32::wake_suspended_thread(Some(slot_idx));
     }
     for spawn in pending_threads {
         spawn_guest_thread(Arc::clone(&tctx.shared), spawn);
@@ -1014,7 +1161,7 @@ fn with_locked_ctx<R>(
             perf.wait_ns += start.elapsed().as_nanos() as u64;
             if perf.needs_flush() {
                 let guard = tctx.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-                perf.maybe_flush(&guard.imports, true);
+                perf.maybe_flush(&tctx.shared.guest_thread_tids, &guard.imports, true);
             }
         }
     }
@@ -1613,101 +1760,103 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
             .unwrap_or_else(|e| e.into_inner());
         flags.push(Arc::clone(&done));
     }
-    std::thread::spawn(move || {
-        #[cfg(target_os = "linux")]
-        let os_tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
-        #[cfg(not(target_os = "linux"))]
-        let os_tid: libc::pid_t = 0;
+    let thread_name = format!("guest_{:x}", spawn.start_va);
+    let _ = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let os_tid = current_os_tid();
+            let _tid_perf_guard =
+                GuestTidPerfGuard::enter(&shared, os_tid, format!("{:x}", spawn.start_va));
 
-        let slot_idx = crate::win32::register_thread_suspend_slot(os_tid);
-        let suspend_slot = slot_idx.and_then(crate::win32::thread_suspend_slot);
-        crate::win32::pin_current_thread_to_guest_core();
+            let slot_idx = crate::win32::register_thread_suspend_slot(os_tid);
+            let suspend_slot = slot_idx.and_then(crate::win32::thread_suspend_slot);
+            crate::win32::pin_current_thread_to_guest_core();
 
-        let thread_priority = {
-            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(crate::win32::Win32Handle::Thread {
-                host_tid,
-                suspend_slot: handle_slot,
-                ..
-            }) = guard.win32.get_handle_mut(spawn.handle)
-            {
-                *host_tid = Some(os_tid);
-                *handle_slot = slot_idx;
-            }
-            loop {
-                if shared.shutdown.load(Ordering::Acquire) {
-                    crate::win32::unregister_thread_suspend_slot(slot_idx);
-                    done.store(true, Ordering::Release);
-                    return;
-                }
-                let (suspended, prio) = match guard.win32.get_handle(spawn.handle) {
-                    Some(crate::win32::Win32Handle::Thread {
-                        suspended,
-                        priority,
-                        ..
-                    }) => (*suspended, *priority),
-                    _ => (false, 0),
-                };
-                if !suspended {
-                    break prio;
-                }
-                let (next_guard, _) = shared
-                    .sync_cv
-                    .wait_timeout(guard, Duration::from_millis(10))
-                    .unwrap_or_else(|e| e.into_inner());
-                guard = next_guard;
-            }
-        };
-        crate::win32::apply_host_thread_priority(os_tid, thread_priority);
-
-        if let Some(entry_fn) = shared.code.resolve_va(spawn.start_va) {
-            let mut cpu = GuestCpuState::new(shared.arena_base as *mut u8, std::ptr::null());
-            cpu.eip = spawn.start_va;
-            cpu.fs_base = spawn.teb_va;
-            cpu.set_gpr(Gpr::Esp, spawn.stack_top);
-            let pushed = {
+            let thread_priority = {
                 let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-                push_args_and_sentinel(&mut cpu, &mut guard.arena, &[spawn.param]).is_ok()
+                if let Some(crate::win32::Win32Handle::Thread {
+                    host_tid,
+                    suspend_slot: handle_slot,
+                    ..
+                }) = guard.win32.get_handle_mut(spawn.handle)
+                {
+                    *host_tid = Some(os_tid);
+                    *handle_slot = slot_idx;
+                }
+                loop {
+                    if shared.shutdown.load(Ordering::Acquire) {
+                        crate::win32::unregister_thread_suspend_slot(slot_idx);
+                        done.store(true, Ordering::Release);
+                        return;
+                    }
+                    let (suspended, prio) = match guard.win32.get_handle(spawn.handle) {
+                        Some(crate::win32::Win32Handle::Thread {
+                            suspended,
+                            priority,
+                            ..
+                        }) => (*suspended, *priority),
+                        _ => (false, 0),
+                    };
+                    if !suspended {
+                        break prio;
+                    }
+                    let (next_guard, _) = shared
+                        .sync_cv
+                        .wait_timeout(guard, Duration::from_millis(10))
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = next_guard;
+                }
             };
-            if pushed {
-                let mut tctx = ThreadBridgeContext {
-                    shared: Arc::clone(&shared),
-                    tid: spawn.handle as u64,
-                    held_inner: None,
-                    trap: None,
-                    pending_error: None,
-                    suspend_slot,
-                    perf: None,
+            crate::win32::apply_host_thread_priority(os_tid, thread_priority);
+
+            if let Some(entry_fn) = shared.code.resolve_va(spawn.start_va) {
+                let mut cpu = GuestCpuState::new(shared.arena_base as *mut u8, std::ptr::null());
+                cpu.eip = spawn.start_va;
+                cpu.fs_base = spawn.teb_va;
+                cpu.set_gpr(Gpr::Esp, spawn.stack_top);
+                let pushed = {
+                    let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    push_args_and_sentinel(&mut cpu, &mut guard.arena, &[spawn.param]).is_ok()
                 };
-                let bridge = build_host_bridge((&raw mut tctx).cast());
-                cpu.bridge = &bridge;
-                if let Some(slot) = suspend_slot {
-                    slot.in_host_code.store(false, Ordering::SeqCst);
-                    crate::win32::park_while_suspended(slot, &shared.shutdown);
+                if pushed {
+                    let mut tctx = ThreadBridgeContext {
+                        shared: Arc::clone(&shared),
+                        tid: spawn.handle as u64,
+                        held_inner: None,
+                        trap: None,
+                        pending_error: None,
+                        suspend_slot,
+                        perf: None,
+                    };
+                    let bridge = build_host_bridge((&raw mut tctx).cast());
+                    cpu.bridge = &bridge;
+                    if let Some(slot) = suspend_slot {
+                        slot.in_host_code.store(false, Ordering::SeqCst);
+                        crate::win32::park_while_suspended(slot, &shared.shutdown);
+                    }
+                    unsafe {
+                        entry_fn(&mut cpu);
+                    }
+                    if let Some(slot) = suspend_slot {
+                        slot.in_host_code.store(true, Ordering::SeqCst);
+                    }
                 }
-                unsafe {
-                    entry_fn(&mut cpu);
+                let exit_val = cpu.gpr(Gpr::Eax);
+                let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(crate::win32::Win32Handle::Thread {
+                    exit_code,
+                    finished,
+                    ..
+                }) = guard.win32.get_handle_mut(spawn.handle)
+                {
+                    *exit_code = exit_val;
+                    *finished = true;
                 }
-                if let Some(slot) = suspend_slot {
-                    slot.in_host_code.store(true, Ordering::SeqCst);
-                }
+                shared.sync_cv.notify_all();
             }
-            let exit_val = cpu.gpr(Gpr::Eax);
-            let mut guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(crate::win32::Win32Handle::Thread {
-                exit_code,
-                finished,
-                ..
-            }) = guard.win32.get_handle_mut(spawn.handle)
-            {
-                *exit_code = exit_val;
-                *finished = true;
-            }
-            shared.sync_cv.notify_all();
-        }
-        crate::win32::unregister_thread_suspend_slot(slot_idx);
-        done.store(true, Ordering::Release);
-    });
+            crate::win32::unregister_thread_suspend_slot(slot_idx);
+            done.store(true, Ordering::Release);
+        });
 }
 
 fn schedule_timers(
@@ -1757,7 +1906,9 @@ fn schedule_timers(
             flags.push(Arc::clone(&done));
         }
         let worker_shared = Arc::clone(shared);
-        std::thread::spawn(move || timer_worker_loop(worker_shared, done));
+        let _ = std::thread::Builder::new()
+            .name("guest_timer".to_string())
+            .spawn(move || timer_worker_loop(worker_shared, done));
     }
     shared.timer_cv.notify_all();
 }
@@ -1766,6 +1917,8 @@ fn timer_worker_loop(shared: Arc<SharedRuntime>, done: Arc<AtomicBool>) {
     const TIMER_STACK_BYTES: usize = 64 * 1024;
     const TIMER_TEB_BYTES: usize = 0x1000;
 
+    let _tid_perf_guard =
+        GuestTidPerfGuard::enter(&shared, current_os_tid(), "timer".to_string());
     crate::win32::pin_current_thread_to_guest_core();
 
     let (stack_top, teb_va) = {
@@ -1924,6 +2077,7 @@ mod tests {
             timer_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             worker_done_flags: Mutex::new(Vec::new()),
+            guest_thread_tids: Mutex::new(Vec::new()),
         });
 
         let mut cancelled_ids = Vec::new();
@@ -2025,5 +2179,14 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_read_task_stat_parses_ticks_and_nice() {
+        let tid = current_os_tid();
+        assert_ne!(tid, 0);
+        let (_ticks, nice) = read_task_stat_ticks_and_nice(tid).expect("/proc stat must parse");
+        assert!((-20..=19).contains(&nice));
     }
 }

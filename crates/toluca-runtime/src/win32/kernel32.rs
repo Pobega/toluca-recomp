@@ -65,7 +65,8 @@ const CURRENT_PROCESS_ID: u32 = 1000;
 const CURRENT_PROCESS_HANDLE: u32 = 0xFFFF_FFFF;
 const CURRENT_THREAD_HANDLE: u32 = 0xFFFF_FFFE;
 
-const QPC_FREQUENCY_HZ: u64 = 1_000_000_000;
+const QPC_FREQUENCY_HZ: u64 = 10_000_000;
+const QPC_NS_PER_TICK: u128 = 100;
 const WIN_XP_VERSION: u32 = 0x0A28_0105;
 const VER_PLATFORM_WIN32_NT: u32 = 2;
 const STARTUPINFOA_SIZE: usize = 68;
@@ -1318,8 +1319,8 @@ fn query_performance_counter(
     cpu: &mut GuestCpuState,
 ) -> Result<(), RuntimeError> {
     let ptr = peek_arg_u32(cpu, ctx.arena, 0)?;
-    let nanos = ctx.host_start_instant.elapsed().as_nanos() as u64;
-    ctx.arena.write_u64(ptr, nanos)?;
+    let ticks = (ctx.host_start_instant.elapsed().as_nanos() / QPC_NS_PER_TICK) as u64;
+    ctx.arena.write_u64(ptr, ticks)?;
     return_stdcall(cpu, ctx.arena, 1, 1)?;
     Ok(())
 }
@@ -2443,7 +2444,7 @@ fn set_thread_priority_boost(
 
 fn resume_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Result<(), RuntimeError> {
     let handle = peek_arg_u32(cpu, ctx.arena, 0)?;
-    let prev = match ctx.win32.get_handle_mut(handle) {
+    let (prev, wake_slot, found) = match ctx.win32.get_handle_mut(handle) {
         Some(Win32Handle::Thread {
             suspended,
             suspend_slot,
@@ -2451,12 +2452,16 @@ fn resume_thread(ctx: &mut RuntimeContext<'_>, cpu: &mut GuestCpuState) -> Resul
         }) => {
             let was = u32::from(*suspended);
             *suspended = false;
-            super::wake_suspended_thread(*suspend_slot);
-            ctx.win32.notify_sync = true;
-            was
+            (was, *suspend_slot, true)
         }
-        _ => 0,
+        _ => (0, None, false),
     };
+    if found {
+        ctx.win32.notify_sync = true;
+    }
+    if let Some(slot_idx) = wake_slot {
+        ctx.win32.pending_wake_slots.push(slot_idx);
+    }
     return_stdcall(cpu, ctx.arena, 1, prev)?;
     Ok(())
 }
@@ -2829,5 +2834,65 @@ mod tests {
             ) as i32,
             2
         );
+    }
+
+    #[test]
+    fn query_performance_uses_10mhz_frequency_and_resume_queues_wake_slot() {
+        let mut arena = GuestArena::new().unwrap();
+        arena.init_thread_environment(DEFAULT_IMAGE_BASE).unwrap();
+        let mut heap = GuestHeap::new();
+        let mut win32 = Win32State::new(Win32Config {
+            headless: true,
+            ..Win32Config::default()
+        });
+        let mut last_error = 0;
+
+        let freq_ptr = heap.alloc(&mut arena, 8, true).unwrap();
+        let qpc_ptr = heap.alloc(&mut arena, 8, true).unwrap();
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                query_performance_frequency,
+                &[freq_ptr],
+            ),
+            1
+        );
+        assert_eq!(arena.read_u64(freq_ptr).unwrap(), 10_000_000);
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                query_performance_counter,
+                &[qpc_ptr],
+            ),
+            1
+        );
+
+        let thandle = win32.alloc_handle(Win32Handle::Thread {
+            host_tid: Some(1234),
+            suspend_slot: Some(7),
+            exit_code: 0,
+            finished: false,
+            suspended: true,
+            priority: 0,
+        });
+        assert_eq!(
+            run_k32_call(
+                &mut arena,
+                &mut heap,
+                &mut win32,
+                &mut last_error,
+                resume_thread,
+                &[thandle],
+            ),
+            1
+        );
+        assert_eq!(win32.pending_wake_slots, vec![7]);
+        assert!(win32.notify_sync);
     }
 }

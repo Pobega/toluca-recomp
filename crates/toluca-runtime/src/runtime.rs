@@ -556,6 +556,7 @@ impl Runtime {
             pending_error: None,
             suspend_slot: None,
             perf: rt_perf_enabled().then(MainThreadPerf::new),
+            sleep0: SleepZeroState::default(),
         };
         let bridge = build_host_bridge((&raw mut tctx).cast());
         cpu.bridge = &bridge;
@@ -1076,6 +1077,25 @@ impl MainThreadPerf {
     }
 }
 
+const SLEEP_ZERO_BASE_US: u64 = 250;
+const SLEEP_ZERO_WORKER_MAX_US: u64 = 2_000;
+const SLEEP_ZERO_TIGHT_SPIN_THRESHOLD_US: u64 = 200;
+
+#[derive(Default)]
+struct SleepZeroState {
+    last_done: Option<Instant>,
+    consecutive_spins: u32,
+}
+
+fn next_sleep_zero_duration(is_main_thread: bool, consecutive_spins: u32) -> Duration {
+    if is_main_thread {
+        Duration::from_micros(SLEEP_ZERO_BASE_US)
+    } else {
+        let us = (SLEEP_ZERO_BASE_US << consecutive_spins.min(3)).min(SLEEP_ZERO_WORKER_MAX_US);
+        Duration::from_micros(us)
+    }
+}
+
 struct ThreadBridgeContext {
     shared: Arc<SharedRuntime>,
     tid: u64,
@@ -1084,6 +1104,7 @@ struct ThreadBridgeContext {
     pending_error: Option<RuntimeError>,
     suspend_slot: Option<&'static crate::win32::ThreadSuspendState>,
     perf: Option<MainThreadPerf>,
+    sleep0: SleepZeroState,
 }
 
 unsafe fn thread_ctx_from_cpu<'a>(
@@ -1207,7 +1228,7 @@ fn with_locked_ctx<R>(
     }
     if let Some(wait) = pending_wait {
         let wait_t0 = tctx.perf.is_some().then(Instant::now);
-        perform_host_wait(&tctx.shared, tctx.tid, state, wait);
+        perform_host_wait(&tctx.shared, tctx.tid, &mut tctx.sleep0, state, wait);
         if let (Some(perf), Some(start)) = (tctx.perf.as_mut(), wait_t0) {
             perf.wait_ns += start.elapsed().as_nanos() as u64;
             if perf.needs_flush() {
@@ -1715,16 +1736,34 @@ unsafe extern "C" fn bridge_trace_hook(_cpu: *mut GuestCpuState, _guest_va: u32)
 fn perform_host_wait(
     shared: &Arc<SharedRuntime>,
     tid: u64,
+    sleep0: &mut SleepZeroState,
     cpu: &mut GuestCpuState,
     wait: crate::win32::PendingHostWait,
 ) {
     const INFINITE_MS: u32 = 0xFFFF_FFFF;
     const WAIT_OBJECT_0: u32 = 0;
 
+    if !matches!(wait, crate::win32::PendingHostWait::SleepMs(0)) {
+        sleep0.consecutive_spins = 0;
+        sleep0.last_done = None;
+    }
+
     match wait {
         crate::win32::PendingHostWait::SleepMs(ms) => {
             if ms == 0 {
-                std::thread::sleep(Duration::from_micros(250));
+                let tight_spin = sleep0.last_done.is_some_and(|prev| {
+                    prev.elapsed() < Duration::from_micros(SLEEP_ZERO_TIGHT_SPIN_THRESHOLD_US)
+                });
+                if tight_spin {
+                    sleep0.consecutive_spins = sleep0.consecutive_spins.saturating_add(1);
+                } else {
+                    sleep0.consecutive_spins = 0;
+                }
+                std::thread::sleep(next_sleep_zero_duration(
+                    tid == 1,
+                    sleep0.consecutive_spins,
+                ));
+                sleep0.last_done = Some(Instant::now());
                 return;
             }
             let deadline = Instant::now() + Duration::from_millis(ms as u64);
@@ -1942,6 +1981,7 @@ fn spawn_guest_thread(shared: Arc<SharedRuntime>, spawn: crate::win32::PendingTh
                         suspend_slot,
                         perf: rt_perf_enabled()
                             .then(|| MainThreadPerf::new_worker(format!("{:x}", spawn.start_va))),
+                        sleep0: SleepZeroState::default(),
                     };
                     let bridge = build_host_bridge((&raw mut tctx).cast());
                     cpu.bridge = &bridge;
@@ -2127,6 +2167,7 @@ fn timer_worker_loop(shared: Arc<SharedRuntime>, done: Arc<AtomicBool>) {
                     pending_error: None,
                     suspend_slot: None,
                     perf: None,
+                    sleep0: SleepZeroState::default(),
                 };
                 let bridge = build_host_bridge((&raw mut tctx).cast());
                 cpu.bridge = &bridge;
@@ -2307,5 +2348,35 @@ mod tests {
         assert_ne!(tid, 0);
         let (_ticks, nice) = read_task_stat_ticks_and_nice(tid).expect("/proc stat must parse");
         assert!((-20..=19).contains(&nice));
+    }
+
+    #[test]
+    fn next_sleep_zero_duration_keeps_main_fast_and_backs_off_workers() {
+        for spins in [0, 1, 2, 3, 10, u32::MAX] {
+            assert_eq!(
+                next_sleep_zero_duration(true, spins),
+                Duration::from_micros(SLEEP_ZERO_BASE_US)
+            );
+        }
+        assert_eq!(
+            next_sleep_zero_duration(false, 0),
+            Duration::from_micros(250)
+        );
+        assert_eq!(
+            next_sleep_zero_duration(false, 1),
+            Duration::from_micros(500)
+        );
+        assert_eq!(
+            next_sleep_zero_duration(false, 2),
+            Duration::from_micros(1_000)
+        );
+        assert_eq!(
+            next_sleep_zero_duration(false, 3),
+            Duration::from_micros(2_000)
+        );
+        assert_eq!(
+            next_sleep_zero_duration(false, 20),
+            Duration::from_micros(SLEEP_ZERO_WORKER_MAX_US)
+        );
     }
 }

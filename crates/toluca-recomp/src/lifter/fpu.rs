@@ -1,6 +1,6 @@
 use core::mem::offset_of;
 
-use cranelift_codegen::ir::condcodes::FloatCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64};
 use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
@@ -14,11 +14,41 @@ use toluca_core::cpu::{
 use super::LifterContext;
 use super::flags::Condition;
 
+const X87_NUM_REGS: usize = 8;
+const X87_SLOT_MASK_U8: u8 = 7;
 const X87_STACK_MASK: i64 = 7;
 const X87_REG_SHIFT: i64 = 3;
 const X87_CC_MASK: u16 = X87_SW_C0 | X87_SW_C2 | X87_SW_C3;
 const EFLAGS_FCOMI_MASK: u32 =
     EFLAGS_CF | EFLAGS_PF | EFLAGS_AF | EFLAGS_ZF | EFLAGS_SF | EFLAGS_OF;
+
+#[derive(Default)]
+pub struct X87BlockCache {
+    pub top_delta: u8,
+    pub slots: [Option<Value>; X87_NUM_REGS],
+    pub dirty: [bool; X87_NUM_REGS],
+    pub entry_top: Option<Value>,
+    pub status_word: Option<(Value, bool)>,
+    pub control_word: Option<(Value, bool)>,
+}
+
+impl X87BlockCache {
+    pub fn reset(&mut self) {
+        self.top_delta = 0;
+        self.slots = [None; X87_NUM_REGS];
+        self.dirty = [false; X87_NUM_REGS];
+        self.entry_top = None;
+        self.status_word = None;
+        self.control_word = None;
+    }
+
+    pub fn has_dirty(&self) -> bool {
+        self.top_delta != 0
+            || self.dirty.iter().any(|&d| d)
+            || self.status_word.is_some_and(|(_, dirty)| dirty)
+            || self.control_word.is_some_and(|(_, dirty)| dirty)
+    }
+}
 
 impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     pub fn lift_fpu(&mut self, instr: &Instruction) -> bool {
@@ -39,13 +69,14 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 self.x87_store_u16(offset_of!(X87State, control_word), cw);
                 self.x87_store_u16(offset_of!(X87State, status_word), zero16);
                 self.x87_store_u16(offset_of!(X87State, tag_word), tw);
+                self.x87_cache.reset();
                 true
             }
             Mnemonic::Fnclex | Mnemonic::Fclex => {
-                let sw = self.x87_load_u16(offset_of!(X87State, status_word));
+                let sw = self.x87_read_sw();
                 // Clear sticky exception flags (bits 0..7) and busy bit (bit 15).
                 let cleared = self.builder.ins().band_imm(sw, 0x7F00);
-                self.x87_store_u16(offset_of!(X87State, status_word), cleared);
+                self.x87_write_sw(cleared);
                 true
             }
             Mnemonic::Fld => {
@@ -107,13 +138,18 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 true
             }
             Mnemonic::Fstp => {
-                let val = self.x87_load_st(0);
-                if instr.op_kind(0) == OpKind::Register {
-                    self.x87_store_st(x87_reg_index(instr.op_register(0)), val);
+                if instr.op_kind(0) == OpKind::Register && x87_reg_index(instr.op_register(0)) == 0
+                {
+                    self.x87_pop_discard();
                 } else {
-                    self.x87_store_mem_float(instr, val);
+                    let val = self.x87_load_st(0);
+                    if instr.op_kind(0) == OpKind::Register {
+                        self.x87_store_st(x87_reg_index(instr.op_register(0)), val);
+                    } else {
+                        self.x87_store_mem_float(instr, val);
+                    }
+                    self.x87_pop_discard();
                 }
-                let _ = self.x87_pop();
                 true
             }
             Mnemonic::Fist => {
@@ -230,17 +266,12 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 true
             }
             Mnemonic::Fdecstp => {
-                let top = self.x87_read_top();
-                let dec = self.builder.ins().iadd_imm(top, -1);
-                let wrapped = self.builder.ins().band_imm(dec, X87_STACK_MASK);
-                self.x87_write_top(wrapped);
+                self.x87_cache.top_delta =
+                    self.x87_cache.top_delta.wrapping_sub(1) & X87_SLOT_MASK_U8;
                 true
             }
             Mnemonic::Fincstp => {
-                let top = self.x87_read_top();
-                let inc = self.builder.ins().iadd_imm(top, 1);
-                let wrapped = self.builder.ins().band_imm(inc, X87_STACK_MASK);
-                self.x87_write_top(wrapped);
+                self.x87_cache.top_delta = (self.x87_cache.top_delta + 1) & X87_SLOT_MASK_U8;
                 true
             }
             Mnemonic::Ffree => true,
@@ -254,15 +285,15 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 let rhs = self.x87_compare_rhs(instr, false);
                 let lhs = self.x87_load_st(0);
                 self.x87_set_sw_compare(lhs, rhs);
-                let _ = self.x87_pop();
+                self.x87_pop_discard();
                 true
             }
             Mnemonic::Fcompp | Mnemonic::Fucompp => {
                 let rhs = self.x87_load_st(1);
                 let lhs = self.x87_load_st(0);
                 self.x87_set_sw_compare(lhs, rhs);
-                let _ = self.x87_pop();
-                let _ = self.x87_pop();
+                self.x87_pop_discard();
+                self.x87_pop_discard();
                 true
             }
             Mnemonic::Ficom => {
@@ -275,7 +306,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 let rhs = self.x87_load_mem_int(instr);
                 let lhs = self.x87_load_st(0);
                 self.x87_set_sw_compare(lhs, rhs);
-                let _ = self.x87_pop();
+                self.x87_pop_discard();
                 true
             }
             Mnemonic::Ftst => {
@@ -304,7 +335,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 let lhs = self.x87_load_st(0);
                 let rhs = self.x87_load_st(rhs_idx);
                 self.set_eflags_float_compare(lhs, rhs);
-                let _ = self.x87_pop();
+                self.x87_pop_discard();
                 true
             }
             Mnemonic::Fcmovb => self.lift_fcmov(instr, Condition::B),
@@ -316,9 +347,9 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             Mnemonic::Fcmovnbe => self.lift_fcmov(instr, Condition::A),
             Mnemonic::Fcmovnu => self.lift_fcmov(instr, Condition::NP),
             Mnemonic::Fnstsw | Mnemonic::Fstsw => {
-                let sw = self.x87_load_u16(offset_of!(X87State, status_word));
+                let sw = self.x87_read_sw();
                 let sw_cleared = self.builder.ins().band_imm(sw, (!X87_SW_TOP_MASK) as i64);
-                let top = self.x87_read_top();
+                let top = self.x87_current_top();
                 let top16 = self.builder.ins().ireduce(I16, top);
                 let top_masked = self.builder.ins().band_imm(top16, X87_STACK_MASK);
                 let top_shifted = self
@@ -330,13 +361,13 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 true
             }
             Mnemonic::Fnstcw | Mnemonic::Fstcw => {
-                let cw = self.x87_load_u16(offset_of!(X87State, control_word));
+                let cw = self.x87_read_cw();
                 self.write_operand(instr, 0, cw);
                 true
             }
             Mnemonic::Fldcw => {
                 let cw = self.read_operand(instr, 0, I16);
-                self.x87_store_u16(offset_of!(X87State, control_word), cw);
+                self.x87_write_cw(cw);
                 true
             }
             Mnemonic::Fsin => self.call_x87_helper(X87HelperOp::Fsin),
@@ -446,12 +477,12 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             .ins()
             .ishl_imm(c3_16, X87_SW_C3.trailing_zeros() as i64);
 
-        let sw = self.x87_load_u16(offset_of!(X87State, status_word));
+        let sw = self.x87_read_sw();
         let cleared = self.builder.ins().band_imm(sw, (!X87_CC_MASK) as i64);
         let w0 = self.builder.ins().bor(cleared, c0_s);
         let w2 = self.builder.ins().bor(w0, c2_s);
         let updated = self.builder.ins().bor(w2, c3_s);
-        self.x87_store_u16(offset_of!(X87State, status_word), updated);
+        self.x87_write_sw(updated);
     }
 
     fn lift_x87_binop(&mut self, instr: &Instruction, op: X87BinOp, pop: bool, is_int: bool) {
@@ -488,15 +519,33 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         };
         self.x87_store_st(dst_idx, res);
         if pop {
-            let _ = self.x87_pop();
+            self.x87_pop_discard();
         }
     }
 
-    fn x87_read_top(&mut self) -> Value {
+    fn x87_entry_top(&mut self) -> Value {
+        if let Some(top) = self.x87_cache.entry_top {
+            return top;
+        }
         let off = (cpu_offsets::X87 + offset_of!(X87State, top)) as i32;
-        self.builder
+        let top = self
+            .builder
             .ins()
-            .load(I32, MemFlags::trusted(), self.cpu_ptr, off)
+            .load(I32, MemFlags::trusted(), self.cpu_ptr, off);
+        self.x87_cache.entry_top = Some(top);
+        top
+    }
+
+    fn x87_current_top(&mut self) -> Value {
+        let entry_top = self.x87_entry_top();
+        if self.x87_cache.top_delta == 0 {
+            return entry_top;
+        }
+        let added = self
+            .builder
+            .ins()
+            .iadd_imm(entry_top, self.x87_cache.top_delta as i64);
+        self.builder.ins().band_imm(added, X87_STACK_MASK)
     }
 
     fn x87_write_top(&mut self, top: Value) {
@@ -521,12 +570,42 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             .store(MemFlags::trusted(), val, self.cpu_ptr, off);
     }
 
-    fn x87_slot_addr(&mut self, st_index: u32) -> Value {
-        let top = self.x87_read_top();
-        let idx = if st_index == 0 {
-            top
+    fn x87_read_sw(&mut self) -> Value {
+        if let Some((sw, _)) = self.x87_cache.status_word {
+            return sw;
+        }
+        let sw = self.x87_load_u16(offset_of!(X87State, status_word));
+        self.x87_cache.status_word = Some((sw, false));
+        sw
+    }
+
+    fn x87_write_sw(&mut self, sw: Value) {
+        self.x87_cache.status_word = Some((sw, true));
+    }
+
+    fn x87_read_cw(&mut self) -> Value {
+        if let Some((cw, _)) = self.x87_cache.control_word {
+            return cw;
+        }
+        let cw = self.x87_load_u16(offset_of!(X87State, control_word));
+        self.x87_cache.control_word = Some((cw, false));
+        cw
+    }
+
+    fn x87_write_cw(&mut self, cw: Value) {
+        self.x87_cache.control_word = Some((cw, true));
+    }
+
+    fn x87_rel_slot(&self, st_index: u32) -> usize {
+        ((self.x87_cache.top_delta + (st_index as u8)) & X87_SLOT_MASK_U8) as usize
+    }
+
+    fn x87_slot_addr_rel(&mut self, rel_v: u8) -> Value {
+        let entry_top = self.x87_entry_top();
+        let idx = if rel_v == 0 {
+            entry_top
         } else {
-            self.builder.ins().iadd_imm(top, st_index as i64)
+            self.builder.ins().iadd_imm(entry_top, rel_v as i64)
         };
         let wrapped = self.builder.ins().band_imm(idx, X87_STACK_MASK);
         let byte_off = self.builder.ins().ishl_imm(wrapped, X87_REG_SHIFT);
@@ -541,30 +620,68 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     }
 
     fn x87_load_st(&mut self, st_index: u32) -> Value {
-        let addr = self.x87_slot_addr(st_index);
-        self.builder.ins().load(F64, MemFlags::trusted(), addr, 0)
+        let v = self.x87_rel_slot(st_index);
+        if let Some(val) = self.x87_cache.slots[v] {
+            return val;
+        }
+        let addr = self.x87_slot_addr_rel(v as u8);
+        let val = self.builder.ins().load(F64, MemFlags::trusted(), addr, 0);
+        self.x87_cache.slots[v] = Some(val);
+        val
     }
 
     fn x87_store_st(&mut self, st_index: u32, val: Value) {
-        let addr = self.x87_slot_addr(st_index);
-        self.builder.ins().store(MemFlags::trusted(), val, addr, 0);
+        let v = self.x87_rel_slot(st_index);
+        self.x87_cache.slots[v] = Some(val);
+        self.x87_cache.dirty[v] = true;
     }
 
     fn x87_push(&mut self, val: Value) {
-        let top = self.x87_read_top();
-        let dec = self.builder.ins().iadd_imm(top, -1);
-        let wrapped = self.builder.ins().band_imm(dec, X87_STACK_MASK);
-        self.x87_write_top(wrapped);
-        self.x87_store_st(0, val);
+        let v = self.x87_cache.top_delta.wrapping_sub(1) & X87_SLOT_MASK_U8;
+        self.x87_cache.top_delta = v;
+        self.x87_cache.slots[v as usize] = Some(val);
+        self.x87_cache.dirty[v as usize] = true;
+    }
+
+    fn x87_pop_discard(&mut self) {
+        let old_v = self.x87_cache.top_delta;
+        if !self.func_has_fdecstp {
+            self.x87_cache.slots[old_v as usize] = None;
+            self.x87_cache.dirty[old_v as usize] = false;
+        }
+        self.x87_cache.top_delta = (old_v + 1) & X87_SLOT_MASK_U8;
     }
 
     fn x87_pop(&mut self) -> Value {
         let val = self.x87_load_st(0);
-        let top = self.x87_read_top();
-        let inc = self.builder.ins().iadd_imm(top, 1);
-        let wrapped = self.builder.ins().band_imm(inc, X87_STACK_MASK);
-        self.x87_write_top(wrapped);
+        self.x87_pop_discard();
         val
+    }
+
+    pub fn flush_x87(&mut self) {
+        if !self.x87_cache.has_dirty() {
+            self.x87_cache.reset();
+            return;
+        }
+        for v in 0..X87_NUM_REGS {
+            if self.x87_cache.dirty[v] {
+                if let Some(val) = self.x87_cache.slots[v] {
+                    let addr = self.x87_slot_addr_rel(v as u8);
+                    self.builder.ins().store(MemFlags::trusted(), val, addr, 0);
+                }
+            }
+        }
+        if self.x87_cache.top_delta != 0 {
+            let new_top = self.x87_current_top();
+            self.x87_write_top(new_top);
+        }
+        if let Some((sw, true)) = self.x87_cache.status_word {
+            self.x87_store_u16(offset_of!(X87State, status_word), sw);
+        }
+        if let Some((cw, true)) = self.x87_cache.control_word {
+            self.x87_store_u16(offset_of!(X87State, control_word), cw);
+        }
+        self.x87_cache.reset();
     }
 
     fn x87_load_mem_float(&mut self, instr: &Instruction) -> Value {
@@ -609,6 +726,9 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     }
 
     pub fn round_nearest_even_f64(&mut self, val: Value) -> Value {
+        if self.is_aarch64 {
+            return self.builder.ins().nearest(val);
+        }
         const TWO_POW_52: f64 = 4_503_599_627_370_496.0;
         let abs_val = self.builder.ins().fabs(val);
         let limit = self.builder.ins().f64const(TWO_POW_52);
@@ -620,6 +740,9 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     }
 
     pub fn round_nearest_even_f32(&mut self, val: Value) -> Value {
+        if self.is_aarch64 {
+            return self.builder.ins().nearest(val);
+        }
         const TWO_POW_23: f32 = 8_388_608.0;
         let abs_val = self.builder.ins().fabs(val);
         let limit = self.builder.ins().f32const(TWO_POW_23);
@@ -637,47 +760,44 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         const X87_CW_RC_TRUNC: i64 = 0x0C00;
         const TWO_POW_52: f64 = 4_503_599_627_370_496.0;
 
-        let cw = self.x87_load_u16(offset_of!(X87State, control_word));
+        let cw = self.x87_read_cw();
         let rc = self.builder.ins().band_imm(cw, X87_CW_RC_MASK);
 
-        let nearest = self.round_nearest_even_f64(val);
+        let (nearest, floor_val, ceil_val, trunc_out) = if self.is_aarch64 {
+            (
+                self.builder.ins().nearest(val),
+                self.builder.ins().floor(val),
+                self.builder.ins().ceil(val),
+                self.builder.ins().trunc(val),
+            )
+        } else {
+            let nearest = self.round_nearest_even_f64(val);
+            // Compute trunc(val) for |val| < 2^52 without host libcalls.
+            let abs_val = self.builder.ins().fabs(val);
+            let limit = self.builder.ins().f64const(TWO_POW_52);
+            let in_range = self.builder.ins().fcmp(FloatCC::LessThan, abs_val, limit);
+            let trunc_i64 = self.builder.ins().fcvt_to_sint_sat(I64, val);
+            let trunc_f64 = self.builder.ins().fcvt_from_sint(F64, trunc_i64);
+            let trunc_val = self.builder.ins().select(in_range, trunc_f64, val);
 
-        // Compute trunc(val) for |val| < 2^52 without host libcalls.
-        let abs_val = self.builder.ins().fabs(val);
-        let limit = self.builder.ins().f64const(TWO_POW_52);
-        let in_range = self.builder.ins().fcmp(FloatCC::LessThan, abs_val, limit);
-        let trunc_i64 = self.builder.ins().fcvt_to_sint_sat(I64, val);
-        let trunc_f64 = self.builder.ins().fcvt_from_sint(F64, trunc_i64);
-        let trunc_val = self.builder.ins().select(in_range, trunc_f64, val);
+            let one = self.builder.ins().f64const(1.0);
+            let need_floor = self.builder.ins().fcmp(FloatCC::LessThan, val, trunc_val);
+            let floor_sub = self.builder.ins().fsub(trunc_val, one);
+            let floor_val = self.builder.ins().select(need_floor, floor_sub, trunc_val);
 
-        let one = self.builder.ins().f64const(1.0);
-        let need_floor = self.builder.ins().fcmp(FloatCC::LessThan, val, trunc_val);
-        let floor_sub = self.builder.ins().fsub(trunc_val, one);
-        let floor_val = self.builder.ins().select(need_floor, floor_sub, trunc_val);
+            let need_ceil = self.builder.ins().fcmp(FloatCC::GreaterThan, val, trunc_val);
+            let ceil_add = self.builder.ins().fadd(trunc_val, one);
+            let ceil_val = self.builder.ins().select(need_ceil, ceil_add, trunc_val);
+            (nearest, floor_val, ceil_val, val)
+        };
 
-        let need_ceil = self.builder.ins().fcmp(FloatCC::GreaterThan, val, trunc_val);
-        let ceil_add = self.builder.ins().fadd(trunc_val, one);
-        let ceil_val = self.builder.ins().select(need_ceil, ceil_add, trunc_val);
-
-        let is_floor = self.builder.ins().icmp_imm(
-            cranelift_codegen::ir::condcodes::IntCC::Equal,
-            rc,
-            X87_CW_RC_FLOOR,
-        );
-        let is_ceil = self.builder.ins().icmp_imm(
-            cranelift_codegen::ir::condcodes::IntCC::Equal,
-            rc,
-            X87_CW_RC_CEIL,
-        );
-        let is_trunc = self.builder.ins().icmp_imm(
-            cranelift_codegen::ir::condcodes::IntCC::Equal,
-            rc,
-            X87_CW_RC_TRUNC,
-        );
+        let is_floor = self.builder.ins().icmp_imm(IntCC::Equal, rc, X87_CW_RC_FLOOR);
+        let is_ceil = self.builder.ins().icmp_imm(IntCC::Equal, rc, X87_CW_RC_CEIL);
+        let is_trunc = self.builder.ins().icmp_imm(IntCC::Equal, rc, X87_CW_RC_TRUNC);
 
         let r1 = self.builder.ins().select(is_floor, floor_val, nearest);
         let r2 = self.builder.ins().select(is_ceil, ceil_val, r1);
-        self.builder.ins().select(is_trunc, val, r2)
+        self.builder.ins().select(is_trunc, trunc_out, r2)
     }
 
     fn x87_store_mem_int(&mut self, instr: &Instruction, val: Value, truncate: bool) {

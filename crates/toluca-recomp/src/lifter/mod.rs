@@ -130,6 +130,9 @@ pub struct LifterContext<'ctx, 'b> {
     pub gpr_vars: [Variable; 8],
     pub pending_flags: Option<flags::PendingLazyFlags>,
     pub flags_known_clean: bool,
+    pub x87_cache: fpu::X87BlockCache,
+    pub func_has_fdecstp: bool,
+    pub is_aarch64: bool,
     pub current_arith_flags_live_after: bool,
     pub current_cf_live_after: bool,
     pub flag_liveness: &'b liveness::FunctionFlagLiveness,
@@ -245,6 +248,21 @@ pub fn lift_function(
         let first_block = func_blocks[&func.entry_va];
         builder.ins().jump(first_block, &[]);
 
+        let split_list: Vec<GuestAddr> = split_vas.iter().copied().collect();
+        let decoded_blocks: Vec<Option<liveness::DecodedSplitBlock>> = (0..split_list.len())
+            .map(|idx| liveness::decode_split_block(image, func, &split_list, idx))
+            .collect();
+        let func_has_fdecstp = decoded_blocks.iter().flatten().any(|decoded| {
+            decoded
+                .instrs
+                .iter()
+                .any(|instr| instr.mnemonic() == Mnemonic::Fdecstp)
+        });
+        let is_aarch64 = matches!(
+            isa.triple().architecture,
+            target_lexicon::Architecture::Aarch64(_)
+        );
+
         let mut lifter = LifterContext {
             builder: &mut builder,
             ptr_ty,
@@ -264,25 +282,28 @@ pub fn lift_function(
             gpr_vars,
             pending_flags: None,
             flags_known_clean: false,
+            x87_cache: fpu::X87BlockCache::default(),
+            func_has_fdecstp,
+            is_aarch64,
             current_arith_flags_live_after: true,
             current_cf_live_after: true,
             flag_liveness: &flag_liveness,
         };
 
-        let split_list: Vec<GuestAddr> = split_vas.iter().copied().collect();
-        for idx in 0..split_list.len() {
+        for (idx, decoded) in decoded_blocks.iter().enumerate() {
             let start_va = split_list[idx];
             let block = func_blocks[&start_va];
             lifter.builder.switch_to_block(block);
 
-            let Some(decoded) = liveness::decode_split_block(image, func, &split_list, idx) else {
+            let Some(decoded) = decoded.as_ref() else {
                 lifter.pending_flags = None;
                 lifter.flags_known_clean = false;
+                lifter.x87_cache.reset();
                 lifter.flush_gprs();
                 lifter.builder.ins().return_(&[]);
                 continue;
             };
-            lift_split_block(&mut lifter, &decoded, known_functions);
+            lift_split_block(&mut lifter, decoded, known_functions);
         }
 
         let count = lifter.unsupported_count;
@@ -381,6 +402,7 @@ fn lift_split_block(
 ) {
     lifter.pending_flags = None;
     lifter.flags_known_clean = false;
+    lifter.x87_cache.reset();
     let (arith_live_out, cf_live_out) = lifter.flag_liveness.block_live_out(
         &decoded.instrs,
         decoded.has_invalid,
@@ -392,6 +414,7 @@ fn lift_split_block(
     let mut terminated = false;
     for (idx, instr) in decoded.instrs.iter().enumerate() {
         if instr.is_invalid() {
+            lifter.flush_x87();
             lifter.emit_unsupported(instr.ip() as GuestAddr);
             lifter.builder.ins().return_(&[]);
             terminated = true;
@@ -428,9 +451,11 @@ fn lift_split_block(
             } else {
                 lifter.pending_flags = None;
             }
+            lifter.flush_x87();
             lifter.builder.ins().jump(next_block, &[]);
         } else {
             lifter.flush_pending_flags();
+            lifter.flush_x87();
             lifter.flush_gprs();
             lifter.builder.ins().return_(&[]);
         }
@@ -1311,11 +1336,12 @@ mod tests {
         assert_eq!(compiled.unsupported_count, 0);
     }
 
-    static MATERIALIZE_CALL_COUNT: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static MATERIALIZE_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     unsafe extern "C" fn counting_materialize_flags(cpu: *mut GuestCpuState) {
-        MATERIALIZE_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MATERIALIZE_CALL_COUNT.with(|c| c.set(c.get() + 1));
         if let Some(state) = unsafe { cpu.as_mut() } {
             state.materialize_flags();
         }
@@ -1337,12 +1363,12 @@ mod tests {
         cpu.set_gpr(Gpr::Esp, 0x8000);
         init(&mut cpu, &mut arena);
 
-        let before = MATERIALIZE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let before = MATERIALIZE_CALL_COUNT.with(|c| c.get());
         let exec = ExecBuffer::new(&compiled.code);
         unsafe {
             (exec.as_fn())(&mut cpu);
         }
-        let calls = MATERIALIZE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let calls = MATERIALIZE_CALL_COUNT.with(|c| c.get()) - before;
         cpu.materialize_flags();
         (cpu, calls)
     }
@@ -1874,14 +1900,174 @@ mod tests {
         cpu.set_gpr(Gpr::Esp, 0x8000);
         cpu.set_gpr(Gpr::Eax, 42);
         cpu.set_gpr(Gpr::Ecx, 42);
-        let before = MATERIALIZE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let before = MATERIALIZE_CALL_COUNT.with(|c| c.get());
         let exec = ExecBuffer::new(&compiled.code);
         unsafe {
             (exec.as_fn())(&mut cpu);
         }
-        let calls = MATERIALIZE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let calls = MATERIALIZE_CALL_COUNT.with(|c| c.get()) - before;
         assert_eq!(calls, 0);
         assert_eq!(cpu.gpr(Gpr::Edx), 1);
         assert!((cpu.x87.st(0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn x87_block_cache_handles_balanced_multislot_fdecstp_and_helper_interop() {
+        let host_arch = TargetArch::current().expect("host arch supported");
+        let host_isa = build_isa(host_arch).unwrap();
+        let run_x87 = |code: &[u8], init: fn(&mut GuestCpuState, &mut [u8])| -> (GuestCpuState, Vec<u8>) {
+            let compiled = lift_raw_snippet(host_isa.as_ref(), 0x0040_1000, code).unwrap();
+            assert_eq!(compiled.unsupported_count, 0);
+            let mut arena = vec![0u8; 64 * 1024];
+            let mut bridge = HostBridge::new_stub();
+            bridge.x87_helper = toluca_core::bridge::default_x87_helper;
+            let mut cpu = GuestCpuState::new(arena.as_mut_ptr(), &bridge);
+            cpu.set_gpr(Gpr::Esp, 0x8000);
+            init(&mut cpu, &mut arena);
+            let exec = ExecBuffer::new(&compiled.code);
+            unsafe {
+                (exec.as_fn())(&mut cpu);
+            }
+            (cpu, arena)
+        };
+
+        // 1. Balanced + multi-slot stack:
+        #[rustfmt::skip]
+        let multislot_code = [
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword [0x4000] (2.0)  -> top=4 [2]
+            0xDD, 0x05, 0x08, 0x40, 0x00, 0x00, // fld qword [0x4008] (3.0)  -> top=3 [3, 2]
+            0xDD, 0x05, 0x10, 0x40, 0x00, 0x00, // fld qword [0x4010] (5.0)  -> top=2 [5, 3, 2]
+            0xD8, 0xC2,                         // fadd st(0), st(2)         -> top=2 [7, 3, 2]
+            0xD9, 0xC9,                         // fxch st(1)                -> top=2 [3, 7, 2]
+            0xDE, 0xC9,                         // fmulp st(1), st(0)        -> top=3 [21, 2]
+            0xD9, 0xE8,                         // fld1                      -> top=2 [1, 21, 2]
+            0xDD, 0xD8,                         // fstp st(0)                -> top=3 [21, 2]
+            0xDD, 0x05, 0x18, 0x40, 0x00, 0x00, // fld qword [0x4018] (4.0)  -> top=2 [4, 21, 2]
+            0xDE, 0xD9,                         // fcompp (4.0 < 21.0)       -> top=4 [2]
+            0xD9, 0xE8,                         // fld1                      -> top=3 [1, 2]
+            0xD8, 0xC1,                         // fadd st(0), st(1)         -> top=3 [3, 2]
+            0xDD, 0xD9,                         // fstp st(1)                -> top=4 [3]
+            0xDD, 0x1D, 0x20, 0x40, 0x00, 0x00, // fstp qword [0x4020]       -> top=5 []
+            0xC3,                               // ret
+        ];
+        let (cpu_multi, arena_multi) = run_x87(&multislot_code, |cpu, arena| {
+            cpu.x87.top = 5;
+            arena[0x4000..0x4008].copy_from_slice(&2.0_f64.to_le_bytes());
+            arena[0x4008..0x4010].copy_from_slice(&3.0_f64.to_le_bytes());
+            arena[0x4010..0x4018].copy_from_slice(&5.0_f64.to_le_bytes());
+            arena[0x4018..0x4020].copy_from_slice(&4.0_f64.to_le_bytes());
+        });
+        assert_eq!(cpu_multi.x87.top, 5);
+        assert_ne!(cpu_multi.x87.status_word & toluca_core::cpu::X87_SW_C0, 0);
+        let out_multi = f64::from_le_bytes(arena_multi[0x4020..0x4028].try_into().unwrap());
+        assert!((out_multi - 3.0).abs() < 1e-12, "got {out_multi}");
+
+        // 2. Cross-block x87 stack carry-over (push in block 1, branch, pop & compute in block 2):
+        #[rustfmt::skip]
+        let cross_block_code = [
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword [0x4000]
+            0x85, 0xC0,                         // test eax, eax
+            0x74, 0x0F,                         // je .add_one (+15)
+            0xD9, 0xE8,                         // fld1
+            0xDE, 0xC1,                         // faddp st(1), st(0)
+            0xD9, 0xE8,                         // fld1
+            0xDE, 0xC1,                         // faddp st(1), st(0)
+            0xDD, 0x1D, 0x08, 0x40, 0x00, 0x00, // fstp qword [0x4008]
+            0xC3,                               // ret
+            0xD9, 0xE8,                         // .add_one: fld1
+            0xDE, 0xC1,                         // faddp st(1), st(0)
+            0xDD, 0x1D, 0x08, 0x40, 0x00, 0x00, // fstp qword [0x4008]
+            0xC3,                               // ret
+        ];
+        for (eax, want) in [(0u32, 11.0_f64), (1u32, 12.0_f64)] {
+            let compiled_cb =
+                lift_raw_snippet(host_isa.as_ref(), 0x0040_1000, &cross_block_code).unwrap();
+            let mut arena = vec![0u8; 64 * 1024];
+            arena[0x4000..0x4008].copy_from_slice(&10.0_f64.to_le_bytes());
+            let bridge = HostBridge::new_stub();
+            let mut cpu_cb = GuestCpuState::new(arena.as_mut_ptr(), &bridge);
+            cpu_cb.set_gpr(Gpr::Esp, 0x8000);
+            cpu_cb.set_gpr(Gpr::Eax, eax);
+            let exec_cb = ExecBuffer::new(&compiled_cb.code);
+            unsafe {
+                (exec_cb.as_fn())(&mut cpu_cb);
+            }
+            let out = f64::from_le_bytes(arena[0x4008..0x4010].try_into().unwrap());
+            assert!((out - want).abs() < 1e-12, "eax={eax} got={out}");
+        }
+
+        // 3. FDECSTP / FINCSTP preservation (including FSTP ST(0) + FDECSTP with func_has_fdecstp):
+        #[rustfmt::skip]
+        let fdecstp_code = [
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword [0x4000]
+            0xDD, 0xD8,                         // fstp st(0)
+            0xD9, 0xF6,                         // fdecstp
+            0xD9, 0xF7,                         // fincstp
+            0xD9, 0xF6,                         // fdecstp
+            0xDD, 0x1D, 0x08, 0x40, 0x00, 0x00, // fstp qword [0x4008]
+            0xC3,                               // ret
+        ];
+        let (cpu_fdec, arena_fdec) = run_x87(&fdecstp_code, |cpu, arena| {
+            cpu.x87.top = 0;
+            arena[0x4000..0x4008].copy_from_slice(&7.5_f64.to_le_bytes());
+        });
+        assert_eq!(cpu_fdec.x87.top, 0);
+        let out_fdec = f64::from_le_bytes(arena_fdec[0x4008..0x4010].try_into().unwrap());
+        assert!((out_fdec - 7.5).abs() < 1e-12, "got {out_fdec}");
+
+        // 4. FSIN / FCOS helper interop mid-block with live cached stack slots:
+        #[rustfmt::skip]
+        let helper_interop_code = [
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword [0x4000]
+            0xDD, 0x05, 0x08, 0x40, 0x00, 0x00, // fld qword [0x4008]
+            0xD9, 0xFF,                         // fcos
+            0xD9, 0xC9,                         // fxch st(1)
+            0xD9, 0xFE,                         // fsin
+            0xDE, 0xC1,                         // faddp st(1), st(0)
+            0xDD, 0x1D, 0x10, 0x40, 0x00, 0x00, // fstp qword [0x4010]
+            0xC3,                               // ret
+        ];
+        let (_cpu_h, arena_h) = run_x87(&helper_interop_code, |_cpu, arena| {
+            arena[0x4000..0x4008].copy_from_slice(&core::f64::consts::FRAC_PI_2.to_le_bytes());
+            arena[0x4008..0x4010].copy_from_slice(&0.0_f64.to_le_bytes());
+        });
+        let out_h = f64::from_le_bytes(arena_h[0x4010..0x4018].try_into().unwrap());
+        assert!((out_h - 2.0).abs() < 1e-12, "got {out_h}");
+
+        // 5. FLDCW + FISTP rounding modes (nearest / floor / ceil / trunc) + AArch64 compilation check:
+        #[rustfmt::skip]
+        let rounding_code = [
+            0xD9, 0x2D, 0x00, 0x40, 0x00, 0x00, // fldcw [0x4000] (nearest: 0x037F)
+            0xDD, 0x05, 0x10, 0x40, 0x00, 0x00, // fld qword [0x4010] (2.5)
+            0xDB, 0x1D, 0x20, 0x40, 0x00, 0x00, // fistp dword [0x4020] -> 2
+            0xD9, 0x2D, 0x02, 0x40, 0x00, 0x00, // fldcw [0x4002] (floor: 0x077F)
+            0xDD, 0x05, 0x18, 0x40, 0x00, 0x00, // fld qword [0x4018] (-2.2)
+            0xDB, 0x1D, 0x24, 0x40, 0x00, 0x00, // fistp dword [0x4024] -> -3
+            0xD9, 0x2D, 0x04, 0x40, 0x00, 0x00, // fldcw [0x4004] (ceil: 0x0B7F)
+            0xDD, 0x05, 0x10, 0x40, 0x00, 0x00, // fld qword [0x4010] (2.5)
+            0xDB, 0x1D, 0x28, 0x40, 0x00, 0x00, // fistp dword [0x4028] -> 3
+            0xD9, 0x2D, 0x06, 0x40, 0x00, 0x00, // fldcw [0x4006] (trunc: 0x0F7F)
+            0xDD, 0x05, 0x18, 0x40, 0x00, 0x00, // fld qword [0x4018] (-2.2)
+            0xDB, 0x1D, 0x2C, 0x40, 0x00, 0x00, // fistp dword [0x402C] -> -2
+            0xC3,                               // ret
+        ];
+        let (_cpu_rnd, arena_rnd) = run_x87(&rounding_code, |_, arena| {
+            arena[0x4000..0x4002].copy_from_slice(&0x037Fu16.to_le_bytes());
+            arena[0x4002..0x4004].copy_from_slice(&0x077Fu16.to_le_bytes());
+            arena[0x4004..0x4006].copy_from_slice(&0x0B7Fu16.to_le_bytes());
+            arena[0x4006..0x4008].copy_from_slice(&0x0F7Fu16.to_le_bytes());
+            arena[0x4010..0x4018].copy_from_slice(&2.5_f64.to_le_bytes());
+            arena[0x4018..0x4020].copy_from_slice(&(-2.2_f64).to_le_bytes());
+        });
+        assert_eq!(i32::from_le_bytes(arena_rnd[0x4020..0x4024].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(arena_rnd[0x4024..0x4028].try_into().unwrap()), -3);
+        assert_eq!(i32::from_le_bytes(arena_rnd[0x4028..0x402C].try_into().unwrap()), 3);
+        assert_eq!(i32::from_le_bytes(arena_rnd[0x402C..0x4030].try_into().unwrap()), -2);
+
+        let aarch64_isa = build_isa(TargetArch::AArch64).unwrap();
+        let aarch64_compiled =
+            lift_raw_snippet(aarch64_isa.as_ref(), 0x0040_1000, &rounding_code).unwrap();
+        assert!(!aarch64_compiled.code.is_empty());
+        assert_eq!(aarch64_compiled.unsupported_count, 0);
     }
 }

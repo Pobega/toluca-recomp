@@ -339,8 +339,9 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
 
     pub fn call_bridge_void(&mut self, offset: usize) {
         self.flush_pending_flags();
-        let sync_gprs = offset != bridge::offsets::MATERIALIZE_FLAGS;
-        if sync_gprs {
+        let sync_state = offset != bridge::offsets::MATERIALIZE_FLAGS;
+        if sync_state {
+            self.flush_x87();
             self.flush_gprs();
         }
         let fn_ptr = self.builder.ins().load(
@@ -352,7 +353,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         self.builder
             .ins()
             .call_indirect(self.sig_void_cpu, fn_ptr, &[self.cpu_ptr]);
-        if sync_gprs {
+        if sync_state {
             self.reload_gprs();
         }
         self.flags_known_clean = offset == bridge::offsets::MATERIALIZE_FLAGS;
@@ -360,6 +361,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
 
     pub fn call_bridge_u32(&mut self, offset: usize, arg: Value) {
         let arg32 = self.ensure_u32(arg);
+        self.flush_x87();
         let touches_cpu_state = offset != bridge::offsets::X87_HELPER;
         if touches_cpu_state {
             self.flush_pending_flags();
@@ -384,6 +386,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         let a0 = self.ensure_u32(arg0);
         let a1 = self.ensure_u32(arg1);
         self.flush_pending_flags();
+        self.flush_x87();
         self.flush_gprs();
         let fn_ptr = self.builder.ins().load(
             self.ptr_ty,

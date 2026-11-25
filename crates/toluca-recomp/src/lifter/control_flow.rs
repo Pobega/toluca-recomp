@@ -52,6 +52,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             }
             Mnemonic::Hlt => {
                 self.flush_pending_flags();
+                self.flush_x87();
                 self.flush_gprs();
                 let reason = self.builder.ins().iconst(I32, ExitReason::Halt as i64);
                 self.builder.ins().store(
@@ -119,6 +120,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     } else {
                         self.pending_flags = None;
                     }
+                    self.flush_x87();
                     self.builder.ins().jump(block, &[]);
                 } else {
                     self.emit_tail_call(target_va, known_functions);
@@ -140,6 +142,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                 self.push32(ret_va);
                 if known_functions.contains(&target_va) {
                     self.flush_pending_flags();
+                    self.flush_x87();
                     self.flush_gprs();
                     let func_ref = self.get_or_declare_direct_call(target_va);
                     self.builder.ins().call(func_ref, &[self.cpu_ptr]);
@@ -189,6 +192,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     let index_val = self.read_reg(instr.memory_index());
                     let index32 = self.ensure_u32(index_val);
                     self.flush_pending_flags();
+                    self.flush_x87();
 
                     let default_block = self.builder.create_block();
                     let mut switch = Switch::new();
@@ -226,6 +230,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
                     self.write_gpr(Gpr::Esp, adjusted);
                 }
                 self.flush_pending_flags();
+                self.flush_x87();
                 self.flush_gprs();
                 self.builder.ins().return_(&[]);
                 ControlFlowOutcome::Terminated
@@ -275,6 +280,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     fn emit_tail_call(&mut self, target_va: GuestAddr, known_functions: &BTreeSet<GuestAddr>) {
         if known_functions.contains(&target_va) {
             self.flush_pending_flags();
+            self.flush_x87();
             self.flush_gprs();
             let func_ref = self.get_or_declare_direct_call(target_va);
             self.builder.ins().call(func_ref, &[self.cpu_ptr]);
@@ -299,6 +305,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         } else {
             self.pending_flags = None;
         }
+        self.flush_x87();
         let taken_block = self.resolve_branch_target_block(taken_va, known_functions);
         let fallthrough_block = self.resolve_branch_target_block(fallthrough_va, known_functions);
         self.builder

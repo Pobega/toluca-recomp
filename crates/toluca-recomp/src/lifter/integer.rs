@@ -767,6 +767,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         let op_none = self.builder.ins().iconst(I32, LazyFlagOp::None as i64);
         let selected_op = self.builder.ins().select(is_nz, op_active, op_none);
 
+        self.flags_known_clean = false;
         let base = cpu_offsets::LAZY_FLAGS;
         let width_val = self.builder.ins().iconst(I32, ty.bytes() as i64);
         let lhs32 = self.ensure_u32(lhs);

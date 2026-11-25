@@ -79,6 +79,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             self.pending_flags = None;
             return;
         }
+        self.flags_known_clean = false;
         self.pending_flags = Some(PendingLazyFlags {
             op,
             width: byte_width,
@@ -104,15 +105,25 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     }
 
     pub fn clear_lazy_flags(&mut self) {
+        if self.flags_known_clean {
+            debug_assert!(self.pending_flags.is_none());
+            return;
+        }
         self.pending_flags = None;
         let off = cpu_offsets::LAZY_FLAGS + offset_of!(LazyFlags, op);
         let zero = self.builder.ins().iconst(I32, LazyFlagOp::None as i64);
         self.store_lazy_field(off, zero);
+        self.flags_known_clean = true;
     }
 
     pub fn materialize_flags(&mut self) {
+        if self.flags_known_clean {
+            debug_assert!(self.pending_flags.is_none());
+            return;
+        }
         self.flush_pending_flags();
         self.call_bridge_void(bridge::offsets::MATERIALIZE_FLAGS);
+        self.flags_known_clean = true;
     }
 
     pub fn eval_condition(&mut self, cond: Condition) -> Value {
@@ -190,15 +201,21 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
     }
 
     fn try_eval_inline_condition(&mut self, pf: PendingLazyFlags, cond: Condition) -> Option<Value> {
-        if matches!(cond, Condition::P | Condition::NP) {
-            return None;
-        }
         let ty = match pf.width {
             1 => I8,
             2 => I16,
             4 => I32,
             _ => return None,
         };
+        if !matches!(
+            pf.op,
+            LazyFlagOp::Sub | LazyFlagOp::Logic | LazyFlagOp::Add | LazyFlagOp::Inc | LazyFlagOp::Dec
+        ) {
+            return None;
+        }
+        if matches!(cond, Condition::P | Condition::NP) {
+            return Some(self.eval_parity_inline(pf.res, cond == Condition::P));
+        }
         let lhs = self.coerce_int(pf.lhs, ty);
         let rhs = self.coerce_int(pf.rhs, ty);
         let res = self.coerce_int(pf.res, ty);
@@ -211,6 +228,23 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             LazyFlagOp::Dec => self.eval_inc_dec_inline(ty, lhs, res, cond, false),
             _ => None,
         }
+    }
+
+    fn eval_parity_inline(&mut self, res: Value, want_even: bool) -> Value {
+        let x = self.ensure_u32(res);
+        let s4 = self.builder.ins().ushr_imm(x, 4);
+        let x = self.builder.ins().bxor(x, s4);
+        let s2 = self.builder.ins().ushr_imm(x, 2);
+        let x = self.builder.ins().bxor(x, s2);
+        let s1 = self.builder.ins().ushr_imm(x, 1);
+        let x = self.builder.ins().bxor(x, s1);
+        let odd = self.builder.ins().band_imm(x, 1);
+        let cc = if want_even {
+            IntCC::Equal
+        } else {
+            IntCC::NotEqual
+        };
+        self.builder.ins().icmp_imm(cc, odd, 0)
     }
 
     fn eval_sub_inline(&mut self, lhs: Value, rhs: Value, res: Value, cond: Condition) -> Value {

@@ -129,6 +129,7 @@ pub struct LifterContext<'ctx, 'b> {
     pub unsupported_count: usize,
     pub gpr_vars: [Variable; 8],
     pub pending_flags: Option<flags::PendingLazyFlags>,
+    pub flags_known_clean: bool,
     pub current_arith_flags_live_after: bool,
     pub current_cf_live_after: bool,
     pub flag_liveness: &'b liveness::FunctionFlagLiveness,
@@ -262,6 +263,7 @@ pub fn lift_function(
             unsupported_count: 0,
             gpr_vars,
             pending_flags: None,
+            flags_known_clean: false,
             current_arith_flags_live_after: true,
             current_cf_live_after: true,
             flag_liveness: &flag_liveness,
@@ -275,6 +277,7 @@ pub fn lift_function(
 
             let Some(decoded) = liveness::decode_split_block(image, func, &split_list, idx) else {
                 lifter.pending_flags = None;
+                lifter.flags_known_clean = false;
                 lifter.flush_gprs();
                 lifter.builder.ins().return_(&[]);
                 continue;
@@ -377,6 +380,7 @@ fn lift_split_block(
     known_functions: &BTreeSet<GuestAddr>,
 ) {
     lifter.pending_flags = None;
+    lifter.flags_known_clean = false;
     let (arith_live_out, cf_live_out) = lifter.flag_liveness.block_live_out(
         &decoded.instrs,
         decoded.has_invalid,
@@ -1376,9 +1380,6 @@ mod tests {
         for &(op32, op16, op8) in ops_2op {
             for op_bytes in [op32, op16, op8] {
                 for cc in 0u8..16u8 {
-                    if cc == 0x0A || cc == 0x0B {
-                        continue; // P/NP intentionally fall back to materialize_flags
-                    }
                     let mut code = op_bytes.to_vec();
                     code.extend_from_slice(&[0x0F, 0x90 + cc, 0xC2, 0xC3]); // setcc dl; ret
                     for &(lhs, rhs) in boundaries {
@@ -1398,6 +1399,8 @@ mod tests {
                             0x7 => (cpu.eflags & (EFLAGS_CF | EFLAGS_ZF)) == 0,
                             0x8 => (cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0,
                             0x9 => (cpu.eflags & toluca_core::cpu::EFLAGS_SF) == 0,
+                            0xA => (cpu.eflags & toluca_core::cpu::EFLAGS_PF) != 0,
+                            0xB => (cpu.eflags & toluca_core::cpu::EFLAGS_PF) == 0,
                             0xC => {
                                 let sf = (cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0;
                                 let of = (cpu.eflags & toluca_core::cpu::EFLAGS_OF) != 0;
@@ -1432,7 +1435,7 @@ mod tests {
             }
         }
 
-        // inc / dec inline conditions (E/NE/S/NS/O/NO/L/GE/LE/G) when CF is dead, plus CF preservation when CF is live
+        // inc / dec inline conditions (excluding CF-dependent B/AE/BE/A) when CF is dead, plus CF preservation when CF is live
         let inc_dec_ops: &[(&[u8], toluca_core::cpu::LazyFlagOp, u8)] = &[
             (&[0x40], toluca_core::cpu::LazyFlagOp::Inc, 4),       // inc eax
             (&[0x66, 0x40], toluca_core::cpu::LazyFlagOp::Inc, 2), // inc ax
@@ -1448,7 +1451,7 @@ mod tests {
                 2 => 0xFFFF,
                 _ => 0xFFFF_FFFF,
             };
-            for cc in [0x0u8, 0x1, 0x4, 0x5, 0x8, 0x9, 0xC, 0xD, 0xE, 0xF] {
+            for cc in [0x0u8, 0x1, 0x4, 0x5, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF] {
                 let mut code = op_bytes.to_vec();
                 code.extend_from_slice(&[0x0F, 0x90 + cc, 0xC2, 0x01, 0xC9, 0xC3]); // setcc dl; add ecx, ecx; ret
                 for &(lhs, _) in boundaries {
@@ -1472,6 +1475,7 @@ mod tests {
                     let sf = (ref_cpu.eflags & toluca_core::cpu::EFLAGS_SF) != 0;
                     let of = (ref_cpu.eflags & toluca_core::cpu::EFLAGS_OF) != 0;
                     let zf = (ref_cpu.eflags & EFLAGS_ZF) != 0;
+                    let pf = (ref_cpu.eflags & toluca_core::cpu::EFLAGS_PF) != 0;
                     let bit = match cc {
                         0x0 => of,
                         0x1 => !of,
@@ -1479,6 +1483,8 @@ mod tests {
                         0x5 => !zf,
                         0x8 => sf,
                         0x9 => !sf,
+                        0xA => pf,
+                        0xB => !pf,
                         0xC => sf != of,
                         0xD => sf == of,
                         0xE => zf || (sf != of),
@@ -1675,5 +1681,207 @@ mod tests {
         }
         assert_eq!(cpu.gpr(Gpr::Eax), 0xBBBB_0002);
         assert_eq!(cpu.gpr(Gpr::Ebx), 0xBBBB_0002);
+    }
+
+    #[test]
+    fn inline_parity_test_jp_jnp_handles_even_and_odd_bytes_without_materialize() {
+        #[rustfmt::skip]
+        let jp_code = [
+            0xA8, 0xFF,                         // test al, 0xFF
+            0x7A, 0x06,                         // jp .even
+            0xBA, 0x00, 0x00, 0x00, 0x00,       // mov edx, 0
+            0xC3,                               // ret
+            0xBA, 0x01, 0x00, 0x00, 0x00,       // .even: mov edx, 1
+            0xC3,                               // ret
+        ];
+        #[rustfmt::skip]
+        let jnp_code = [
+            0xA8, 0xFF,                         // test al, 0xFF
+            0x7B, 0x06,                         // jnp .odd
+            0xBA, 0x00, 0x00, 0x00, 0x00,       // mov edx, 0
+            0xC3,                               // ret
+            0xBA, 0x01, 0x00, 0x00, 0x00,       // .odd: mov edx, 1
+            0xC3,                               // ret
+        ];
+
+        for (eax, want_even) in [
+            (0x00u32, true),
+            (0x41, true),
+            (0x44, true),
+            (0x05, true),
+            (0xFF, true),
+            (0x01, false),
+            (0x40, false),
+            (0x04, false),
+            (0x07, false),
+            (0xFE, false),
+            (0x101, false),
+        ] {
+            let (cpu_jp, calls_jp) = run_with_materialize_counter(&jp_code, |cpu, _| {
+                cpu.set_gpr(Gpr::Eax, eax);
+            });
+            assert_eq!(calls_jp, 0, "TEST+JP must not materialize_flags");
+            assert_eq!(cpu_jp.gpr(Gpr::Edx), u32::from(want_even), "jp eax={eax:#x}");
+
+            let (cpu_jnp, calls_jnp) = run_with_materialize_counter(&jnp_code, |cpu, _| {
+                cpu.set_gpr(Gpr::Eax, eax);
+            });
+            assert_eq!(calls_jnp, 0, "TEST+JNP must not materialize_flags");
+            assert_eq!(cpu_jnp.gpr(Gpr::Edx), u32::from(!want_even), "jnp eax={eax:#x}");
+        }
+    }
+
+    #[test]
+    fn fcomp_fnstsw_test_ah_jp_jnp_avoids_materialize_flags() {
+        #[rustfmt::skip]
+        let code = [
+            0xDD, 0x05, 0x08, 0x40, 0x00, 0x00, // fld qword ptr [0x4008] (st1 = rhs)
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword ptr [0x4000] (st0 = lhs)
+            0xD8, 0xD9,                         // fcomp st(1)
+            0xDF, 0xE0,                         // fnstsw ax
+            0xF6, 0xC4, 0x44,                   // test ah, 0x44
+            0x7A, 0x06,                         // jp .taken (true when !=, i.e. LT, GT, or NaN)
+            0xBA, 0x00, 0x00, 0x00, 0x00,       // mov edx, 0
+            0xC3,                               // ret
+            0xBA, 0x01, 0x00, 0x00, 0x00,       // .taken: mov edx, 1
+            0xC3,                               // ret
+        ];
+
+        for (lhs, rhs, want_jp) in [
+            (1.0_f64, 2.0_f64, 1u32),
+            (3.0_f64, 2.0_f64, 1u32),
+            (2.0_f64, 2.0_f64, 0u32),
+            (f64::NAN, 2.0_f64, 1u32),
+        ] {
+            let (cpu, calls) = run_with_materialize_counter(&code, |_cpu, arena| {
+                arena[0x4000..0x4008].copy_from_slice(&lhs.to_le_bytes());
+                arena[0x4008..0x4010].copy_from_slice(&rhs.to_le_bytes());
+            });
+            assert_eq!(calls, 0, "FCOMP+FNSTSW+TEST+JP must not materialize_flags");
+            assert_eq!(cpu.gpr(Gpr::Edx), want_jp, "lhs={lhs} rhs={rhs}");
+        }
+    }
+
+    #[test]
+    fn fcomi_and_sahf_jcc_avoid_redundant_materialize_flags() {
+        #[rustfmt::skip]
+        let fcomi_code = [
+            0xDD, 0x05, 0x08, 0x40, 0x00, 0x00, // fld qword ptr [0x4008]
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword ptr [0x4000]
+            0xDB, 0xF1,                         // fcomi st(0), st(1)
+            0x0F, 0x92, 0xC2,                   // setb dl
+            0x0F, 0x97, 0xC1,                   // seta cl
+            0x0F, 0x94, 0xC3,                   // sete bl
+            0x72, 0x06,                         // jb .below
+            0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0
+            0xC3,                               // ret
+            0xB8, 0x01, 0x00, 0x00, 0x00,       // .below: mov eax, 1
+            0xC3,                               // ret
+        ];
+
+        #[rustfmt::skip]
+        let sahf_code = [
+            0xDD, 0x05, 0x08, 0x40, 0x00, 0x00, // fld qword ptr [0x4008]
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword ptr [0x4000]
+            0xD8, 0xD9,                         // fcomp st(1)
+            0xDF, 0xE0,                         // fnstsw ax
+            0x9E,                               // sahf
+            0x0F, 0x92, 0xC2,                   // setb dl
+            0x0F, 0x97, 0xC1,                   // seta cl
+            0x0F, 0x94, 0xC3,                   // sete bl
+            0x72, 0x06,                         // jb .below
+            0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0
+            0xC3,                               // ret
+            0xB8, 0x01, 0x00, 0x00, 0x00,       // .below: mov eax, 1
+            0xC3,                               // ret
+        ];
+
+        // When flags are already clean (via FCOMI), a subsequent SAHF + Jcc makes zero calls.
+        #[rustfmt::skip]
+        let clean_then_sahf_code = [
+            0xDD, 0x05, 0x08, 0x40, 0x00, 0x00, // fld qword ptr [0x4008]
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword ptr [0x4000]
+            0xDB, 0xF1,                         // fcomi st(0), st(1)
+            0xD8, 0xD9,                         // fcomp st(1)
+            0xDF, 0xE0,                         // fnstsw ax
+            0x9E,                               // sahf
+            0x77, 0x06,                         // ja .above
+            0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0
+            0xC3,                               // ret
+            0xB8, 0x01, 0x00, 0x00, 0x00,       // .above: mov eax, 1
+            0xC3,                               // ret
+        ];
+
+        for (lhs, rhs, want_b, want_a, want_e) in [
+            (1.0_f64, 2.0_f64, 1u32, 0u32, 0u32),
+            (3.0_f64, 2.0_f64, 0, 1, 0),
+            (2.0_f64, 2.0_f64, 0, 0, 1),
+            (f64::NAN, 2.0_f64, 1, 0, 1),
+        ] {
+            let (cpu_fcomi, calls_fcomi) = run_with_materialize_counter(&fcomi_code, |_, arena| {
+                arena[0x4000..0x4008].copy_from_slice(&lhs.to_le_bytes());
+                arena[0x4008..0x4010].copy_from_slice(&rhs.to_le_bytes());
+            });
+            assert_eq!(calls_fcomi, 0, "FCOMI+Jcc must not call materialize_flags");
+            assert_eq!(cpu_fcomi.gpr(Gpr::Edx) & 1, want_b);
+            assert_eq!(cpu_fcomi.gpr(Gpr::Ecx) & 1, want_a);
+            assert_eq!(cpu_fcomi.gpr(Gpr::Ebx) & 1, want_e);
+            assert_eq!(cpu_fcomi.gpr(Gpr::Eax), want_b);
+
+            let (cpu_sahf, calls_sahf) = run_with_materialize_counter(&sahf_code, |_, arena| {
+                arena[0x4000..0x4008].copy_from_slice(&lhs.to_le_bytes());
+                arena[0x4008..0x4010].copy_from_slice(&rhs.to_le_bytes());
+            });
+            assert_eq!(
+                calls_sahf, 1,
+                "SAHF materializes at most once; subsequent SETcc/JB must not materialize"
+            );
+            assert_eq!(cpu_sahf.gpr(Gpr::Edx) & 1, want_b);
+            assert_eq!(cpu_sahf.gpr(Gpr::Ecx) & 1, want_a);
+            assert_eq!(cpu_sahf.gpr(Gpr::Ebx) & 1, want_e);
+            assert_eq!(cpu_sahf.gpr(Gpr::Eax), want_b);
+
+            let (cpu_clean, calls_clean) =
+                run_with_materialize_counter(&clean_then_sahf_code, |_, arena| {
+                    arena[0x4000..0x4008].copy_from_slice(&lhs.to_le_bytes());
+                    arena[0x4008..0x4010].copy_from_slice(&rhs.to_le_bytes());
+                });
+            assert_eq!(calls_clean, 0);
+            assert_eq!(cpu_clean.gpr(Gpr::Eax), want_a);
+        }
+
+        // Verify X87_HELPER skips GPR/flag flushing and preserves pending inline flags.
+        #[rustfmt::skip]
+        let x87_helper_code = [
+            0x39, 0xC8,                         // cmp eax, ecx
+            0xDD, 0x05, 0x00, 0x40, 0x00, 0x00, // fld qword ptr [0x4000]
+            0xD9, 0xFE,                         // fsin
+            0x74, 0x06,                         // je .eq
+            0xBA, 0x00, 0x00, 0x00, 0x00,       // mov edx, 0
+            0xC3,                               // ret
+            0xBA, 0x01, 0x00, 0x00, 0x00,       // .eq: mov edx, 1
+            0xC3,                               // ret
+        ];
+        let arch = TargetArch::current().expect("host arch supported");
+        let isa = build_isa(arch).unwrap();
+        let compiled = lift_raw_snippet(isa.as_ref(), 0x0040_1000, &x87_helper_code).unwrap();
+        let mut arena = vec![0u8; 64 * 1024];
+        arena[0x4000..0x4008].copy_from_slice(&(core::f64::consts::FRAC_PI_2).to_le_bytes());
+        let mut bridge = HostBridge::new_stub();
+        bridge.materialize_flags = counting_materialize_flags;
+        bridge.x87_helper = toluca_core::bridge::default_x87_helper;
+        let mut cpu = GuestCpuState::new(arena.as_mut_ptr(), &bridge);
+        cpu.set_gpr(Gpr::Esp, 0x8000);
+        cpu.set_gpr(Gpr::Eax, 42);
+        cpu.set_gpr(Gpr::Ecx, 42);
+        let before = MATERIALIZE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let exec = ExecBuffer::new(&compiled.code);
+        unsafe {
+            (exec.as_fn())(&mut cpu);
+        }
+        let calls = MATERIALIZE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(calls, 0);
+        assert_eq!(cpu.gpr(Gpr::Edx), 1);
+        assert!((cpu.x87.st(0) - 1.0).abs() < 1e-12);
     }
 }

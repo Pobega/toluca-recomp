@@ -355,12 +355,16 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         if sync_gprs {
             self.reload_gprs();
         }
+        self.flags_known_clean = offset == bridge::offsets::MATERIALIZE_FLAGS;
     }
 
     pub fn call_bridge_u32(&mut self, offset: usize, arg: Value) {
         let arg32 = self.ensure_u32(arg);
-        self.flush_pending_flags();
-        self.flush_gprs();
+        let touches_cpu_state = offset != bridge::offsets::X87_HELPER;
+        if touches_cpu_state {
+            self.flush_pending_flags();
+            self.flush_gprs();
+        }
         let fn_ptr = self.builder.ins().load(
             self.ptr_ty,
             MemFlags::trusted(),
@@ -370,7 +374,10 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
         self.builder
             .ins()
             .call_indirect(self.sig_cpu_u32, fn_ptr, &[self.cpu_ptr, arg32]);
-        self.reload_gprs();
+        if touches_cpu_state {
+            self.reload_gprs();
+            self.flags_known_clean = false;
+        }
     }
 
     pub fn call_bridge_u32_u32(&mut self, offset: usize, arg0: Value, arg1: Value) {
@@ -388,6 +395,7 @@ impl<'ctx, 'b> LifterContext<'ctx, 'b> {
             .ins()
             .call_indirect(self.sig_cpu_u32_u32, fn_ptr, &[self.cpu_ptr, a0, a1]);
         self.reload_gprs();
+        self.flags_known_clean = false;
     }
 
     pub fn ensure_u32(&mut self, val: Value) -> Value {
